@@ -156,7 +156,9 @@
   контур уже реализован и не заменяет физический Android-прогон;
 - instrumentation-тесты текущей Room `v1`, включая
   checkpoint + pending ingress, `close → reopen → next commit → second reopen`,
-  реализованы и компилируются; остаётся runtime-прогон на Android;
+  реализованы и компилируются; локальный Emulator `37.1.11` установлен, но ARM
+  system image требует отдельного принятия владельцем лицензии Google, после
+  чего остаётся runtime-прогон на Android;
 - recovery fail-closed проверяет sensor ID, family и Bluetooth address до
   replay; несовпадение не вызывает алгоритм;
 - восстановление после смерти процесса и продолжение полного sensor replay;

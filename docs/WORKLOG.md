@@ -131,6 +131,11 @@ pending ingress, выполняет `close → reopen`, побайтово св�
 commit и проверяет terminal outcome после второго reopen. Instrumented test APK
 компилируется; runtime-прогон на устройстве или эмуляторе ещё требуется.
 
+Для локального прогона по официальному SHA-256 установлены Android command-line
+tools и Emulator `37.1.11`. Установка ARM system image остановлена без принятия
+за владельца отдельной лицензии `android-sdk-arm-dbt-license`; сам тест не
+выдаётся за выполненный.
+
 Полный локальный Gradle-прогон unit-тестов, Android-test compilation/APK, lint,
 debug APK и minified release-сборки прошёл. Debug APK выровнен, подписан только
 локальным Android debug-ключом и проверен `apksigner`; это инженерная сборка, не

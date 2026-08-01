@@ -66,7 +66,7 @@
 | GS1/GS1Sb | ARM JNI, private capture и полный датчик ещё не проверены |
 | BLE identity | Name suffix остаётся кандидатом, а не доказательством exact MAC |
 | GS3 | Требует отдельного транспорта, account binding и физического допуска |
-| Room restart | Двукратный reopen с checkpoint, pending ingress и outcome компилируется; нет device runtime, process-kill и продолжения полного replay |
+| Room restart | Двукратный reopen компилируется; Emulator установлен, но ARM image ожидает принятия владельцем отдельной лицензии; нет device runtime, process-kill и полного replay |
 | Фоновая работа | Fake-GATT lifecycle готов; in-flight platform call может пересечь stop, нет реального configured stream, Samsung/Doze/process-kill испытаний |
 | Тревога Android | Программный повтор/подтверждение готовы; нужны DND, Doze, громкость и ночной тест |
 | Виджет | Политика скрывает demo/stale/clock-mismatch/non-VALID; нет строгой гарантии watchdog после гибели процесса |
