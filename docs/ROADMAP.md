@@ -115,7 +115,8 @@
 - generation, identity, bind и close сведены в один атомарный GATT-registry;
   fake-GATT тесты покрывают callback до возврата `connectGatt`, stale callback,
   параллельный stop и exactly-once release, а endpoint проверяется только после
-  identity gate;
+  identity gate; глобальный identity-owner и weak tombstone запрещают передачу
+  одного объекта между lease и повторную привязку во время release;
 - терминальный core-result больше не запускает уже принятый хвост через тот же
   native context; первая причина сбоя сохраняет приоритет при callback/actor
   гонке; история и прогрев не объявляются свежим диагностическим потоком;

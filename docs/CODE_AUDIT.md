@@ -50,7 +50,8 @@
   алгоритм при identity mismatch.
 - GATT generation, identity и ownership сведены в один атомарный registry;
   callback-before-return, stale callback и close проверены fake-GATT тестами,
-  отклонённый транспорт освобождается ровно один раз.
+  отклонённый транспорт освобождается ровно один раз глобально. Cross-lease
+  stealing и rebind во время release запрещены identity-owner и weak tombstone.
 - Backend требует явный `APP_ENV` и разные device/family token во всех режимах.
 - `sequence` ограничен единым JSON-safe диапазоном в домене, начальной схеме,
   OpenAPI и web; большее значение не доходит до хранения.

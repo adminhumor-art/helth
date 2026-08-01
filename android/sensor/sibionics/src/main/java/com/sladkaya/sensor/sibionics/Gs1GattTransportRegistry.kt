@@ -1,6 +1,7 @@
 package com.sladkaya.sensor.sibionics
 
-import java.util.Collections
+import java.lang.ref.ReferenceQueue
+import java.lang.ref.WeakReference
 import java.util.IdentityHashMap
 import java.util.concurrent.atomic.AtomicLong
 
@@ -23,6 +24,11 @@ internal class Gs1GattTransportRegistry<Gatt : Any>(
 ) {
     private val lock = Any()
     private val sequence = AtomicLong(1L)
+    private val owners = IdentityHashMap<Gatt, Gs1GattTransportLease<Gatt>>()
+    // A tombstone is needed only while the released object can still reappear
+    // in a late callback; weak identity avoids retaining every historical GATT.
+    private val released = HashSet<WeakIdentityReference<Gatt>>()
+    private val releasedQueue = ReferenceQueue<Gatt>()
     private var active: Gs1GattTransportLease<Gatt>? = null
 
     fun begin(profile: Gs1DiagnosticActivationProfile): Gs1GattTransportLease<Gatt> =
@@ -88,7 +94,14 @@ internal class Gs1GattTransportRegistry<Gatt : Any>(
             lease.closed = true
             lease.accepting = false
             if (active === lease) active = null
-            val gatt = lease.gatt?.takeIf(lease.released::add)
+            val gatt = lease.gatt?.takeIf { owned ->
+                if (owners[owned] !== lease) {
+                    false
+                } else {
+                    owners.remove(owned)
+                    markReleasedLocked(owned)
+                }
+            }
             lease.gatt = null
             gatt
         }
@@ -101,7 +114,9 @@ internal class Gs1GattTransportRegistry<Gatt : Any>(
         reportedBluetoothAddress: String,
     ): Boolean {
         if (active !== lease || !lease.accepting || lease.closed) return false
-        if (gatt in lease.released) return false
+        if (isReleasedLocked(gatt)) return false
+        val owner = owners[gatt]
+        if (owner != null && owner !== lease) return false
         if (!reportedBluetoothAddress.equals(
                 lease.token.expectedBluetoothAddress,
                 ignoreCase = true,
@@ -111,7 +126,10 @@ internal class Gs1GattTransportRegistry<Gatt : Any>(
         }
         val bound = lease.gatt
         if (bound != null && bound !== gatt) return false
-        if (bound == null) lease.gatt = gatt
+        if (bound == null) {
+            lease.gatt = gatt
+            owners[gatt] = lease
+        }
         return active === lease && lease.accepting && !lease.closed && lease.gatt === gatt
     }
 
@@ -119,12 +137,28 @@ internal class Gs1GattTransportRegistry<Gatt : Any>(
         lease: Gs1GattTransportLease<Gatt>,
         gatt: Gatt,
     ): Gatt? {
-        val currentOwnsGatt = active?.gatt === gatt
         val leaseOwnsGatt = lease.gatt === gatt
-        return if (!currentOwnsGatt && !leaseOwnsGatt && lease.released.add(gatt)) {
+        return if (!leaseOwnsGatt && !owners.containsKey(gatt) && markReleasedLocked(gatt)) {
             gatt
         } else {
             null
+        }
+    }
+
+    private fun isReleasedLocked(gatt: Gatt): Boolean {
+        drainReleasedLocked()
+        return released.contains(WeakIdentityReference(gatt))
+    }
+
+    private fun markReleasedLocked(gatt: Gatt): Boolean {
+        drainReleasedLocked()
+        return released.add(WeakIdentityReference(gatt, releasedQueue))
+    }
+
+    private fun drainReleasedLocked() {
+        while (true) {
+            val collected = releasedQueue.poll() ?: return
+            released.remove(collected)
         }
     }
 
@@ -140,6 +174,22 @@ internal class Gs1GattTransportRegistry<Gatt : Any>(
         val accepted: Boolean,
         val rejected: Gatt?,
     )
+
+    private class WeakIdentityReference<Value : Any>(
+        referent: Value,
+        queue: ReferenceQueue<Value>? = null,
+    ) : WeakReference<Value>(referent, queue) {
+        private val identityHashCode = System.identityHashCode(referent)
+
+        override fun hashCode(): Int = identityHashCode
+
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is WeakIdentityReference<*>) return false
+            val value = get() ?: return false
+            return value === other.get()
+        }
+    }
 }
 
 internal class Gs1GattTransportLease<Gatt : Any> internal constructor(
@@ -148,6 +198,4 @@ internal class Gs1GattTransportLease<Gatt : Any> internal constructor(
     internal var accepting: Boolean = true
     internal var closed: Boolean = false
     internal var gatt: Gatt? = null
-    internal val released: MutableSet<Gatt> =
-        Collections.newSetFromMap(IdentityHashMap<Gatt, Boolean>())
 }

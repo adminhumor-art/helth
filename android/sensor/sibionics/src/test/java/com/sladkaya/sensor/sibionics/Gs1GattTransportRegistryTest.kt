@@ -3,6 +3,7 @@ package com.sladkaya.sensor.sibionics
 import com.sladkaya.core.model.SensorFamily
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -153,6 +154,120 @@ class Gs1GattTransportRegistryTest {
         assertTrue(registry.bindConnectResult(current, currentGatt, "AA:BB:CC:DD:EE:FF"))
         registry.close(current)
         assertEquals(listOf(lateGatt, currentGatt), closed)
+    }
+
+    @Test
+    fun newLeaseCannotStealTransportFromStillLivePreviousLease() {
+        val disconnected = mutableListOf<FakeGatt>()
+        val closed = mutableListOf<FakeGatt>()
+        val registry = Gs1GattTransportRegistry<FakeGatt>(
+            disconnect = disconnected::add,
+            close = closed::add,
+        )
+        val previous = registry.begin(profile())
+        val sharedGatt = FakeGatt("shared")
+        assertTrue(
+            registry.bindConnectResult(previous, sharedGatt, "AA:BB:CC:DD:EE:FF"),
+        )
+
+        val current = registry.begin(profile())
+
+        assertFalse(
+            registry.bindConnectResult(current, sharedGatt, "AA:BB:CC:DD:EE:FF"),
+        )
+        assertNull(registry.current(current))
+        assertTrue(disconnected.isEmpty())
+        assertTrue(closed.isEmpty())
+
+        registry.close(previous)
+        assertFalse(
+            registry.acceptCallback(current, sharedGatt, "AA:BB:CC:DD:EE:FF"),
+        )
+        registry.close(current)
+
+        assertEquals(listOf(sharedGatt), disconnected)
+        assertEquals(listOf(sharedGatt), closed)
+    }
+
+    @Test
+    fun staleReleaseBlocksRebindingBeforeAndAfterPlatformReleaseCompletes() {
+        val disconnectEntered = CountDownLatch(1)
+        val allowDisconnectToFinish = CountDownLatch(1)
+        val disconnected = mutableListOf<FakeGatt>()
+        val closed = mutableListOf<FakeGatt>()
+        val registry = Gs1GattTransportRegistry<FakeGatt>(
+            disconnect = {
+                disconnected += it
+                disconnectEntered.countDown()
+                allowDisconnectToFinish.await(2, TimeUnit.SECONDS)
+            },
+            close = closed::add,
+        )
+        val stale = registry.begin(profile())
+        val current = registry.begin(profile())
+        val sharedGatt = FakeGatt("shared")
+        val staleAccepted = AtomicBoolean(true)
+
+        val releaser = thread(name = "fake-stale-gatt-release") {
+            staleAccepted.set(
+                registry.acceptCallback(stale, sharedGatt, "AA:BB:CC:DD:EE:FF"),
+            )
+        }
+        val releaseStarted = disconnectEntered.await(2, TimeUnit.SECONDS)
+        val acceptedDuringRelease = registry.bindConnectResult(
+            current,
+            sharedGatt,
+            "AA:BB:CC:DD:EE:FF",
+        )
+        allowDisconnectToFinish.countDown()
+        releaser.join(2_000L)
+        val acceptedAfterRelease = registry.bindConnectResult(
+            current,
+            sharedGatt,
+            "AA:BB:CC:DD:EE:FF",
+        )
+        registry.close(stale)
+        registry.close(current)
+
+        assertTrue(releaseStarted)
+        assertFalse(releaser.isAlive)
+        assertFalse(staleAccepted.get())
+        assertFalse(acceptedDuringRelease)
+        assertFalse(acceptedAfterRelease)
+        assertEquals(listOf(sharedGatt), disconnected)
+        assertEquals(listOf(sharedGatt), closed)
+    }
+
+    @Test
+    fun releasedIdentityDoesNotRejectDistinctButEqualTransport() {
+        val disconnected = mutableListOf<FakeGatt>()
+        val closed = mutableListOf<FakeGatt>()
+        val registry = Gs1GattTransportRegistry<FakeGatt>(
+            disconnect = disconnected::add,
+            close = closed::add,
+        )
+        val stale = registry.begin(profile())
+        val current = registry.begin(profile())
+        val releasedGatt = FakeGatt("equal")
+        val equalCurrentGatt = FakeGatt("equal")
+        assertEquals(releasedGatt, equalCurrentGatt)
+        assertFalse(releasedGatt === equalCurrentGatt)
+
+        assertFalse(
+            registry.acceptCallback(stale, releasedGatt, "AA:BB:CC:DD:EE:FF"),
+        )
+        assertTrue(
+            registry.bindConnectResult(current, equalCurrentGatt, "AA:BB:CC:DD:EE:FF"),
+        )
+        assertSame(equalCurrentGatt, registry.current(current))
+        registry.close(current)
+
+        assertEquals(2, disconnected.size)
+        assertSame(releasedGatt, disconnected[0])
+        assertSame(equalCurrentGatt, disconnected[1])
+        assertEquals(2, closed.size)
+        assertSame(releasedGatt, closed[0])
+        assertSame(equalCurrentGatt, closed[1])
     }
 
     private data class FakeGatt(val name: String)

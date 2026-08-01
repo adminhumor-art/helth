@@ -68,6 +68,10 @@ GS3 отделён от GS1/GS1Sb. Текущая GS1-сессия отклон�
   в один атомарный registry: callback до возврата `connectGatt`, поздний
   callback, stop во время блокирующего disconnect и exactly-once release
   проверяются на JVM; устаревший callback не может отравить текущую попытку;
+- глубокий ownership-review отдельными red-тестами воспроизвёл попытку передать
+  один GATT между двумя lease и повторную привязку во время блокирующего release;
+  глобальный identity-owner и GC-safe weak tombstone закрыли обе гонки, не
+  смешивая разные, но равные по `equals` объекты;
 - append-only ingress, outcomes, журнал отказов и restart recovery pending
   пакетов;
 - атомарное сохранение raw sample, algorithm result и checkpoint;
@@ -87,7 +91,7 @@ initialization mode, token source и sensitivity binding. В Git разрешё�
 Текущий результат программных проверок:
 
 - `sensor:sibionics-datahandle`: 12 тестов;
-- `sensor:sibionics`: 198 тестов, включая 26 golden/replay и fake-GATT
+- `sensor:sibionics`: 201 тест, включая 26 golden/replay и fake-GATT
   lifecycle;
 - lint обоих модулей — успешно;
 - `git diff --check` — успешно.
