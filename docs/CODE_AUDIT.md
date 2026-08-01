@@ -46,6 +46,12 @@
   первыми и единственными текущими схемами.
 - Golden fixture publication разрешена только для одного канонического
   синтетического файла с закреплённым SHA-256.
+- Recovery pending ingress проверяет семейство датчика до replay и не вызывает
+  алгоритм при identity mismatch.
+- Backend требует явный `APP_ENV` и разные device/family token во всех режимах.
+- Web API boundary fail-closed сверяет trusted patient, свежесть, качество,
+  часы и гонку snapshot/history; полный TypeScript-check включён в проверенный
+  CI-шаблон, ожидающий активации.
 
 ## Обязательно довести
 
@@ -54,14 +60,14 @@
 | GS1/GS1Sb | ARM JNI, private capture и полный датчик ещё не проверены |
 | BLE identity | Name suffix остаётся кандидатом, а не доказательством exact MAC |
 | GS3 | Требует отдельного транспорта, account binding и физического допуска |
-| Room restart | Instrumentation-тест `close → reopen → restore → next commit` компилируется; нет device runtime, process-kill и продолжения полного replay |
+| Room restart | Двукратный reopen с checkpoint, pending ingress и outcome компилируется; нет device runtime, process-kill и продолжения полного replay |
 | Фоновая работа | Нет реального configured stream, Samsung/Doze/process-kill испытаний |
 | Тревога Android | Программный повтор/подтверждение готовы; нужны DND, Doze, громкость и ночной тест |
 | Виджет | Политика скрывает demo/stale/clock-mismatch/non-VALID; нет строгой гарантии watchdog после гибели процесса |
 | Настройки | Локальные и серверные пороги пока не синхронизированы |
-| Backend auth | Один технический token не является семейной моделью доступа |
+| Backend auth | Device/family token разделены, но это ещё не семейные аккаунты, сессии и роли |
 | Telegram | Нет настоящего bot token/chat и сетевой end-to-end проверки; claim/lease/retry уже покрыты тестами |
-| Сайт | Пока синтетический и не вызывает backend API |
+| Сайт | Typed boundary готов, но нет server-side BFF/session; family token нельзя отдавать браузеру |
 
 ## Диагностический карантин
 

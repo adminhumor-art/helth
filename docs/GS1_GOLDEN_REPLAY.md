@@ -112,9 +112,10 @@ state hash. Лишь после совпадения вызывается `confi
 При смене attempt нативный контекст закрывается и открывается заново с последним
 checkpoint. Это `context reopen`, а не проверка смерти процесса или повторного
 открытия Room. Отдельный instrumentation-тест
-`Room close → reopen → restore checkpoint → next commit` реализован и
-компилируется, но ещё не запускался на Android. Process-kill и продолжение
-полного sensor replay остаются обязательными отдельными барьерами.
+`checkpoint + pending ingress → Room close → reopen → next commit → terminal
+outcome → second reopen` реализован и компилируется, но ещё не запускался на
+Android. Process-kill и продолжение полного sensor replay остаются обязательными
+отдельными барьерами.
 
 ## Текущий fixture
 

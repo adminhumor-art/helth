@@ -184,6 +184,31 @@ class Gs1PendingIngressRecoveryTest {
     }
 
     @Test
+    fun restoredEvidenceFromAnotherSensorFamilyFailsClosedBeforeReplay() = runBlocking {
+        val journal = FakeRecoveryJournal(
+            listOf(
+                record(
+                    ordinal = 0,
+                    packet = rawPacket(startIndex = 10, count = 1),
+                    family = SensorFamily.SIBIONICS_GS1SB,
+                ),
+            ),
+        )
+        var replayCalls = 0
+
+        val result = recovery(journal) {
+            replayCalls += 1
+            completedReplay(index = 10)
+        }.recover(profile(), generation = 1L, initialCoreCursor = 10)
+            as Gs1PendingIngressRecoveryResult.Failed
+
+        assertEquals("RECOVERY_INGRESS_IDENTITY_MISMATCH", result.code)
+        assertTrue(!result.retryable)
+        assertEquals(0, replayCalls)
+        assertTrue(journal.outcomes.isEmpty())
+    }
+
+    @Test
     fun coreInvalidPacketIsDurablyQuarantinedInsteadOfBlockingEveryRestart() = runBlocking {
         val journal = FakeRecoveryJournal(listOf(record(0, rawPacket(startIndex = 10, count = 1))))
         val result = recovery(journal) {
@@ -242,16 +267,34 @@ class Gs1PendingIngressRecoveryTest {
             packageCode = "ABCDEFGH",
         ) as Gs1DiagnosticActivationProfileValidation.Valid).profile
 
-    private fun record(ordinal: Long, packet: ByteArray) = SensorPacketIngressRecord(
+    private fun record(
+        ordinal: Long,
+        packet: ByteArray,
+        family: SensorFamily = SensorFamily.SIBIONICS_GS1,
+    ) = SensorPacketIngressRecord(
         ingressId = "attempt-a:$ordinal",
         sensorId = "sensor-a",
-        sensorFamily = SensorFamily.SIBIONICS_GS1,
+        sensorFamily = family,
         bluetoothAddress = "AA:BB:CC:DD:EE:FF",
         attemptId = "attempt-a",
         ordinal = ordinal,
         receivedAtEpochMs = 1_700_000_000_000L + ordinal,
         encryptedPacket = packet,
         packetSha256 = packet.sha256ForRecoveryTest(),
+    )
+
+    private fun completedReplay(index: Int) = Gs1RuntimeAwaitResult.Processed(
+        Gs1PacketProcessingResult.Completed(
+            committedSamples = listOf(
+                DecodedGs1RawSample(
+                    index = index,
+                    sensorTimeEpochSeconds = 1_700_000_000L + index * 60L,
+                    current = 50,
+                    temperature = 321,
+                    reindex = 0,
+                ),
+            ),
+        ),
     )
 
     private fun rawPacket(startIndex: Int, count: Int): ByteArray {

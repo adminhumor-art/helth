@@ -9,6 +9,7 @@ import (
 
 func TestProductionConfigRequiresDatabase(t *testing.T) {
 	err := validateConfig(appConfig{
+		environment: "production",
 		production:  true,
 		deviceToken: "0123456789abcdef0123456789abcdef",
 		familyToken: "fedcba9876543210fedcba9876543210",
@@ -22,7 +23,7 @@ func TestProductionConfigRequiresDatabase(t *testing.T) {
 func TestProductionConfigKeepsDeviceAndFamilyAuthorizationSeparate(t *testing.T) {
 	shared := "0123456789abcdef0123456789abcdef"
 	err := validateConfig(appConfig{
-		production: true, deviceToken: shared, familyToken: shared,
+		environment: "production", production: true, deviceToken: shared, familyToken: shared,
 		patientID:   "00000000-0000-4000-8000-000000000001",
 		databaseURL: "postgres://database.invalid/sladkaya",
 	})
@@ -33,7 +34,7 @@ func TestProductionConfigKeepsDeviceAndFamilyAuthorizationSeparate(t *testing.T)
 
 func TestProductionConfigRejectsWeakAuthorizationTokens(t *testing.T) {
 	err := validateConfig(appConfig{
-		production: true, deviceToken: "short-device", familyToken: "short-family",
+		environment: "production", production: true, deviceToken: "short-device", familyToken: "short-family",
 		patientID:   "00000000-0000-4000-8000-000000000001",
 		databaseURL: "postgres://database.invalid/sladkaya",
 	})
@@ -46,6 +47,27 @@ func TestConfigRejectsUnknownEnvironmentInsteadOfFallingBackToDevelopment(t *tes
 	err := validateConfig(appConfig{environment: "prod"})
 	if err == nil {
 		t.Fatal("unknown APP_ENV silently enabled development credentials")
+	}
+}
+
+func TestConfigRejectsMissingEnvironmentInsteadOfFallingBackToDevelopment(t *testing.T) {
+	t.Setenv("APP_ENV", "")
+	config := loadConfig()
+	if err := validateConfig(config); err == nil {
+		t.Fatal("missing APP_ENV silently enabled development credentials and ephemeral storage")
+	}
+}
+
+func TestDevelopmentConfigKeepsDeviceAndFamilyAuthorizationSeparate(t *testing.T) {
+	shared := "shared-local-token"
+	err := validateConfig(appConfig{
+		environment: "development",
+		deviceToken: shared,
+		familyToken: shared,
+		patientID:   "00000000-0000-4000-8000-000000000001",
+	})
+	if err == nil {
+		t.Fatal("development accepted one token for both device ingest and family access")
 	}
 }
 

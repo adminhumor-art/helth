@@ -52,6 +52,7 @@ internal class Gs1PendingIngressRecovery(
         var handled = 0
         records.forEach { record ->
             if (record.sensorId != profile.sensorId ||
+                record.sensorFamily != profile.family ||
                 record.bluetoothAddress != profile.bluetoothAddress
             ) {
                 return failed(

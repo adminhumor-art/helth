@@ -150,8 +150,10 @@
 - Android-инструментальные тесты GATT callback/lifecycle на fake transport или
   Robolectric и затем на реальном Samsung;
 - instrumentation-тесты текущей Room `v1`, включая
-  `close → reopen → restore checkpoint → next commit`, реализованы и
-  компилируются; остаётся runtime-прогон на Android;
+  checkpoint + pending ingress, `close → reopen → next commit → second reopen`,
+  реализованы и компилируются; остаётся runtime-прогон на Android;
+- recovery fail-closed проверяет sensor ID, family и Bluetooth address до
+  replay; несовпадение не вызывает алгоритм;
 - восстановление после смерти процесса и продолжение полного sensor replay;
 - ARM-инструментальный тест реальных JNI-библиотек на 4-КБ и 16-КБ устройствах;
 - реальный private golden-набор вне Git, ARM-прогон закреплённых JNI-библиотек и
@@ -241,7 +243,16 @@ GS3 не проводится через алгоритм GS1/GS1Sb. Для не
   закрывают signal-loss;
 - опубликован закрытый демо-сайт с большим значением и графиком, который не
   соединяет тестовый разрыв;
+- подготовлена typed API boundary: trusted patient scope, свежесть, `VALID`,
+  clock mismatch и согласованность snapshot/history проверяются fail-closed;
+- при смене датчика/семейства, пропуске sequence или отброшенной точке web-график
+  начинает новый сегмент; Go `int64 sequence`, который JavaScript не представляет
+  точно, не может скрыть конкурирующее показание;
 - настоящий Telegram и семейная авторизация пока не подключены.
+
+Перед сетевым live-подключением остаётся выбрать server-side BFF/session, не
+передающий family token браузеру, и закрепить единое представление `sequence` в
+API-контракте.
 
 ## Когда нужен владелец
 

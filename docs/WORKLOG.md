@@ -111,10 +111,15 @@ initialization mode, token source и sensitivity binding. В Git разрешё�
 - fail-closed чтение повреждённой confirmed-настройки датчика;
 - одна начальная Room-схема `v1` со всеми таблицами сенсорного контура.
 
+Recovery дополнительно проверяет точное семейство датчика до replay. TDD-тест
+сначала воспроизвёл ошибочное принятие GS1Sb-записи для GS1-профиля, после чего
+восстановление стало fail-closed до вызова алгоритма.
+
 Room-тесты проверяют атомарность, точный повтор, конфликт, append-only ingress,
-outcome, checkpoint и сценарий `close → reopen → restore → next commit`.
-Instrumented test APK компилируется; runtime-прогон на устройстве или эмуляторе
-ещё требуется.
+outcome и checkpoint. Файловый instrumentation-сценарий сохраняет checkpoint и
+pending ingress, выполняет `close → reopen`, побайтово сверяет пакет, продолжает
+commit и проверяет terminal outcome после второго reopen. Instrumented test APK
+компилируется; runtime-прогон на устройстве или эмуляторе ещё требуется.
 
 Полный локальный Gradle-прогон unit-тестов, Android-test compilation/APK, lint,
 debug APK и minified release-сборки прошёл. Debug APK выровнен, подписан только
@@ -144,8 +149,8 @@ debug APK и minified release-сборки прошёл. Debug APK выровн�
 - независимые scheduler для signal-loss и delivery;
 - bounded разбор ответа Telegram, обязательные `ok=true` и `message_id`, а также
   удаление bot token из ошибок;
-- production fail-fast без PostgreSQL, при неизвестном `APP_ENV`, слабых или
-  одинаковых device/family token.
+- production fail-fast без PostgreSQL, при слабых token; любой режим fail-fast
+  при отсутствующем/неизвестном `APP_ENV` или одинаковых device/family token.
 
 Проверено локально:
 
@@ -167,11 +172,14 @@ Telegram и до фиксации `sent` возможно повторное с�
 `https://sladkaya-family-demo.rinatvfx.chatgpt.site`.
 
 Он показывает крупное тестовое значение, график с настоящим разрывом, свежесть
-и тестовую тревогу. На экране явно указано, что данные симулированные. Источник
-демо детерминирован и покрыт пятью тестами; build и lint проходят. Метаданные и
-`og-v2.png` прямо обозначают демо/симуляцию, не содержат имён людей и не обещают
-настоящую доставку тревог. Сайт пока не вызывает backend API и не открыт семье
-без настоящей авторизации.
+и тестовую тревогу. На экране явно указано, что данные симулированные. Добавлена
+чистая типизированная граница будущего API: trusted patient scope, `VALID`,
+свежесть, часы и согласованность snapshot/history проверяются fail-closed;
+смена sensor/family/sequence разрывает график. Всего проходят 22 теста, build,
+lint, полный TypeScript-check и production audit. Метаданные и `og-v2.png`
+прямо обозначают демо/симуляцию, не содержат имён людей и не обещают настоящую
+доставку тревог. Сайт пока не вызывает backend API и не открыт семье без
+настоящей авторизации.
 
 ## Git и безопасность
 
@@ -180,6 +188,9 @@ Telegram и до фиксации `sent` возможно повторное с�
 - локальные SDK, APK, кэши и любые private trace исключены через `.gitignore`;
 - в продуктовом дереве нет названия исследованного стороннего приложения;
 - исследовательские материалы остаются отдельными от продуктового репозитория.
+- подготовлен least-privilege CI-шаблон с SHA-pinned actions для Go/PostgreSQL,
+  web и Android; `actionlint` зелёный. Автоматический запуск пока не включён:
+  GitHub token не имеет отдельного разрешения `Workflows`.
 
 ## Следующий физический барьер
 

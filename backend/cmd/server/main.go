@@ -152,15 +152,16 @@ type appConfig struct {
 }
 
 func validateConfig(config appConfig) error {
-	if config.environment != "" {
-		switch config.environment {
-		case "development", "test", "production":
-		default:
-			return errors.New("APP_ENV must be development, test or production")
-		}
-		if (config.environment == "production") != config.production {
-			return errors.New("APP_ENV and production mode are inconsistent")
-		}
+	switch config.environment {
+	case "development", "test", "production":
+	default:
+		return errors.New("APP_ENV must be explicitly set to development, test or production")
+	}
+	if (config.environment == "production") != config.production {
+		return errors.New("APP_ENV and production mode are inconsistent")
+	}
+	if config.deviceToken != "" && config.deviceToken == config.familyToken {
+		return errors.New("DEVICE_TOKEN and FAMILY_SESSION_TOKEN must be different")
 	}
 	if !config.production {
 		return nil
@@ -177,9 +178,6 @@ func validateConfig(config appConfig) error {
 	if len(config.deviceToken) < 32 || len(config.familyToken) < 32 {
 		return errors.New("DEVICE_TOKEN and FAMILY_SESSION_TOKEN must each contain at least 32 characters in production")
 	}
-	if config.deviceToken == config.familyToken {
-		return errors.New("DEVICE_TOKEN and FAMILY_SESSION_TOKEN must be different")
-	}
 	if len(config.telegramChatIDs) > 0 && config.telegramToken == "" {
 		return errors.New("TELEGRAM_BOT_TOKEN is required when TELEGRAM_CHAT_IDS is configured")
 	}
@@ -187,7 +185,7 @@ func validateConfig(config appConfig) error {
 }
 
 func loadConfig() appConfig {
-	environment := env("APP_ENV", "development")
+	environment := strings.TrimSpace(os.Getenv("APP_ENV"))
 	return appConfig{
 		environment: environment,
 		address:     env("HTTP_ADDRESS", ":8080"), production: environment == "production",

@@ -100,6 +100,97 @@ class SensorStorageTransactionTest {
     }
 
     @Test
+    fun closeAndReopenRestoresCheckpointAndPendingIngressBeforeContinuingSession() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val databaseName = "current-v1-runtime-recovery.db"
+        val encryptedPacket = byteArrayOf(9, 8, 7, 6)
+        val pendingIngress = ingress(
+            ingressId = "attempt-before-stop:0",
+            attemptId = "attempt-before-stop",
+            encryptedPacket = encryptedPacket,
+        ).toRecord()
+        context.deleteDatabase(databaseName)
+        try {
+            val first = Room.databaseBuilder(
+                context,
+                SladkayaDatabase::class.java,
+                databaseName,
+            ).build()
+            try {
+                assertEquals(
+                    SensorCoreCommitDisposition.COMMITTED,
+                    first.sensorCore().commit(coreBundle(sequence = 1)),
+                )
+                assertEquals(
+                    SensorPacketIngressAppendResult.Appended,
+                    RoomSensorPacketIngressJournal(first.sensorPacketIngress()).append(pendingIngress),
+                )
+            } finally {
+                first.close()
+            }
+
+            val reopened = Room.databaseBuilder(
+                context,
+                SladkayaDatabase::class.java,
+                databaseName,
+            ).build()
+            try {
+                assertEquals(1, reopened.sensorCore().checkpoint("sensor-a")?.sequence)
+                val journal = RoomSensorPacketIngressJournal(reopened.sensorPacketIngress())
+                val restored = journal.pending("sensor-a", "AA:BB:CC:DD:EE:FF").single()
+                assertEquals(pendingIngress.ingressId, restored.ingressId)
+                assertEquals(pendingIngress.sensorFamily, restored.sensorFamily)
+                assertEquals(pendingIngress.attemptId, restored.attemptId)
+                assertEquals(pendingIngress.ordinal, restored.ordinal)
+                assertEquals(pendingIngress.receivedAtEpochMs, restored.receivedAtEpochMs)
+                assertArrayEquals(encryptedPacket, restored.encryptedPacketCopy())
+
+                assertEquals(
+                    SensorCoreCommitDisposition.COMMITTED,
+                    reopened.sensorCore().commit(coreBundle(sequence = 2)),
+                )
+                assertEquals(
+                    SensorPacketIngressMarkHandledResult.MarkedHandled,
+                    journal.markHandled(
+                        SensorPacketIngressOutcomeRecord(
+                            ingressId = restored.ingressId,
+                            status = SensorPacketIngressOutcomeStatus.CORE_COMMITTED,
+                            handledAtEpochMs = restored.receivedAtEpochMs,
+                            detail = null,
+                        ),
+                    ),
+                )
+            } finally {
+                reopened.close()
+            }
+
+            val verified = Room.databaseBuilder(
+                context,
+                SladkayaDatabase::class.java,
+                databaseName,
+            ).build()
+            try {
+                assertEquals(2, verified.sensorCore().checkpoint("sensor-a")?.sequence)
+                assertTrue(
+                    RoomSensorPacketIngressJournal(verified.sensorPacketIngress())
+                        .pending("sensor-a", "AA:BB:CC:DD:EE:FF")
+                        .isEmpty(),
+                )
+                assertEquals(
+                    "CORE_COMMITTED",
+                    verified.sensorPacketIngress()
+                        .outcomeByIngressId(pendingIngress.ingressId)
+                        ?.status,
+                )
+            } finally {
+                verified.close()
+            }
+        } finally {
+            context.deleteDatabase(databaseName)
+        }
+    }
+
+    @Test
     fun lateMeasurementConflictRollsBackRawResultAndCheckpointAsOneRoomTransaction() = runBlocking {
         val dao = database.sensorCore()
         val value = coreBundle()
@@ -267,18 +358,21 @@ class SensorStorageTransactionTest {
         )
     }
 
-    private fun ingress(): SensorPacketIngressEntity {
-        val packet = byteArrayOf(1, 2, 3)
+    private fun ingress(
+        ingressId: String = "ingress-a",
+        attemptId: String = "attempt-a",
+        encryptedPacket: ByteArray = byteArrayOf(1, 2, 3),
+    ): SensorPacketIngressEntity {
         return SensorPacketIngressEntity(
-            ingressId = "ingress-a",
+            ingressId = ingressId,
             sensorId = "sensor-a",
             sensorFamily = "sibionics_gs1",
             bluetoothAddress = "AA:BB:CC:DD:EE:FF",
-            attemptId = "attempt-a",
+            attemptId = attemptId,
             ordinal = 0,
             receivedAtEpochMs = 1_700_000_000_000L,
-            encryptedPacket = packet,
-            packetSha256 = packet.sha256(),
+            encryptedPacket = encryptedPacket,
+            packetSha256 = encryptedPacket.sha256(),
         )
     }
 

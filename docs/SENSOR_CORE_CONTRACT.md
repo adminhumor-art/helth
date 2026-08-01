@@ -241,10 +241,11 @@ Durable commit истории или прогрева подтверждает �
 - Replay runner использует существующие `Gs1PacketVerifier` и stateful session,
   до нативного шага сверяет `STANDARD`, sensitivity metadata и private HMAC
   точного входа, затем проверяет output/checkpoint и context reopen между
-  attempt. Instrumentation-тест `Room close → reopen → restore checkpoint →
-  next commit` реализован и компилируется, но ещё не запускался на Android. Он не
-  доказывает process-kill или продолжение полного sensor replay. Единственный
-  fixture пока синтетический и не доказывает корректность реальных результатов.
+  attempt. Instrumentation-тест `checkpoint + pending ingress → Room close →
+  reopen → next commit → terminal outcome → second reopen` реализован и
+  компилируется, но ещё не запускался на Android. Он не доказывает process-kill
+  или продолжение полного sensor replay. Единственный fixture пока
+  синтетический и не доказывает корректность реальных результатов.
 - Реализованы долговечные outcomes и restart recovery до live GATT. Неизвестная
   команда остаётся pending, разрыв может быть закрыт более поздним сохранённым
   пакетом, а терминальный core-result оставляет хвост следующему поколению.
