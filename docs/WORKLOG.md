@@ -62,8 +62,12 @@ GS3 отделён от GS1/GS1Sb. Текущая GS1-сессия отклон�
 - официальный decoder sensitivity с разрешённым fallback только при точном
   специальном результате;
 - двойная проверка transport datahandle и независимого parser;
-- ограниченная последовательная очередь, GATT deadlines, generation-защита,
-  bounded reconnect и terminal fail-closed;
+- ограниченная последовательная очередь, GATT deadlines, bounded reconnect и
+  terminal fail-closed;
+- после падающих fake-GATT сценариев generation, identity, bind и close сведены
+  в один атомарный registry: callback до возврата `connectGatt`, поздний
+  callback, stop во время блокирующего disconnect и exactly-once release
+  проверяются на JVM; устаревший callback не может отравить текущую попытку;
 - append-only ingress, outcomes, журнал отказов и restart recovery pending
   пакетов;
 - атомарное сохранение raw sample, algorithm result и checkpoint;
@@ -83,12 +87,14 @@ initialization mode, token source и sensitivity binding. В Git разрешё�
 Текущий результат программных проверок:
 
 - `sensor:sibionics-datahandle`: 12 тестов;
-- `sensor:sibionics`: 196 тестов, включая 26 golden/replay;
+- `sensor:sibionics`: 198 тестов, включая 26 golden/replay и fake-GATT
+  lifecycle;
 - lint обоих модулей — успешно;
 - `git diff --check` — успешно.
 
 Эти проверки не заменяют ARM-smoke, private capture и испытание отдельного
-датчика.
+датчика. Они также не доказывают OEM-порядок callback: уже начатая GATT-операция
+может пересечься со stop, хотя её поздний callback больше не принимается.
 
 ## TDD Android-приложения
 
@@ -132,6 +138,8 @@ debug APK и minified release-сборки прошёл. Debug APK выровн�
 
 - Go API с обязательной `sequence`, проверкой диапазонов, времени, trend,
   quality и семейства сенсора;
+- единый JSON-safe контракт `sequence` во всём тракте:
+  `0..9 007 199 254 740 991` в Go, PostgreSQL, OpenAPI и web;
 - запрет `simulator` в продуктовом endpoint;
 - точный идемпотентный повтор и `409` при другом payload с тем же event ID либо
   при другом событии с той же парой `patientId + sensorId + sequence`;
@@ -175,7 +183,7 @@ Telegram и до фиксации `sent` возможно повторное с�
 и тестовую тревогу. На экране явно указано, что данные симулированные. Добавлена
 чистая типизированная граница будущего API: trusted patient scope, `VALID`,
 свежесть, часы и согласованность snapshot/history проверяются fail-closed;
-смена sensor/family/sequence разрывает график. Всего проходят 22 теста, build,
+смена sensor/family/sequence разрывает график. Всего проходят 23 теста, build,
 lint, полный TypeScript-check и production audit. Метаданные и `og-v2.png`
 прямо обозначают демо/симуляцию, не содержат имён людей и не обещают настоящую
 доставку тревог. Сайт пока не вызывает backend API и не открыт семье без

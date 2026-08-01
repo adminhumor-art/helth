@@ -288,6 +288,17 @@ func TestMeasurementIngestRequiresExplicitSequence(t *testing.T) {
 	}
 }
 
+func TestMeasurementIngestRejectsSequenceOutsideJSONSafeInteger(t *testing.T) {
+	server := New(Config{DeviceToken: deviceToken, FamilySessionToken: familyToken, PatientID: patientID}, store.NewMemory(), alerts.NewEngine(alerts.DefaultThresholds()))
+	value := validMeasurement(time.Now().UTC())
+	value.Sequence = 9_007_199_254_740_992
+
+	response := postMeasurement(t, server.Handler(), value, deviceToken)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("unsafe JSON sequence: expected 400, got %d: %s", response.Code, response.Body.String())
+	}
+}
+
 func TestSimulatorMeasurementIsRejectedBeforeStorageAndAlerts(t *testing.T) {
 	values := store.NewMemory()
 	server := New(Config{

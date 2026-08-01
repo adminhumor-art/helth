@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS measurements (
     glucose_mg_dl SMALLINT NOT NULL CHECK (glucose_mg_dl BETWEEN 20 AND 600),
     trend_mg_dl_per_minute DOUBLE PRECISION NOT NULL,
     quality TEXT NOT NULL CHECK (quality IN ('valid', 'warming_up', 'degraded')),
-    sequence BIGINT NOT NULL CHECK (sequence >= 0),
+    sequence BIGINT NOT NULL CHECK (sequence BETWEEN 0 AND 9007199254740991),
     UNIQUE (patient_id, sensor_id, sequence)
 );
 

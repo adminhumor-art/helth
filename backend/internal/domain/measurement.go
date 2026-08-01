@@ -26,6 +26,10 @@ const (
 	QualityDegraded  MeasurementQuality = "degraded"
 )
 
+// MaxSequence is the largest integer that survives a JSON number round trip
+// through both Go and JavaScript without loss of identity.
+const MaxSequence uint64 = 1<<53 - 1
+
 type Measurement struct {
 	EventID            string             `json:"eventId"`
 	PatientID          string             `json:"patientId,omitempty"`
@@ -82,8 +86,8 @@ func (m Measurement) Validate(now time.Time) error {
 	if math.IsNaN(m.TrendMgDLPerMinute) || math.IsInf(m.TrendMgDLPerMinute, 0) || math.Abs(m.TrendMgDLPerMinute) > 20 {
 		return errors.New("trendMgDlPerMinute is outside -20..20")
 	}
-	if m.Sequence > math.MaxInt64 {
-		return errors.New("sequence is outside PostgreSQL BIGINT")
+	if m.Sequence > MaxSequence {
+		return errors.New("sequence is outside the JSON safe-integer range")
 	}
 	switch m.Quality {
 	case QualityValid, QualityWarmingUp, QualityDegraded:

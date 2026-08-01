@@ -48,7 +48,12 @@
   синтетического файла с закреплённым SHA-256.
 - Recovery pending ingress проверяет семейство датчика до replay и не вызывает
   алгоритм при identity mismatch.
+- GATT generation, identity и ownership сведены в один атомарный registry;
+  callback-before-return, stale callback и close проверены fake-GATT тестами,
+  отклонённый транспорт освобождается ровно один раз.
 - Backend требует явный `APP_ENV` и разные device/family token во всех режимах.
+- `sequence` ограничен единым JSON-safe диапазоном в домене, начальной схеме,
+  OpenAPI и web; большее значение не доходит до хранения.
 - Web API boundary fail-closed сверяет trusted patient, свежесть, качество,
   часы и гонку snapshot/history; полный TypeScript-check включён в проверенный
   CI-шаблон, ожидающий активации.
@@ -61,13 +66,13 @@
 | BLE identity | Name suffix остаётся кандидатом, а не доказательством exact MAC |
 | GS3 | Требует отдельного транспорта, account binding и физического допуска |
 | Room restart | Двукратный reopen с checkpoint, pending ingress и outcome компилируется; нет device runtime, process-kill и продолжения полного replay |
-| Фоновая работа | Нет реального configured stream, Samsung/Doze/process-kill испытаний |
+| Фоновая работа | Fake-GATT lifecycle готов; in-flight platform call может пересечь stop, нет реального configured stream, Samsung/Doze/process-kill испытаний |
 | Тревога Android | Программный повтор/подтверждение готовы; нужны DND, Doze, громкость и ночной тест |
 | Виджет | Политика скрывает demo/stale/clock-mismatch/non-VALID; нет строгой гарантии watchdog после гибели процесса |
 | Настройки | Локальные и серверные пороги пока не синхронизированы |
 | Backend auth | Device/family token разделены, но это ещё не семейные аккаунты, сессии и роли |
 | Telegram | Нет настоящего bot token/chat и сетевой end-to-end проверки; claim/lease/retry уже покрыты тестами |
-| Сайт | Typed boundary готов, но нет server-side BFF/session; family token нельзя отдавать браузеру |
+| Сайт | Typed boundary и JSON-safe sequence готовы, но нет server-side BFF/session; family token нельзя отдавать браузеру |
 
 ## Диагностический карантин
 

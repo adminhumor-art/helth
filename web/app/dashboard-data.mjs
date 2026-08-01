@@ -146,7 +146,7 @@ function hasInconsistentHistory(input, patientId, latest, nowEpochMs) {
 /**
  * Reads only enough of a rejected history item to ensure that a valid-looking
  * newer timestamp cannot disappear because JavaScript cannot safely represent
- * another field such as a PostgreSQL BIGINT sequence.
+ * an out-of-contract integer field such as an unsafe sequence.
  * @param {unknown} input
  * @param {string} patientId
  */

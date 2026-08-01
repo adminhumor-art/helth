@@ -112,6 +112,10 @@
   writes, ограничивает каждую фазу deadline, ограничивает auth retry, закрывает
   Bluetooth до ожидания базы и автоматически переподключается с bounded
   exponential backoff;
+- generation, identity, bind и close сведены в один атомарный GATT-registry;
+  fake-GATT тесты покрывают callback до возврата `connectGatt`, stale callback,
+  параллельный stop и exactly-once release, а endpoint проверяется только после
+  identity gate;
 - терминальный core-result больше не запускает уже принятый хвост через тот же
   native context; первая причина сбоя сохраняет приоритет при callback/actor
   гонке; история и прогрев не объявляются свежим диагностическим потоком;
@@ -147,8 +151,8 @@
 - физический trace onboarding `код → BLE identity → точный MAC`; программный
   контур до `PENDING_DIAGNOSTIC` готов, но текущая name-suffix политика остаётся
   только кандидатом до проверки отдельного датчика;
-- Android-инструментальные тесты GATT callback/lifecycle на fake transport или
-  Robolectric и затем на реальном Samsung;
+- реальный порядок GATT callback/lifecycle на Samsung; JVM fake-transport
+  контур уже реализован и не заменяет физический Android-прогон;
 - instrumentation-тесты текущей Room `v1`, включая
   checkpoint + pending ingress, `close → reopen → next commit → second reopen`,
   реализованы и компилируются; остаётся runtime-прогон на Android;
@@ -246,13 +250,15 @@ GS3 не проводится через алгоритм GS1/GS1Sb. Для не
 - подготовлена typed API boundary: trusted patient scope, свежесть, `VALID`,
   clock mismatch и согласованность snapshot/history проверяются fail-closed;
 - при смене датчика/семейства, пропуске sequence или отброшенной точке web-график
-  начинает новый сегмент; Go `int64 sequence`, который JavaScript не представляет
-  точно, не может скрыть конкурирующее показание;
+  начинает новый сегмент; out-of-contract небезопасный sequence не может скрыть
+  конкурирующее показание;
+- контракт `sequence` синхронизирован: JSON integer безопасен до
+  `9 007 199 254 740 991`, и та же граница действует в Go, PostgreSQL, OpenAPI и
+  web;
 - настоящий Telegram и семейная авторизация пока не подключены.
 
 Перед сетевым live-подключением остаётся выбрать server-side BFF/session, не
-передающий family token браузеру, и закрепить единое представление `sequence` в
-API-контракте.
+передающий family token браузеру.
 
 ## Когда нужен владелец
 

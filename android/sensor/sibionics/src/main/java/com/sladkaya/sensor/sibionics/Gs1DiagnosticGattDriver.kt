@@ -101,7 +101,10 @@ class Gs1DiagnosticGattDriver internal constructor(
         appContext.getSystemService(BluetoothManager::class.java)
     private val codec = SibionicsPacketCodec()
     private val dataHandle = SibionicsDataHandle()
-    private val generationGate = Gs1GattGenerationGate<BluetoothGatt>()
+    private val transportRegistry = Gs1GattTransportRegistry<BluetoothGatt>(
+        disconnect = ::safeDisconnect,
+        close = ::safeClose,
+    )
     private val lifecycle = Mutex()
     private val active = AtomicReference<Attempt?>(null)
     private val desired = AtomicReference<DesiredConnection?>(null)
@@ -219,7 +222,8 @@ class Gs1DiagnosticGattDriver internal constructor(
                     return
                 }
 
-                val token = generationGate.begin(profile)
+                val transport = transportRegistry.begin(profile)
+                val token = transport.token
                 val initialDeadline = Gs1GattDeadlinePolicy.begin(
                     generation = token.generation,
                     nowElapsedMillis = elapsedClock(),
@@ -236,7 +240,7 @@ class Gs1DiagnosticGattDriver internal constructor(
                 )
                 val attempt = Attempt(
                     profile = profile,
-                    token = token,
+                    transport = transport,
                     coreGeneration = core.generation,
                     session = session,
                     deadlinePolicy = initialDeadline.policy,
@@ -273,13 +277,19 @@ class Gs1DiagnosticGattDriver internal constructor(
                     failOffer(attempt, "GATT_CONNECT_FAILED", failure.message, true)
                     return
                 }
-                if (!generationGate.bindConnectResult(
-                        token = token,
+                val reportedBluetoothAddress = try {
+                    gatt.device.address
+                } catch (failure: SecurityException) {
+                    transportRegistry.releaseIfUnowned(transport, gatt)
+                    failOffer(attempt, "BLUETOOTH_PERMISSION_REVOKED", failure.message, false)
+                    return
+                }
+                if (!transportRegistry.bindConnectResult(
+                        lease = transport,
                         gatt = gatt,
-                        reportedBluetoothAddress = profile.bluetoothAddress,
-                    ) || !attempt.gatt.compareAndSet(null, gatt) && attempt.gatt.get() !== gatt
+                        reportedBluetoothAddress = reportedBluetoothAddress,
+                    )
                 ) {
-                    if (attempt.gatt.get() === gatt) closeGattOnce(attempt, gatt) else safeClose(gatt)
                     failOffer(attempt, "GATT_IDENTITY_CONFLICT", null, false)
                 }
             } finally {
@@ -330,13 +340,14 @@ class Gs1DiagnosticGattDriver internal constructor(
             descriptor: BluetoothGattDescriptor,
             status: Int,
         ) {
+            if (!acceptCallback(attempt, gatt)) return
             if (descriptor.uuid != SibionicsUuids.CLIENT_CHARACTERISTIC_CONFIGURATION ||
                 descriptor.characteristic.uuid != SibionicsUuids.NOTIFY
             ) {
                 failOffer(attempt, "UNEXPECTED_GATT_DESCRIPTOR", descriptor.uuid.toString(), false)
                 return
             }
-            offerCallback(attempt, gatt, GattEvent.SubscriptionWritten(status))
+            offer(attempt, GattEvent.SubscriptionWritten(status))
         }
 
         override fun onCharacteristicWrite(
@@ -344,11 +355,12 @@ class Gs1DiagnosticGattDriver internal constructor(
             characteristic: BluetoothGattCharacteristic,
             status: Int,
         ) {
+            if (!acceptCallback(attempt, gatt)) return
             if (characteristic.uuid != SibionicsUuids.WRITE) {
                 failOffer(attempt, "UNEXPECTED_GATT_WRITE_ENDPOINT", characteristic.uuid.toString(), false)
                 return
             }
-            offerCallback(attempt, gatt, GattEvent.CommandWritten(status))
+            offer(attempt, GattEvent.CommandWritten(status))
         }
 
         override fun onCharacteristicChanged(
@@ -356,11 +368,12 @@ class Gs1DiagnosticGattDriver internal constructor(
             characteristic: BluetoothGattCharacteristic,
             value: ByteArray,
         ) {
+            if (!acceptCallback(attempt, gatt)) return
             if (characteristic.uuid != SibionicsUuids.NOTIFY) {
                 failOffer(attempt, "UNEXPECTED_GATT_NOTIFY_ENDPOINT", characteristic.uuid.toString(), false)
                 return
             }
-            offerCallback(attempt, gatt, GattEvent.Notification(value.copyOf()))
+            offer(attempt, GattEvent.Notification(value.copyOf()))
         }
 
         @Suppress("OVERRIDE_DEPRECATION", "DEPRECATION")
@@ -375,18 +388,23 @@ class Gs1DiagnosticGattDriver internal constructor(
 
     @SuppressLint("MissingPermission")
     private fun offerCallback(attempt: Attempt, gatt: BluetoothGatt, event: GattEvent) {
+        if (acceptCallback(attempt, gatt)) offer(attempt, event)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun acceptCallback(attempt: Attempt, gatt: BluetoothGatt): Boolean {
         val address = try {
             gatt.device.address
         } catch (_: SecurityException) {
+            transportRegistry.releaseIfUnowned(attempt.transport, gatt)
             failOffer(attempt, "BLUETOOTH_PERMISSION_REVOKED", null, false)
-            return
+            return false
         }
-        if (!generationGate.accept(attempt.token, gatt, address)) {
+        if (!transportRegistry.acceptCallback(attempt.transport, gatt, address)) {
             // A stale callback is not allowed to mutate any current state.
-            return
+            return false
         }
-        attempt.gatt.compareAndSet(null, gatt)
-        offer(attempt, event)
+        return true
     }
 
     private fun offer(attempt: Attempt, event: GattEvent) {
@@ -486,7 +504,7 @@ class Gs1DiagnosticGattDriver internal constructor(
                         attempt.phase = GattPhase.DISCOVERING
                         mutableState.value = Gs1DiagnosticGattState.DiscoveringServices
                         enterDeadline(attempt, Gs1GattDeadlinePhase.DISCOVERING)
-                        val gatt = attempt.gatt.get()
+                        val gatt = transportRegistry.current(attempt.transport)
                             ?: return failure("GATT_UNBOUND", null, false)
                         if (event.status != BluetoothGatt.GATT_SUCCESS || !gatt.discoverServices()) {
                             failure("SERVICE_DISCOVERY_DID_NOT_START", event.status.toString(), true)
@@ -592,7 +610,8 @@ class Gs1DiagnosticGattDriver internal constructor(
 
     @SuppressLint("MissingPermission")
     private fun subscribe(attempt: Attempt): GattEvent.Failure? {
-        val gatt = attempt.gatt.get() ?: return failure("GATT_UNBOUND", null, false)
+        val gatt = transportRegistry.current(attempt.transport)
+            ?: return failure("GATT_UNBOUND", null, false)
         val service = gatt.getService(SibionicsUuids.SERVICE)
             ?: return failure("GS1_SERVICE_MISSING", null, false)
         val notify = service.getCharacteristic(SibionicsUuids.NOTIFY)
@@ -791,7 +810,7 @@ class Gs1DiagnosticGattDriver internal constructor(
 
     @SuppressLint("MissingPermission")
     private fun startPhysicalWrite(attempt: Attempt, bytes: ByteArray): GattEvent.Failure? {
-        val gatt = attempt.gatt.get()
+        val gatt = transportRegistry.current(attempt.transport)
             ?: return failCurrentWrite(attempt, "GATT_UNBOUND", null, false)
         val characteristic = attempt.writeCharacteristic.get()
             ?: return failCurrentWrite(attempt, "GS1_WRITE_MISSING", null, false)
@@ -962,12 +981,8 @@ class Gs1DiagnosticGattDriver internal constructor(
     @SuppressLint("MissingPermission")
     private fun closeAttemptTransport(attempt: Attempt) {
         attempt.accepting.set(false)
-        generationGate.stop(attempt.token)
         attempt.commandArbiter.close()
-        attempt.gatt.get()?.let { gatt ->
-            safeDisconnect(gatt)
-            closeGattOnce(attempt, gatt)
-        }
+        transportRegistry.close(attempt.transport)
         attempt.mailbox.close()
     }
 
@@ -1049,10 +1064,6 @@ class Gs1DiagnosticGattDriver internal constructor(
         runCatching { gatt.close() }
     }
 
-    private fun closeGattOnce(attempt: Attempt, gatt: BluetoothGatt) {
-        if (attempt.gattClosed.compareAndSet(false, true)) safeClose(gatt)
-    }
-
     private fun failure(
         code: String,
         detail: String?,
@@ -1061,7 +1072,7 @@ class Gs1DiagnosticGattDriver internal constructor(
 
     private class Attempt(
         val profile: Gs1DiagnosticActivationProfile,
-        val token: Gs1GattGenerationToken,
+        val transport: Gs1GattTransportLease<BluetoothGatt>,
         val reconnectToken: Gs1ReconnectToken,
         val coreGeneration: Long,
         val session: SibionicsSession,
@@ -1069,15 +1080,13 @@ class Gs1DiagnosticGattDriver internal constructor(
         val mailbox: Channel<GattEvent> = Channel(GATT_MAILBOX_CAPACITY),
         val accepting: AtomicBoolean = AtomicBoolean(true),
         val stopRequested: AtomicBoolean = AtomicBoolean(false),
-        val gatt: AtomicReference<BluetoothGatt?> = AtomicReference(null),
         val writeCharacteristic: AtomicReference<BluetoothGattCharacteristic?> = AtomicReference(null),
         val commandArbiter: Gs1GattCommandArbiter = Gs1GattCommandArbiter(),
-        val gattClosed: AtomicBoolean = AtomicBoolean(false),
         val nextIngressOrdinal: AtomicLong = AtomicLong(0L),
         val terminalFailure: FirstTerminalCause<GattEvent.Failure> = FirstTerminalCause(),
         var deadlinePolicy: Gs1GattDeadlinePolicy,
         var streamFreshnessPolicy: Gs1StreamFreshnessPolicy =
-            Gs1StreamFreshnessPolicy.begin(token.generation),
+            Gs1StreamFreshnessPolicy.begin(transport.token.generation),
         var delayedWriteSequence: Long = 0L,
         var phase: GattPhase = GattPhase.CONNECTING,
     ) {

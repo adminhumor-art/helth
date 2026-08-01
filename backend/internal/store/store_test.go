@@ -16,6 +16,7 @@ import (
 func TestInitialSchemaUsesFinalTextEventIDs(t *testing.T) {
 	for _, fragment := range []string{
 		"event_id TEXT PRIMARY KEY",
+		"sequence BIGINT NOT NULL CHECK (sequence BETWEEN 0 AND 9007199254740991)",
 		"UNIQUE (patient_id, sensor_id, sequence)",
 		"measurement_id TEXT REFERENCES measurements(event_id)",
 		"lease_token TEXT",

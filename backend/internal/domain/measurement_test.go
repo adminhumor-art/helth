@@ -2,7 +2,6 @@ package domain
 
 import (
 	"encoding/json"
-	"math"
 	"strings"
 	"testing"
 	"time"
@@ -18,13 +17,23 @@ func TestMeasurementValidateAcceptsDeterministicContentEventID(t *testing.T) {
 	}
 }
 
-func TestMeasurementValidateRejectsSequenceOutsidePostgresBigint(t *testing.T) {
+func TestMeasurementValidateAcceptsMaximumJSONSafeSequence(t *testing.T) {
 	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
 	value := validDomainMeasurement(now)
-	value.Sequence = uint64(math.MaxInt64) + 1
+	value.Sequence = 9_007_199_254_740_991
+
+	if err := value.Validate(now); err != nil {
+		t.Fatalf("maximum JSON-safe sequence must be accepted: %v", err)
+	}
+}
+
+func TestMeasurementValidateRejectsSequenceOutsideJSONSafeInteger(t *testing.T) {
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	value := validDomainMeasurement(now)
+	value.Sequence = 9_007_199_254_740_992
 
 	if err := value.Validate(now); err == nil {
-		t.Fatal("sequence outside PostgreSQL BIGINT must be rejected before storage")
+		t.Fatal("sequence outside the JSON safe-integer range must be rejected before storage")
 	}
 }
 

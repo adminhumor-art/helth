@@ -102,6 +102,14 @@ test("fresh valid backend data becomes a typed live view model", () => {
   assert.deepEqual(result.chartSegments.map((segment) => segment.map((point) => point.value)), [[101, 93], [58]]);
 });
 
+test("maximum JSON-safe sequence remains representable in live data", () => {
+  const latest = measurement({ sequence: Number.MAX_SAFE_INTEGER });
+  const result = live(snapshot(latest), [latest]);
+
+  assert.equal(result.state, "ready");
+  assert.equal(result.latest?.glucoseMgDl, 58);
+});
+
 test("uppercase backend UUID remains valid", () => {
   const uppercase = measurement({
     eventId: "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE",

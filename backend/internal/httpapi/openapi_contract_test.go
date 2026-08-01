@@ -19,4 +19,8 @@ func TestProductOpenAPIExcludesSimulatorAndRequiresSequence(t *testing.T) {
 	if !strings.Contains(contract, requiredSequence) {
 		t.Fatal("measurement sequence must remain required in the product contract")
 	}
+	sequenceRange := "        sequence:\n          type: integer\n          minimum: 0\n          maximum: 9007199254740991\n"
+	if !strings.Contains(contract, sequenceRange) {
+		t.Fatal("measurement sequence must remain a JSON safe integer across Go and JavaScript")
+	}
 }
