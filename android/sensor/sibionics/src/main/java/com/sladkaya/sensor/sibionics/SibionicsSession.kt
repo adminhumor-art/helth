@@ -5,8 +5,6 @@ import com.sladkaya.core.sensor.SensorConfiguration
 import com.sladkaya.sensor.sibionics.datahandle.DataHandleCommandResult
 import com.sladkaya.sensor.sibionics.datahandle.DataHandleVariant
 import com.sladkaya.sensor.sibionics.datahandle.SibionicsDataHandle
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 
 internal sealed interface SessionAction {
     data class Write(val bytes: ByteArray) : SessionAction
@@ -32,7 +30,7 @@ internal class OfficialGs1CommandCodec(
 ) : Gs1CommandCodec {
     override fun authentication(protocolVariant: Int, bluetoothAddress: String): Gs1CommandResult {
         val variant = DataHandleVariant.entries.firstOrNull {
-            it.protocolCode == protocolVariant && it != DataHandleVariant.GS3
+            it.protocolCode == protocolVariant
         } ?: return Gs1CommandResult.Failure("Unsupported GS1 protocol variant $protocolVariant")
         return dataHandle.authentication(variant, bluetoothAddress).toGs1CommandResult()
     }
@@ -59,11 +57,12 @@ internal class OfficialGs1CommandCodec(
 }
 
 /**
- * Pure protocol state machine. Physical readings remain diagnostic until this
+ * Pure GS1/GS1Sb protocol state machine. GS3 intentionally requires a separate
+ * future implementation. Physical readings remain diagnostic until this
  * sequence is matched against the manufacturer's application on real hardware.
  */
 internal class SibionicsSession(
-    private val family: SensorFamily,
+    family: SensorFamily,
     private val configuration: SensorConfiguration,
     private val gs1Commands: Gs1CommandCodec? = null,
     initialNextIndex: Int = 1,
@@ -77,20 +76,15 @@ internal class SibionicsSession(
         get() = nextIndex
 
     init {
+        require(family == SensorFamily.SIBIONICS_GS1 || family == SensorFamily.SIBIONICS_GS1SB) {
+            "SibionicsSession supports only GS1/GS1Sb; GS3 requires a separate verified protocol path"
+        }
         require(initialNextIndex in 1..0xffff)
     }
 
     fun initial(deviceAddress: String): SessionAction {
-        val variant = when (family) {
-            SensorFamily.SIBIONICS_GS3 -> configuration.protocolVariant ?: 4
-            SensorFamily.SIBIONICS_GS1, SensorFamily.SIBIONICS_GS1SB -> configuration.protocolVariant
-                ?: return SessionAction.Failure("SiBionics protocol variant is required for this regional model")
-            else -> return SessionAction.Failure("Unsupported SiBionics family")
-        }
-        if (family == SensorFamily.SIBIONICS_GS3) {
-            return runCatching { SessionAction.Write(SibionicsCommands.gs3Authentication(deviceAddress)) }
-                .getOrElse { SessionAction.Failure(it.message ?: "GS3 authentication command could not be built") }
-        }
+        val variant = configuration.protocolVariant
+            ?: return SessionAction.Failure("SiBionics protocol variant is required for this regional model")
         val commands = gs1Commands
             ?: return SessionAction.Failure("Official GS1 command codec is unavailable")
         if (gs1Phase != Gs1Phase.CREATED) {
@@ -106,26 +100,9 @@ internal class SibionicsSession(
         }
     }
 
-    fun onPacket(packet: DecodedPacket): SessionAction {
-        if (family == SensorFamily.SIBIONICS_GS1 || family == SensorFamily.SIBIONICS_GS1SB) {
-            return onGs1Packet(packet)
-        }
-        return when (packet) {
-            is DecodedPacket.Acknowledgement -> onAcknowledgement(packet)
-            is DecodedPacket.DeviceInformation -> onDeviceInformation(packet.subcommand)
-            is DecodedPacket.Gs3GlucoseSamples -> {
-                packet.values.maxOfOrNull { it.index }?.let { nextIndex = it + 1 }
-                SessionAction.None
-            }
-            is DecodedPacket.Invalid -> SessionAction.Failure("Invalid sensor packet: ${packet.reason}")
-            else -> SessionAction.None
-        }
-    }
+    fun onPacket(packet: DecodedPacket): SessionAction = onGs1Packet(packet)
 
     fun confirmDurablyCommitted(samples: List<DecodedGs1RawSample>): SessionAction {
-        if (family != SensorFamily.SIBIONICS_GS1 && family != SensorFamily.SIBIONICS_GS1SB) {
-            return SessionAction.Failure("Durable GS1 cursor cannot be used for this sensor family")
-        }
         if (gs1Phase != Gs1Phase.RECEIVING_DATA) {
             return failGs1("GS1 samples were committed outside the data phase")
         }
@@ -198,23 +175,6 @@ internal class SibionicsSession(
         return SessionAction.WriteAfter(AUTHENTICATION_RETRY_DELAY_MS, command.copyOf())
     }
 
-    private fun onAcknowledgement(ack: DecodedPacket.Acknowledgement): SessionAction {
-        if (family == SensorFamily.SIBIONICS_GS3) {
-            return when (ack.command) {
-                0x01 -> bindUser(1)
-                0x13 -> when {
-                    ack.status == 2 -> SessionAction.Failure("GS3 rejected the account ID")
-                    ack.status == 0 && ack.detail == 0 -> SessionAction.Write(SibionicsCommands.deviceInfo(1))
-                    else -> bindUser(2)
-                }
-                0x0f -> SessionAction.Write(SibionicsCommands.timeUpdate(epochSeconds()))
-                0x03 -> SessionAction.Write(SibionicsCommands.requestGs3(nextIndex))
-                else -> SessionAction.None
-            }
-        }
-        return SessionAction.Failure("GS1 acknowledgement reached the GS3 state machine")
-    }
-
     private inline fun gs1Command(
         nextPhase: Gs1Phase,
         build: Gs1CommandCodec.() -> Gs1CommandResult,
@@ -234,23 +194,6 @@ internal class SibionicsSession(
         return SessionAction.Failure(reason)
     }
 
-    private fun onDeviceInformation(subcommand: Int): SessionAction {
-        if (family != SensorFamily.SIBIONICS_GS3) return SessionAction.None
-        return when (subcommand) {
-            1 -> SessionAction.Write(SibionicsCommands.deviceInfo(7))
-            7 -> SessionAction.Write(SibionicsCommands.gs3Activation(epochSeconds()))
-            else -> SessionAction.None
-        }
-    }
-
-    private fun bindUser(sequence: Int): SessionAction {
-        val accountId = configuration.pairingPayload
-        if (accountId == null || accountId.size != 12) {
-            return SessionAction.Failure("GS3 requires a 12-byte account ID payload")
-        }
-        return SessionAction.Write(SibionicsCommands.bindUser(accountId, sequence))
-    }
-
     private enum class Gs1Phase {
         CREATED,
         AUTHENTICATING,
@@ -263,82 +206,4 @@ internal class SibionicsSession(
     private companion object {
         const val AUTHENTICATION_RETRY_DELAY_MS = 1_000L
     }
-}
-
-internal object SibionicsCommands {
-    fun gs3Authentication(address: String): ByteArray {
-        val addressBytes = parseAddress(address).reversedArray()
-        val plain = ByteArray(26)
-        plain[0] = 0x19
-        plain[1] = 0x01
-        addressBytes.copyInto(plain, 3)
-        GS3_REGISTRATION_KEY.encodeToByteArray().copyInto(plain, 9)
-        finishChecksum(plain)
-        return Rc4.xor(plain)
-    }
-
-    fun timeUpdate(epochSeconds: Long): ByteArray = packet(7) {
-        this[0] = 0x06
-        this[1] = 0x03
-        putU32(2, epochSeconds)
-    }
-
-    fun requestGs3(index: Int): ByteArray = request(index, 0x14)
-
-    fun bindUser(accountId: ByteArray, sequence: Int): ByteArray = packet(16) {
-        require(accountId.size == 12)
-        this[0] = 0x0f
-        this[1] = 0x13
-        this[2] = sequence.toByte()
-        accountId.copyInto(this, 3)
-    }
-
-    fun deviceInfo(number: Int): ByteArray = packet(4) {
-        require(number in 1..12)
-        this[0] = 0x03
-        this[1] = 0xf0.toByte()
-        this[2] = number.toByte()
-    }
-
-    fun gs3Activation(epochSeconds: Long): ByteArray = packet(7) {
-        this[0] = 0x06
-        this[1] = 0x0f
-        putU32(2, epochSeconds)
-    }
-
-    private fun request(index: Int, command: Int): ByteArray = packet(7) {
-        require(index in 0..0xffff)
-        this[0] = 0x06
-        this[1] = command.toByte()
-        putU16(2, index)
-        putU16(4, 0)
-    }
-
-    private inline fun packet(size: Int, fill: ByteArray.() -> Unit): ByteArray {
-        val plain = ByteArray(size)
-        plain.fill()
-        finishChecksum(plain)
-        return Rc4.xor(plain)
-    }
-
-    private fun finishChecksum(bytes: ByteArray) {
-        bytes[bytes.lastIndex] = (-bytes.take(bytes.lastIndex).sum()).toByte()
-    }
-
-    private fun ByteArray.putU16(offset: Int, value: Int) {
-        ByteBuffer.wrap(this, offset, 2).order(ByteOrder.LITTLE_ENDIAN).putShort(value.toShort())
-    }
-
-    private fun ByteArray.putU32(offset: Int, value: Long) {
-        require(value in 0..0xffff_ffffL)
-        ByteBuffer.wrap(this, offset, 4).order(ByteOrder.LITTLE_ENDIAN).putInt(value.toInt())
-    }
-
-    private fun parseAddress(value: String): ByteArray {
-        val parts = value.split(':')
-        require(parts.size == 6 && parts.all { it.length == 2 }) { "Invalid Bluetooth address" }
-        return parts.map { it.toInt(16).toByte() }.toByteArray()
-    }
-
-    private const val GS3_REGISTRATION_KEY = "THE544U0TYITE461"
 }

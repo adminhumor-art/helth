@@ -13,6 +13,7 @@ import (
 
 	"glucose-monitor/backend/internal/alerts"
 	"glucose-monitor/backend/internal/delivery"
+	"glucose-monitor/backend/internal/domain"
 	"glucose-monitor/backend/internal/httpapi"
 	"glucose-monitor/backend/internal/store"
 	"glucose-monitor/backend/internal/telegram"
@@ -21,12 +22,8 @@ import (
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	config := loadConfig()
-	if config.production && (config.deviceToken == "" || config.familyToken == "" || config.patientID == "") {
-		logger.Error("DEVICE_TOKEN, FAMILY_SESSION_TOKEN and PATIENT_ID are required in production")
-		os.Exit(1)
-	}
-	if config.production && len(config.telegramChatIDs) > 0 && config.telegramToken == "" {
-		logger.Error("TELEGRAM_BOT_TOKEN is required when TELEGRAM_CHAT_IDS is configured")
+	if err := validateConfig(config); err != nil {
+		logger.Error("invalid configuration", "error", err)
 		os.Exit(1)
 	}
 	var values store.Store
@@ -37,8 +34,8 @@ func main() {
 			logger.Error("connect to postgres", "error", err)
 			os.Exit(1)
 		}
-		if err := postgres.Migrate(context.Background()); err != nil {
-			logger.Error("migrate postgres", "error", err)
+		if err := postgres.InitializeSchema(context.Background()); err != nil {
+			logger.Error("initialize postgres schema", "error", err)
 			os.Exit(1)
 		}
 		if err := postgres.Bootstrap(context.Background(), config.patientID); err != nil {
@@ -72,22 +69,18 @@ func main() {
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	staleTicker := time.NewTicker(30 * time.Second)
-	defer staleTicker.Stop()
-	deliveryTicker := time.NewTicker(2 * time.Second)
-	defer deliveryTicker.Stop()
-	staleDone := make(chan struct{})
+	defer signal.Stop(stop)
+	schedulerCtx, stopSchedulers := context.WithCancel(context.Background())
+	schedulersDone := make(chan struct{})
 	go func() {
-		for {
-			select {
-			case at := <-staleTicker.C:
-				api.CheckStaleness(context.Background(), config.patientID, at.UTC())
-			case at := <-deliveryTicker.C:
-				deliveryWorker.RunOnce(context.Background(), at.UTC())
-			case <-staleDone:
-				return
-			}
-		}
+		runSchedulers(
+			schedulerCtx,
+			30*time.Second,
+			2*time.Second,
+			func(ctx context.Context, at time.Time) { api.CheckStaleness(ctx, config.patientID, at) },
+			func(ctx context.Context, _ time.Time) { deliveryWorker.RunOnce(ctx, time.Now().UTC()) },
+		)
+		close(schedulersDone)
 	}()
 	go func() {
 		logger.Info("api listening", "address", config.address)
@@ -98,13 +91,56 @@ func main() {
 	}()
 
 	<-stop
-	close(staleDone)
+	stopSchedulers()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = server.Shutdown(ctx)
+	select {
+	case <-schedulersDone:
+	case <-ctx.Done():
+		logger.Error("background schedulers did not stop", "error", ctx.Err())
+	}
+}
+
+func runSchedulers(
+	ctx context.Context,
+	staleInterval time.Duration,
+	deliveryInterval time.Duration,
+	checkStaleness func(context.Context, time.Time),
+	runDelivery func(context.Context, time.Time),
+) {
+	staleCtx, stopStaleness := context.WithCancel(ctx)
+	defer stopStaleness()
+	deliveryCtx, stopDelivery := context.WithCancel(ctx)
+	defer stopDelivery()
+	done := make(chan struct{}, 2)
+	go func() {
+		runScheduler(staleCtx, staleInterval, checkStaleness)
+		done <- struct{}{}
+	}()
+	go func() {
+		runScheduler(deliveryCtx, deliveryInterval, runDelivery)
+		done <- struct{}{}
+	}()
+	<-done
+	<-done
+}
+
+func runScheduler(ctx context.Context, interval time.Duration, task func(context.Context, time.Time)) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case at := <-ticker.C:
+			task(ctx, at.UTC())
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 type appConfig struct {
+	environment     string
 	address         string
 	production      bool
 	deviceToken     string
@@ -115,10 +151,46 @@ type appConfig struct {
 	databaseURL     string
 }
 
+func validateConfig(config appConfig) error {
+	if config.environment != "" {
+		switch config.environment {
+		case "development", "test", "production":
+		default:
+			return errors.New("APP_ENV must be development, test or production")
+		}
+		if (config.environment == "production") != config.production {
+			return errors.New("APP_ENV and production mode are inconsistent")
+		}
+	}
+	if !config.production {
+		return nil
+	}
+	if config.deviceToken == "" || config.familyToken == "" || config.patientID == "" {
+		return errors.New("DEVICE_TOKEN, FAMILY_SESSION_TOKEN and PATIENT_ID are required in production")
+	}
+	if config.databaseURL == "" {
+		return errors.New("DATABASE_URL is required in production")
+	}
+	if !domain.IsUUID(config.patientID) {
+		return errors.New("PATIENT_ID must be a UUID in production")
+	}
+	if len(config.deviceToken) < 32 || len(config.familyToken) < 32 {
+		return errors.New("DEVICE_TOKEN and FAMILY_SESSION_TOKEN must each contain at least 32 characters in production")
+	}
+	if config.deviceToken == config.familyToken {
+		return errors.New("DEVICE_TOKEN and FAMILY_SESSION_TOKEN must be different")
+	}
+	if len(config.telegramChatIDs) > 0 && config.telegramToken == "" {
+		return errors.New("TELEGRAM_BOT_TOKEN is required when TELEGRAM_CHAT_IDS is configured")
+	}
+	return nil
+}
+
 func loadConfig() appConfig {
 	environment := env("APP_ENV", "development")
 	return appConfig{
-		address: env("HTTP_ADDRESS", ":8080"), production: environment == "production",
+		environment: environment,
+		address:     env("HTTP_ADDRESS", ":8080"), production: environment == "production",
 		deviceToken:     env("DEVICE_TOKEN", developmentOnly(environment, "dev-device-token")),
 		familyToken:     env("FAMILY_SESSION_TOKEN", developmentOnly(environment, "dev-family-token")),
 		patientID:       env("PATIENT_ID", developmentOnly(environment, "00000000-0000-4000-8000-000000000001")),

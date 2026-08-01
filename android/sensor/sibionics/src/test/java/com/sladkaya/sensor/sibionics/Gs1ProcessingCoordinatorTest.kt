@@ -31,7 +31,7 @@ import org.junit.Test
 
 class Gs1ProcessingCoordinatorTest {
     @Test
-    fun commitsRawResultMeasurementAndCheckpointBeforeAdvancingSession() = runBlocking {
+    fun commitsRawDiagnosticResultAndCheckpointBeforeAdvancingSession() = runBlocking {
         val native = FakeNative().apply {
             results += NativeAlgorithmSnapshot(6.0, trend = -2, glucoseWarning = 1)
             results += NativeAlgorithmSnapshot(6.1, trend = -1)
@@ -43,8 +43,8 @@ class Gs1ProcessingCoordinatorTest {
         val first = coordinator.process(packet, sample(index = 65, current = 50, reindex = 0))
         val second = coordinator.process(packet, sample(index = 66, current = 51, reindex = 0))
 
-        assertTrue(first is Gs1ProcessingResult.Accepted)
-        assertTrue(second is Gs1ProcessingResult.Accepted)
+        assertTrue(first is Gs1ProcessingResult.Diagnostic)
+        assertTrue(second is Gs1ProcessingResult.Diagnostic)
         assertEquals(listOf(65, 66), native.processedIndices)
         val saved = store.records.first()
         assertArrayEquals(packet, saved.raw.packetCopy())
@@ -53,15 +53,15 @@ class Gs1ProcessingCoordinatorTest {
         assertEquals(6.0, saved.result.nativeGlucoseMmolL, 0.0001)
         assertEquals(6.0, saved.result.displayedGlucoseMmolL, 0.0001)
         assertEquals(1, saved.result.glucoseWarning)
-        assertEquals(true, saved.result.alarmEligible)
-        assertEquals(108, saved.measurement?.glucoseMgDl)
-        assertEquals(-2.6, saved.measurement?.trendMgDlPerMinute ?: 0.0, 0.0001)
+        assertFalse(saved.result.publishable)
+        assertFalse(saved.result.alarmEligible)
+        assertNull(saved.measurement)
         assertEquals(65, saved.checkpoint.sequence)
         assertArrayEquals(native.exportedState, saved.checkpoint.stateCopy())
     }
 
     @Test
-    fun warmupAndHistoryAreStoredButNeverMarkedEligibleForAlarm() = runBlocking {
+    fun warmupAndHistoryRemainExplicitDiagnosticQualities() = runBlocking {
         val native = FakeNative().apply {
             results += NativeAlgorithmSnapshot(5.5, trend = 0)
             results += NativeAlgorithmSnapshot(5.6, trend = 0)
@@ -72,10 +72,14 @@ class Gs1ProcessingCoordinatorTest {
         val warmup = coordinator.process(byteArrayOf(1), sample(index = 60, reindex = 0))
         val history = coordinator.process(byteArrayOf(2), sample(index = 61, reindex = 3))
 
-        assertFalse((warmup as Gs1ProcessingResult.Accepted).alarmEligible)
-        assertEquals(ReadingQuality.WARMING_UP, warmup.reading.quality)
-        assertFalse((history as Gs1ProcessingResult.Accepted).alarmEligible)
-        assertEquals(ReadingQuality.DEGRADED, history.reading.quality)
+        assertEquals(
+            ReadingQuality.WARMING_UP,
+            (warmup as Gs1ProcessingResult.Diagnostic).candidate.quality,
+        )
+        assertEquals(
+            ReadingQuality.DEGRADED,
+            (history as Gs1ProcessingResult.Diagnostic).candidate.quality,
+        )
         assertEquals(listOf(false, false), store.records.map { it.result.alarmEligible })
     }
 
@@ -89,7 +93,7 @@ class Gs1ProcessingCoordinatorTest {
         val retry = coordinator.retryPendingCommit()
 
         assertTrue(firstAttempt is Gs1ProcessingResult.PersistenceUnavailable)
-        assertTrue(retry is Gs1ProcessingResult.Accepted)
+        assertTrue(retry is Gs1ProcessingResult.Diagnostic)
         assertEquals(listOf(61), native.processedIndices)
         assertEquals(2, store.commitAttempts)
         assertEquals(1, store.records.size)
@@ -128,7 +132,7 @@ class Gs1ProcessingCoordinatorTest {
         assertTrue(rejected is Gs1ProcessingResult.Rejected)
         assertEquals("INVALID_GLUCOSE", (rejected as Gs1ProcessingResult.Rejected).code)
         assertTrue(rejected.checkpointCommitted)
-        assertTrue(next is Gs1ProcessingResult.Accepted)
+        assertTrue(next is Gs1ProcessingResult.Diagnostic)
         val diagnostic = store.records.first()
         assertFalse(diagnostic.result.publishable)
         assertFalse(diagnostic.result.alarmEligible)
@@ -145,12 +149,7 @@ class Gs1ProcessingCoordinatorTest {
             results += NativeAlgorithmSnapshot(6.0, trend = -2, glucoseWarning = 1)
         }
         val store = FakeStore()
-        val coordinator = coordinator(
-            native = native,
-            store = store,
-            firstIndex = 65,
-            publicationMode = Gs1PublicationMode.DIAGNOSTIC_ONLY,
-        )
+        val coordinator = coordinator(native = native, store = store, firstIndex = 65)
 
         val result = coordinator.process(
             byteArrayOf(4, 8, 15, 16, 23, 42),
@@ -186,7 +185,7 @@ class Gs1ProcessingCoordinatorTest {
     }
 
     @Test
-    fun realtimeEligibilityUsesStrict330SecondFreshnessBoundary() = runBlocking {
+    fun diagnosticQualityUsesStrict330SecondFreshnessBoundary() = runBlocking {
         val current = sample(index = 65, reindex = 0)
         val currentTimeMs = current.sensorTimeEpochSeconds * 1_000L
 
@@ -197,7 +196,7 @@ class Gs1ProcessingCoordinatorTest {
             freshStore,
             firstIndex = 65,
             phoneClock = { currentTimeMs + 329_999L },
-        ).process(byteArrayOf(1), current) as Gs1ProcessingResult.Accepted
+        ).process(byteArrayOf(1), current) as Gs1ProcessingResult.Diagnostic
 
         val staleNative = FakeNative().apply { results += NativeAlgorithmSnapshot(6.0, trend = 0) }
         val staleStore = FakeStore()
@@ -206,17 +205,15 @@ class Gs1ProcessingCoordinatorTest {
             staleStore,
             firstIndex = 65,
             phoneClock = { currentTimeMs + 330_000L },
-        ).process(byteArrayOf(2), current) as Gs1ProcessingResult.Accepted
+        ).process(byteArrayOf(2), current) as Gs1ProcessingResult.Diagnostic
 
-        assertTrue(fresh.alarmEligible)
-        assertEquals(ReadingQuality.VALID, fresh.reading.quality)
-        assertFalse(stale.alarmEligible)
-        assertEquals(ReadingQuality.DEGRADED, stale.reading.quality)
+        assertEquals(ReadingQuality.VALID, fresh.candidate.quality)
+        assertEquals(ReadingQuality.DEGRADED, stale.candidate.quality)
         assertFalse(staleStore.records.single().result.alarmEligible)
     }
 
     @Test
-    fun futureTimestampIsStoredAsDegradedAndCannotTriggerAlarm() = runBlocking {
+    fun futureTimestampIsStoredAsDegradedDiagnostic() = runBlocking {
         val current = sample(index = 65, reindex = 0)
         val native = FakeNative().apply { results += NativeAlgorithmSnapshot(6.0, trend = 0) }
         val store = FakeStore()
@@ -227,10 +224,10 @@ class Gs1ProcessingCoordinatorTest {
             phoneClock = { current.sensorTimeEpochSeconds * 1_000L - 1L },
         )
 
-        val result = coordinator.process(byteArrayOf(1), current) as Gs1ProcessingResult.Accepted
+        val result = coordinator.process(byteArrayOf(1), current) as Gs1ProcessingResult.Diagnostic
 
-        assertFalse(result.alarmEligible)
-        assertEquals(ReadingQuality.DEGRADED, result.reading.quality)
+        assertEquals(ReadingQuality.DEGRADED, result.candidate.quality)
+        assertFalse(store.records.single().result.alarmEligible)
     }
 
     @Test
@@ -362,7 +359,7 @@ class Gs1ProcessingCoordinatorTest {
 
         val retry = coordinator.retryPendingCommit()
 
-        assertTrue(retry is Gs1ProcessingResult.Accepted)
+        assertTrue(retry is Gs1ProcessingResult.Diagnostic)
         assertEquals(listOf(1), native.processedIndices)
         assertEquals(2, store.commitAttempts)
         assertEquals(1, store.records.size)
@@ -373,7 +370,6 @@ class Gs1ProcessingCoordinatorTest {
         store: FakeStore,
         firstIndex: Int,
         phoneClock: () -> Long = { sample(65).sensorTimeEpochSeconds * 1_000L + 100_000L },
-        publicationMode: Gs1PublicationMode = Gs1PublicationMode.PRODUCT_RELEASED,
     ): Gs1ProcessingCoordinator {
         val first = sample(firstIndex)
         val checkpoint = if (firstIndex == 1) {
@@ -413,7 +409,6 @@ class Gs1ProcessingCoordinatorTest {
             ),
             store = store,
             phoneClock = phoneClock,
-            publicationMode = publicationMode,
         )
     }
 

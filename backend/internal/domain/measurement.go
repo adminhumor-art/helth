@@ -37,12 +37,28 @@ type Measurement struct {
 	GlucoseMgDL        int                `json:"glucoseMgDl"`
 	TrendMgDLPerMinute float64            `json:"trendMgDlPerMinute"`
 	Quality            MeasurementQuality `json:"quality"`
-	Sequence           uint64             `json:"sequence,omitempty"`
+	Sequence           uint64             `json:"sequence"`
+}
+
+// FreshnessTime is the oldest trustworthy clock attached to this sample.
+// A recent sensor timestamp must not hide an old phone/receipt timestamp, and
+// a future device clock must not postpone signal-loss beyond server receipt.
+func (m Measurement) FreshnessTime() time.Time {
+	oldest := time.Time{}
+	for _, candidate := range []time.Time{m.SensorTime, m.PhoneTime, m.ReceivedAt} {
+		if candidate.IsZero() {
+			continue
+		}
+		if oldest.IsZero() || candidate.Before(oldest) {
+			oldest = candidate
+		}
+	}
+	return oldest
 }
 
 func (m Measurement) Validate(now time.Time) error {
-	if !isUUID(m.EventID) {
-		return errors.New("eventId must be a UUID")
+	if !IsUUID(m.EventID) && !isContentEventID(m.EventID) {
+		return errors.New("eventId must be a UUID or 64 lowercase hexadecimal characters")
 	}
 	if strings.TrimSpace(m.SensorID) == "" || len(m.SensorID) > 128 {
 		return errors.New("sensorId must contain 1..128 characters")
@@ -66,6 +82,9 @@ func (m Measurement) Validate(now time.Time) error {
 	if math.IsNaN(m.TrendMgDLPerMinute) || math.IsInf(m.TrendMgDLPerMinute, 0) || math.Abs(m.TrendMgDLPerMinute) > 20 {
 		return errors.New("trendMgDlPerMinute is outside -20..20")
 	}
+	if m.Sequence > math.MaxInt64 {
+		return errors.New("sequence is outside PostgreSQL BIGINT")
+	}
 	switch m.Quality {
 	case QualityValid, QualityWarmingUp, QualityDegraded:
 	default:
@@ -74,8 +93,16 @@ func (m Measurement) Validate(now time.Time) error {
 	return nil
 }
 
-func isUUID(value string) bool {
-	value = strings.TrimSpace(value)
+func isContentEventID(value string) bool {
+	if len(value) != 64 || strings.ToLower(value) != value {
+		return false
+	}
+	decoded := make([]byte, 32)
+	_, err := hex.Decode(decoded, []byte(value))
+	return err == nil
+}
+
+func IsUUID(value string) bool {
 	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' {
 		return false
 	}

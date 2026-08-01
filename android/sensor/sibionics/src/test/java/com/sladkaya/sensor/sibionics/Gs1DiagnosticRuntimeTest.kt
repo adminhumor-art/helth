@@ -1,6 +1,5 @@
 package com.sladkaya.sensor.sibionics
 
-import com.sladkaya.core.model.GlucoseReading
 import com.sladkaya.core.model.ReadingQuality
 import com.sladkaya.core.model.SensorFamily
 import java.util.Collections
@@ -216,72 +215,11 @@ class Gs1DiagnosticRuntimeTest {
     }
 
     @Test
-    fun anyProductReadingFromDiagnosticLeaseFailsClosed() = runBlocking {
-        val terminal = CompletableDeferred<Gs1DiagnosticRuntimeEvent.Failed>()
-        val lease = ScriptedRuntimeLease(
-            ingest = {
-                Gs1PacketProcessingResult.Completed(
-                    readings = listOf(
-                        Gs1PacketProcessingResult.PublishedReading(
-                            reading = reading(1),
-                            alarmEligible = true,
-                        ),
-                    ),
-                    committedSamples = listOf(sample(1)),
-                )
-            },
-        )
-        val runtime = Gs1DiagnosticRuntime(
-            scope = this,
-            opener = Gs1RuntimeCoreOpener { Gs1RuntimeCoreOpenResult.Success(lease) },
-            eventSink = { if (it is Gs1DiagnosticRuntimeEvent.Failed) terminal.complete(it) },
-        )
-        val generation = (runtime.start(profile()) as Gs1RuntimeStartResult.Started).generation
-
-        runtime.submit(generation, journaled(1))
-        val failure = withTimeout(1_000) { terminal.await() }
-        runtime.stop()
-
-        assertEquals("PRODUCT_PUBLICATION_BYPASS", failure.code)
-        assertTrue(lease.closed.isCompleted)
-    }
-
-    @Test
-    fun productReadingInCommittedPrefixOfRejectedBatchAlsoFailsClosed() = runBlocking {
-        val terminal = CompletableDeferred<Gs1DiagnosticRuntimeEvent.Failed>()
-        val lease = ScriptedRuntimeLease(
-            ingest = {
-                Gs1PacketProcessingResult.Rejected(
-                    code = "LATER_SAMPLE_REJECTED",
-                    message = "partial prefix",
-                    readings = listOf(
-                        Gs1PacketProcessingResult.PublishedReading(reading(1), alarmEligible = true),
-                    ),
-                    committedSamples = listOf(sample(1)),
-                )
-            },
-        )
-        val runtime = Gs1DiagnosticRuntime(
-            scope = this,
-            opener = Gs1RuntimeCoreOpener { Gs1RuntimeCoreOpenResult.Success(lease) },
-            eventSink = { if (it is Gs1DiagnosticRuntimeEvent.Failed) terminal.complete(it) },
-        )
-        val generation = (runtime.start(profile()) as Gs1RuntimeStartResult.Started).generation
-
-        runtime.submit(generation, journaled(1))
-        val failure = withTimeout(1_000) { terminal.await() }
-        runtime.stop()
-
-        assertEquals("PRODUCT_PUBLICATION_BYPASS", failure.code)
-    }
-
-    @Test
     fun committedAlgorithmIssueIsNotReportedAsHealthyDiagnosticData() = runBlocking {
         val committed = CompletableDeferred<Gs1DiagnosticRuntimeEvent.Committed>()
         val lease = ScriptedRuntimeLease(
             ingest = {
                 Gs1PacketProcessingResult.Completed(
-                    readings = emptyList(),
                     committedSamples = listOf(sample(1)),
                     committedIssues = listOf(
                         Gs1PacketProcessingResult.CommittedIssue(
@@ -451,17 +389,16 @@ class Gs1DiagnosticRuntimeTest {
         assertTrue(lease.closed.isCompleted)
     }
 
-    private fun profile(): Gs1ActivationProfile =
-        (Gs1ActivationProfile.validate(
+    private fun profile(): Gs1DiagnosticActivationProfile =
+        (Gs1DiagnosticActivationProfile.validate(
             sensorId = "sensor-a",
             family = SensorFamily.SIBIONICS_GS1,
             bluetoothAddress = "AA:BB:CC:DD:EE:FF",
             transportVariant = 0,
             packageCode = "aB12cd34",
-        ) as Gs1ActivationProfileValidation.Valid).profile
+        ) as Gs1DiagnosticActivationProfileValidation.Valid).profile
 
     private fun completed(index: Int) = Gs1PacketProcessingResult.Completed(
-        readings = emptyList(),
         committedSamples = listOf(sample(index)),
         diagnostics = listOf(
             Gs1DiagnosticReading(
@@ -492,17 +429,6 @@ class Gs1DiagnosticRuntimeTest {
         encryptedPacket = byteArrayOf(index.toByte()),
     )
 
-    private fun reading(index: Int) = GlucoseReading(
-        eventId = "event-$index",
-        sensorId = "sensor-a",
-        sensorFamily = SensorFamily.SIBIONICS_GS1,
-        sensorTimeEpochMs = sample(index).sensorTimeEpochSeconds * 1_000L,
-        phoneTimeEpochMs = sample(index).sensorTimeEpochSeconds * 1_000L + 1_000L,
-        glucoseMgDl = 100 + index,
-        trendMgDlPerMinute = 0.0,
-        quality = ReadingQuality.VALID,
-        sequence = index.toLong(),
-    )
 }
 
 private class ScriptedRuntimeLease(

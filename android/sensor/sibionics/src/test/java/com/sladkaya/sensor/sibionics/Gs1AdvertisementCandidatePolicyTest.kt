@@ -54,7 +54,7 @@ class Gs1AdvertisementCandidatePolicyTest {
     }
 
     @Test
-    fun malformedMacIsInvalidEvenWhenNameDoesNotMatch() {
+    fun malformedMacIsIgnoredWhenNameDoesNotMatch() {
         val malformed = listOf(
             "AA:BB:CC:DD:EE",
             "AA-BB-CC-DD-EE-FF",
@@ -64,8 +64,15 @@ class Gs1AdvertisementCandidatePolicyTest {
 
         malformed.forEach { address ->
             val result = policy.evaluate(Gs1AdvertisementCandidate("unrelated", address))
-            assertTrue("$address must be invalid", result is Gs1AdvertisementCandidateResult.Invalid)
+            assertEquals(Gs1AdvertisementCandidateResult.NoMatch, result)
         }
+    }
+
+    @Test
+    fun malformedMacRemainsInvalidWhenNameMatches() {
+        val result = policy.evaluate(Gs1AdvertisementCandidate("GS-Ab1Z", "not-a-mac"))
+
+        assertTrue(result is Gs1AdvertisementCandidateResult.Invalid)
     }
 
     @Test

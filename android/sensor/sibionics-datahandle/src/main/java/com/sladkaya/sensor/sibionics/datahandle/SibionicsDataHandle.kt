@@ -3,10 +3,17 @@ package com.sladkaya.sensor.sibionics.datahandle
 import com.no.sisense.enanddecryption.CGMDataHandle130
 import java.nio.charset.StandardCharsets
 
+/**
+ * GS1 protocol variants supported by the pinned official native datahandle.
+ *
+ * The application ID and registration material below are protocol constants
+ * required by that native registration call. They are not user, account, or
+ * deployment credentials and must never be written to logs or error messages.
+ */
 enum class DataHandleVariant(
     val protocolCode: Int,
-    internal val applicationId: String,
-    internal val registrationKey: String,
+    internal val pinnedProtocolApplicationId: String,
+    internal val pinnedProtocolRegistrationMaterial: String,
 ) {
     GLOBAL_GS1(
         0,
@@ -27,11 +34,6 @@ enum class DataHandleVariant(
         3,
         "com.sisensing.eco",
         "068449FA5C1B1F97EEC9C1475A8752D5C387D17A65B002D9132489C0BFDFC99F0CAC670E9AB10D62FDE0B2B1E7",
-    ),
-    GS3(
-        4,
-        "com.sisensing.gs3",
-        "46C04E9267430C94F8B4B2375A8752D5CBE7A17814B502D9132489C0BFDFC99F0CAC670E98A1510AEA9186FAC6",
     ),
 }
 
@@ -132,9 +134,15 @@ class SibionicsDataHandle internal constructor(
                 DataHandleError.INVALID_BLUETOOTH_ADDRESS,
             )
         val registrationResult = runCatching {
-            val key = variant.registrationKey.toByteArray(StandardCharsets.US_ASCII)
-            val applicationId = variant.applicationId.toByteArray(StandardCharsets.US_ASCII)
-            native.registerKey(key, key.size, applicationId)
+            val registrationMaterial = variant.pinnedProtocolRegistrationMaterial
+                .toByteArray(StandardCharsets.US_ASCII)
+            val protocolApplicationId = variant.pinnedProtocolApplicationId
+                .toByteArray(StandardCharsets.US_ASCII)
+            native.registerKey(
+                registrationMaterial,
+                registrationMaterial.size,
+                protocolApplicationId,
+            )
         }.getOrElse {
             return@synchronized DataHandleCommandResult.Failure(DataHandleError.NATIVE_CALL_FAILED)
         }

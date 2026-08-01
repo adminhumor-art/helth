@@ -78,7 +78,7 @@ sealed interface Gs1DiagnosticGattState {
 
 /**
  * Android-only shell for GS1/GS1Sb diagnostics. It intentionally exposes no
- * product [com.sladkaya.core.model.GlucoseReading] stream.
+ * product measurement stream.
  *
  * Every attempt owns one callback, GATT object, protocol session and bounded
  * mailbox. The stateful core is reached only through [Gs1DiagnosticRuntime].
@@ -125,7 +125,7 @@ class Gs1DiagnosticGattDriver internal constructor(
         replay = coreRuntime::submitAndAwait,
     )
 
-    suspend fun start(profile: Gs1ActivationProfile) {
+    suspend fun start(profile: Gs1DiagnosticActivationProfile) {
         lifecycle.withLock {
             desired.getAndSet(null)?.let { reconnectGate.stop(it.reconnectToken) }
             val requested = DesiredConnection(
@@ -1060,7 +1060,7 @@ class Gs1DiagnosticGattDriver internal constructor(
     ) = GattEvent.Failure(code, detail, retryable)
 
     private class Attempt(
-        val profile: Gs1ActivationProfile,
+        val profile: Gs1DiagnosticActivationProfile,
         val token: Gs1GattGenerationToken,
         val reconnectToken: Gs1ReconnectToken,
         val coreGeneration: Long,
@@ -1085,7 +1085,7 @@ class Gs1DiagnosticGattDriver internal constructor(
     }
 
     private data class DesiredConnection(
-        val profile: Gs1ActivationProfile,
+        val profile: Gs1DiagnosticActivationProfile,
         val reconnectToken: Gs1ReconnectToken,
     )
 

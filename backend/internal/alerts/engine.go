@@ -3,7 +3,6 @@ package alerts
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"sync"
 	"time"
 
 	"glucose-monitor/backend/internal/domain"
@@ -41,115 +40,131 @@ type Change struct {
 	Alert domain.Alert
 }
 
-type patientState struct {
-	latestAt time.Time
-	open     map[domain.AlertKind]domain.Alert
+// State is a durable snapshot loaded by the Store while holding the patient
+// transaction lock. Engine never owns or mutates committed alert state.
+type State struct {
+	MonitoringStartedAt time.Time
+	LatestAt            time.Time
+	LatestFreshAt       time.Time
+	OpenAlerts          []domain.Alert
 }
 
 type Engine struct {
-	mu         sync.Mutex
 	thresholds Thresholds
-	patients   map[string]*patientState
 	now        func() time.Time
 }
 
 func NewEngine(t Thresholds) *Engine {
-	return &Engine{thresholds: t, patients: make(map[string]*patientState), now: time.Now}
+	return &Engine{thresholds: t, now: time.Now}
 }
 
-// SeedLatest restores the most recent known sensor time after a process restart.
-// It never moves the clock backwards, so an older database row cannot make a
-// currently connected patient appear stale.
-func (e *Engine) SeedLatest(patientID string, at time.Time) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	state := e.state(patientID)
-	if at.After(state.latestAt) {
-		state.latestAt = at
+// PlanMeasurement is a pure decision over a durable pre-transaction snapshot.
+// The caller must commit the measurement and every returned change atomically.
+func (e *Engine) PlanMeasurement(state State, m domain.Measurement) []Change {
+	now := e.now().UTC()
+	open := validOpenAlerts(m.PatientID, state.OpenAlerts)
+	latestAt := state.LatestAt
+	latestFreshAt := state.LatestFreshAt
+	if latestFreshAt.IsZero() {
+		latestFreshAt = latestAt
 	}
+	newest := m.Quality == domain.QualityValid && (latestAt.IsZero() || m.SensorTime.After(latestAt))
+	var changes []Change
+
+	if newest {
+		latestAt = m.SensorTime
+		latestFreshAt = m.FreshnessTime()
+		if !latestFreshAt.IsZero() && now.Sub(latestFreshAt) < e.thresholds.StaleAfter {
+			changes = append(changes, e.planGlucose(open, m, now)...)
+		}
+	}
+	changes = append(changes, e.planSignalLoss(open, m.PatientID, latestFreshAt, state.MonitoringStartedAt, now, true)...)
+	return changes
 }
 
-func (e *Engine) Evaluate(m domain.Measurement) []Change {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+// PlanStaleness is also pure. In particular, a persisted signal-loss alert is
+// never closed merely because the API process restarted.
+func (e *Engine) PlanStaleness(state State, patientID string, at time.Time) []Change {
+	open := validOpenAlerts(patientID, state.OpenAlerts)
+	latestFreshAt := state.LatestFreshAt
+	if latestFreshAt.IsZero() {
+		latestFreshAt = state.LatestAt
+	}
+	return e.planSignalLoss(open, patientID, latestFreshAt, state.MonitoringStartedAt, at.UTC(), false)
+}
 
-	state := e.state(m.PatientID)
-	if !state.latestAt.IsZero() && !m.SensorTime.After(state.latestAt) {
+func (e *Engine) planGlucose(open map[domain.AlertKind]domain.Alert, m domain.Measurement, now time.Time) []Change {
+	// A warming-up or degraded value is not reliable enough either to open a
+	// glucose alert or to declare an existing alert recovered.
+	if m.Quality != domain.QualityValid {
 		return nil
 	}
-	state.latestAt = m.SensorTime
-	if e.now().Sub(m.SensorTime) >= e.thresholds.StaleAfter {
-		return nil
-	}
-
 	desired := make(map[domain.AlertKind]bool)
-	if m.Quality == domain.QualityValid {
-		desired[domain.AlertLow] = m.GlucoseMgDL <= e.thresholds.LowMgDL
-		desired[domain.AlertHigh] = m.GlucoseMgDL >= e.thresholds.HighMgDL
-		desired[domain.AlertRapidFall] = m.TrendMgDLPerMinute <= e.thresholds.RapidFallMgDLPerMinute
-		desired[domain.AlertRapidRise] = m.TrendMgDLPerMinute >= e.thresholds.RapidRiseMgDLPerMinute
-	}
+	desired[domain.AlertLow] = m.GlucoseMgDL <= e.thresholds.LowMgDL
+	desired[domain.AlertHigh] = m.GlucoseMgDL >= e.thresholds.HighMgDL
+	desired[domain.AlertRapidFall] = m.TrendMgDLPerMinute <= e.thresholds.RapidFallMgDLPerMinute
+	desired[domain.AlertRapidRise] = m.TrendMgDLPerMinute >= e.thresholds.RapidRiseMgDLPerMinute
 
 	var changes []Change
 	for _, kind := range []domain.AlertKind{domain.AlertLow, domain.AlertHigh, domain.AlertRapidFall, domain.AlertRapidRise} {
-		active := desired[kind]
-		if existing, ok := state.open[kind]; active && !ok {
+		existing, exists := open[kind]
+		if desired[kind] && !exists {
 			value := m.GlucoseMgDL
 			alert := domain.Alert{
-				ID: uuid(), PatientID: m.PatientID, Kind: kind, OpenedAt: e.now().UTC(),
+				ID: uuid(), PatientID: m.PatientID, Kind: kind, OpenedAt: now,
 				MeasurementID: m.EventID, GlucoseMgDL: &value,
 			}
-			state.open[kind] = alert
+			open[kind] = alert
 			changes = append(changes, Change{Type: Opened, Alert: alert})
-		} else if ok && e.recovered(kind, m) {
-			closedAt := e.now().UTC()
+		} else if exists && e.recovered(kind, m) {
+			closedAt := now
 			existing.ClosedAt = &closedAt
-			delete(state.open, kind)
+			delete(open, kind)
 			changes = append(changes, Change{Type: Closed, Alert: existing})
 		}
 	}
 	return changes
 }
 
-func (e *Engine) EvaluateStaleness(patientID string, at time.Time) []Change {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	state := e.state(patientID)
-	stale := state.latestAt.IsZero() || at.Sub(state.latestAt) >= e.thresholds.StaleAfter
-	existing, open := state.open[domain.AlertSignalLoss]
-	if stale && !open {
-		alert := domain.Alert{ID: uuid(), PatientID: patientID, Kind: domain.AlertSignalLoss, OpenedAt: at.UTC()}
-		state.open[domain.AlertSignalLoss] = alert
+func (e *Engine) planSignalLoss(
+	open map[domain.AlertKind]domain.Alert,
+	patientID string,
+	latestAt time.Time,
+	monitoringStartedAt time.Time,
+	at time.Time,
+	allowRecovery bool,
+) []Change {
+	reference := latestAt
+	if reference.IsZero() {
+		reference = monitoringStartedAt
+	}
+	stale := reference.IsZero() || at.Sub(reference) >= e.thresholds.StaleAfter
+	existing, exists := open[domain.AlertSignalLoss]
+	if stale && !exists {
+		alert := domain.Alert{ID: uuid(), PatientID: patientID, Kind: domain.AlertSignalLoss, OpenedAt: at}
 		return []Change{{Type: Opened, Alert: alert}}
 	}
-	if !stale && open {
-		closedAt := at.UTC()
+	if !stale && exists && allowRecovery {
+		closedAt := at
 		existing.ClosedAt = &closedAt
-		delete(state.open, domain.AlertSignalLoss)
 		return []Change{{Type: Closed, Alert: existing}}
 	}
 	return nil
 }
 
-func (e *Engine) OpenAlerts(patientID string) []domain.Alert {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	state := e.state(patientID)
-	result := make([]domain.Alert, 0, len(state.open))
-	for _, alert := range state.open {
-		result = append(result, alert)
+func validOpenAlerts(patientID string, persisted []domain.Alert) map[domain.AlertKind]domain.Alert {
+	result := make(map[domain.AlertKind]domain.Alert)
+	for _, alert := range persisted {
+		if alert.ID == "" || alert.PatientID != patientID || alert.OpenedAt.IsZero() || alert.ClosedAt != nil || !supportedAlertKind(alert.Kind) {
+			continue
+		}
+		existing, exists := result[alert.Kind]
+		if !exists || alert.OpenedAt.After(existing.OpenedAt) ||
+			(alert.OpenedAt.Equal(existing.OpenedAt) && alert.ID < existing.ID) {
+			result[alert.Kind] = alert
+		}
 	}
 	return result
-}
-
-func (e *Engine) state(patientID string) *patientState {
-	state, ok := e.patients[patientID]
-	if !ok {
-		state = &patientState{open: make(map[domain.AlertKind]domain.Alert)}
-		e.patients[patientID] = state
-	}
-	return state
 }
 
 func (e *Engine) recovered(kind domain.AlertKind, m domain.Measurement) bool {
@@ -164,6 +179,15 @@ func (e *Engine) recovered(kind domain.AlertKind, m domain.Measurement) bool {
 		return m.TrendMgDLPerMinute < e.thresholds.RapidRiseMgDLPerMinute
 	default:
 		return true
+	}
+}
+
+func supportedAlertKind(kind domain.AlertKind) bool {
+	switch kind {
+	case domain.AlertLow, domain.AlertHigh, domain.AlertRapidFall, domain.AlertRapidRise, domain.AlertSignalLoss:
+		return true
+	default:
+		return false
 	}
 }
 

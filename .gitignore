@@ -18,6 +18,12 @@ android/local.properties
 android/**/build/
 android/.idea/
 android/captures/
+# Exact physical-sensor packets, raw values and timestamps are private evidence.
+**/*.trace
+android/sensor/sibionics/src/test/resources/golden/private/
+# Repository allowlist: only the reviewed deterministic fixture may be tracked.
+android/sensor/sibionics/src/test/resources/golden/*
+!android/sensor/sibionics/src/test/resources/golden/gs1-synthetic-v1.trace
 *.jks
 *.keystore
 

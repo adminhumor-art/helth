@@ -17,7 +17,7 @@ internal class Gs1GattGenerationGate<Gatt : Any> {
     private val sequence = AtomicLong(1L)
     private val active = AtomicReference<Lease<Gatt>?>(null)
 
-    fun begin(profile: Gs1ActivationProfile): Gs1GattGenerationToken {
+    fun begin(profile: Gs1DiagnosticActivationProfile): Gs1GattGenerationToken {
         val token = Gs1GattGenerationToken(
             generation = sequence.getAndIncrement(),
             expectedBluetoothAddress = profile.bluetoothAddress,

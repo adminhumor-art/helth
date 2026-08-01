@@ -20,15 +20,20 @@ class SibionicsDataHandleTest {
 
         assertArrayEquals(byteArrayOf(0x19, 0x01, 0x02), result.bytes)
         assertEquals(2, native.calls.size)
-        assertEquals(
-            "register:${DataHandleVariant.GLOBAL_GS1.registrationKey}:${DataHandleVariant.GLOBAL_GS1.applicationId}",
-            native.calls[0],
+        assertEquals("register-pinned-protocol-material", native.calls[0])
+        assertArrayEquals(
+            DataHandleVariant.GLOBAL_GS1.pinnedProtocolRegistrationMaterial.encodeToByteArray(),
+            checkNotNull(native.registeredProtocolMaterial),
+        )
+        assertArrayEquals(
+            DataHandleVariant.GLOBAL_GS1.pinnedProtocolApplicationId.encodeToByteArray(),
+            checkNotNull(native.registeredProtocolApplicationId),
         )
         assertEquals("auth:1:true:0:FFEEDDCCBBAA:50", native.calls[1])
     }
 
     @Test
-    fun registrationIdentitiesArePinnedForEverySupportedProtocolVariant() {
+    fun registrationMaterialIsPinnedOnlyForSupportedGs1ProtocolVariants() {
         val expected = listOf(
             Triple(
                 DataHandleVariant.GLOBAL_GS1,
@@ -50,18 +55,14 @@ class SibionicsDataHandleTest {
                 "com.sisensing.eco",
                 "068449FA5C1B1F97EEC9C1475A8752D5C387D17A65B002D9132489C0BFDFC99F0CAC670E9AB10D62FDE0B2B1E7",
             ),
-            Triple(
-                DataHandleVariant.GS3,
-                "com.sisensing.gs3",
-                "46C04E9267430C94F8B4B2375A8752D5CBE7A17814B502D9132489C0BFDFC99F0CAC670E98A1510AEA9186FAC6",
-            ),
         )
 
-        expected.forEach { (variant, applicationId, registrationKey) ->
-            assertEquals(applicationId, variant.applicationId)
-            assertEquals(registrationKey, variant.registrationKey)
+        expected.forEach { (variant, protocolApplicationId, registrationMaterial) ->
+            assertEquals(protocolApplicationId, variant.pinnedProtocolApplicationId)
+            assertEquals(registrationMaterial, variant.pinnedProtocolRegistrationMaterial)
         }
-        assertEquals(listOf(0, 1, 2, 3, 4), DataHandleVariant.entries.map { it.protocolCode })
+        assertEquals(listOf(0, 1, 2, 3), DataHandleVariant.entries.map { it.protocolCode })
+        assertTrue(DataHandleVariant.entries.all { it.name.endsWith("_GS1") })
     }
 
     @Test
@@ -226,13 +227,17 @@ class SibionicsDataHandleTest {
 private class RecordingDataHandleApi : NativeDataHandleApi {
     val calls = mutableListOf<String>()
     val splitResults = ArrayDeque<Int>()
+    var registeredProtocolMaterial: ByteArray? = null
+    var registeredProtocolApplicationId: ByteArray? = null
     var commandBytes = byteArrayOf(1, 2, 3)
     var forcedLength: Int? = null
     var payloadJson: String = ""
     var mutateCanary: Boolean = false
 
     override fun registerKey(input: ByteArray, length: Int, output: ByteArray): Int {
-        calls += "register:${input.decodeToString()}:${output.decodeToString()}"
+        registeredProtocolMaterial = input.copyOf(length)
+        registeredProtocolApplicationId = output.copyOf()
+        calls += "register-pinned-protocol-material"
         return 0
     }
 

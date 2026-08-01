@@ -48,7 +48,7 @@ class AppStateFailClosedTest {
     }
 
     @Test
-    fun restoredProductHistoryDropsLegacySimulatorRows() {
+    fun restoredProductHistoryDropsSimulatorRows() {
         AppState.onSetupRequired("reset")
 
         AppState.restoreProductHistory(

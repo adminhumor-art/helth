@@ -65,4 +65,11 @@ class SensorServiceStartPolicyTest {
         )
     }
 
+    @Test
+    fun backgroundStartRequiresBothConfigurationAndBlePermission() {
+        assertEquals(true, SensorBackgroundStartPolicy.shouldStart(true, true))
+        assertEquals(false, SensorBackgroundStartPolicy.shouldStart(false, true))
+        assertEquals(false, SensorBackgroundStartPolicy.shouldStart(true, false))
+    }
+
 }

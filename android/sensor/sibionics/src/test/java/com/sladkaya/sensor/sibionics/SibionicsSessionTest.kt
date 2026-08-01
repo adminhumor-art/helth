@@ -2,10 +2,9 @@ package com.sladkaya.sensor.sibionics
 
 import com.sladkaya.core.model.SensorFamily
 import com.sladkaya.core.sensor.SensorConfiguration
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -151,61 +150,20 @@ class SibionicsSessionTest {
     }
 
     @Test
-    fun gs3SessionRunsBindDeviceInfoActivationTimeAndDataRequest() {
-        val account = ByteArray(12) { (it + 1).toByte() }
-        val session = SibionicsSession(
-            SensorFamily.SIBIONICS_GS3,
-            SensorConfiguration("sensor", pairingPayload = account),
-            epochSeconds = { now },
-        )
+    fun gs3CannotConstructTheGs1ProtocolSessionOrReachACommandCodec() {
+        val commands = RecordingGs1CommandCodec()
 
-        assertCommand(session.initial("01:23:45:67:89:AB"), 0x01)
-        val bind = assertCommand(session.onPacket(DecodedPacket.Acknowledgement(0x01, 0, 0)), 0x13)
-        assertEquals(1, bind[2].u8())
-        assertArrayEquals(account, bind.copyOfRange(3, 15))
-        val infoOne = assertCommand(session.onPacket(DecodedPacket.Acknowledgement(0x13, 0, 0)), 0xf0)
-        assertEquals(1, infoOne[2].u8())
-        val infoSeven = assertCommand(session.onPacket(DecodedPacket.DeviceInformation(1)), 0xf0)
-        assertEquals(7, infoSeven[2].u8())
-        val activation = assertCommand(session.onPacket(DecodedPacket.DeviceInformation(7)), 0x0f)
-        assertEquals(now, activation.u32le(2))
-        assertCommand(session.onPacket(DecodedPacket.Acknowledgement(0x0f, 0, 0)), 0x03)
-        val request = assertCommand(session.onPacket(DecodedPacket.Acknowledgement(0x03, 0, 0)), 0x14)
-        assertEquals(1, request.u16le(2))
+        val failure = assertThrows(IllegalArgumentException::class.java) {
+            SibionicsSession(
+                SensorFamily.SIBIONICS_GS3,
+                SensorConfiguration("sensor", protocolVariant = 4),
+                gs1Commands = commands,
+            )
+        }
+
+        assertTrue(failure.message.orEmpty().contains("GS1/GS1Sb"))
+        assertTrue(commands.calls.isEmpty())
     }
-
-    @Test
-    fun sampleAdvancesNextRequestedIndex() {
-        val account = ByteArray(12)
-        val session = SibionicsSession(
-            SensorFamily.SIBIONICS_GS3,
-            SensorConfiguration("sensor", pairingPayload = account),
-        )
-        session.onPacket(DecodedPacket.Gs3GlucoseSamples(listOf(DecodedGs3GlucoseSample(25, now, 100))))
-
-        val request = assertCommand(session.onPacket(DecodedPacket.Acknowledgement(0x03, 0, 0)), 0x14)
-        assertEquals(26, request.u16le(2))
-    }
-
-    private fun assertCommand(action: SessionAction, command: Int): ByteArray {
-        assertTrue(action is SessionAction.Write)
-        val plain = Rc4.xor((action as SessionAction.Write).bytes)
-        assertEquals(command, plain[1].u8())
-        assertChecksum(plain)
-        return plain
-    }
-
-    private fun assertChecksum(bytes: ByteArray) {
-        assertEquals(0, bytes.sumOf { it.u8() } and 0xff)
-    }
-
-    private fun Byte.u8(): Int = toInt() and 0xff
-
-    private fun ByteArray.u16le(offset: Int): Int =
-        ByteBuffer.wrap(this, offset, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xffff
-
-    private fun ByteArray.u32le(offset: Int): Long =
-        ByteBuffer.wrap(this, offset, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xffff_ffffL
 }
 
 private class RecordingGs1CommandCodec : Gs1CommandCodec {

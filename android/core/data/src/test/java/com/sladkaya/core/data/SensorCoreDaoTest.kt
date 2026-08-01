@@ -308,7 +308,7 @@ class SensorCoreDaoTest {
             state = ByteArray(2_480),
             stateSha256 = ByteArray(2_480).sha256(),
             displayOffsetMmolL = 0.0,
-            schemaVersion = 3,
+            schemaVersion = 1,
         )
         val measurement = GlucoseReading(
             eventId = raw.eventId,

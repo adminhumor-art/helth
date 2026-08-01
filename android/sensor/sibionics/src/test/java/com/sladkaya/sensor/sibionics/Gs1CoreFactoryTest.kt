@@ -4,7 +4,6 @@ import com.sladkaya.core.data.AtomicSensorCoreRecord
 import com.sladkaya.core.data.SensorAlgorithmCheckpointRecord
 import com.sladkaya.core.data.SensorCoreCommitResult
 import com.sladkaya.core.data.SensorCoreStore
-import com.sladkaya.core.data.SensorCheckpointProvenance
 import com.sladkaya.core.data.SensorFailureCommitResult
 import com.sladkaya.core.data.SensorIngestionFailureRecord
 import com.sladkaya.core.model.SensorFamily
@@ -50,7 +49,7 @@ class Gs1CoreFactoryTest {
     }
 
     @Test
-    fun factoryKeepsPhysicalResultsBehindDiagnosticGateUntilRelease() = runBlocking {
+    fun factoryCanOnlyProduceDiagnosticResultsWithoutMeasurementsOrAlarms() = runBlocking {
         val native = FactoryNative()
         val store = FactoryStore()
         val factory = Gs1CoreFactory(
@@ -242,53 +241,6 @@ class Gs1CoreFactoryTest {
         val result = factory.open(configuration()) as Gs1CoreOpenResult.Failure
 
         assertEquals(Gs1CoreOpenError.CHECKPOINT_PHYSICAL_IDENTITY_MISMATCH, result.error)
-        assertTrue(native.calls.isEmpty())
-    }
-
-    @Test
-    fun migratedCheckpointWithoutVerifiedTransportIsQuarantinedNotTreatedAsFresh() = runBlocking {
-        val native = FactoryNative()
-        val token = SensitivityToken.packageCode("ABCDEFGH")
-        val sensitivity = DecodedSensitivity(token, 1.42f, SensitivityEncoding.NORMAL)
-        val saved = checkpoint(native, sensitivity).copy(
-            transportProtocol = SensorCheckpointProvenance.UNVERIFIED_LEGACY_V2,
-            dataHandleBinarySetId = SensorCheckpointProvenance.UNVERIFIED_LEGACY_V2,
-        )
-        val factory = Gs1CoreFactory(
-            store = FactoryStore(savedCheckpoint = saved),
-            decodeSensitivity = { SensitivityDecodeResult.Success(sensitivity) },
-            nativeProvider = { native },
-        )
-
-        val result = factory.open(configuration())
-
-        assertEquals(
-            Gs1CoreOpenError.CHECKPOINT_PROVENANCE_UNVERIFIED,
-            (result as Gs1CoreOpenResult.Failure).error,
-        )
-        assertTrue(native.calls.isEmpty())
-    }
-
-    @Test
-    fun migratedV3CheckpointWithoutPhysicalBluetoothIdentityIsQuarantined() = runBlocking {
-        val native = FactoryNative()
-        val token = SensitivityToken.packageCode("ABCDEFGH")
-        val sensitivity = DecodedSensitivity(token, 1.42f, SensitivityEncoding.NORMAL)
-        val saved = checkpoint(native, sensitivity).copy(
-            bluetoothAddress = SensorCheckpointProvenance.UNVERIFIED_LEGACY_V3_IDENTITY,
-        )
-        val factory = Gs1CoreFactory(
-            store = FactoryStore(savedCheckpoint = saved),
-            decodeSensitivity = { SensitivityDecodeResult.Success(sensitivity) },
-            nativeProvider = { native },
-        )
-
-        val result = factory.open(configuration())
-
-        assertEquals(
-            Gs1CoreOpenError.CHECKPOINT_PROVENANCE_UNVERIFIED,
-            (result as Gs1CoreOpenResult.Failure).error,
-        )
         assertTrue(native.calls.isEmpty())
     }
 

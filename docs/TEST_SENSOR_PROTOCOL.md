@@ -18,6 +18,13 @@
    Отдельно проверить, что checkpoint от другого MAC блокируется, а каждый BLE
    notification имеет ingress receipt до декодирования. Pending-ingress должен
    восстановиться до нового GATT; неизвестная команда остаётся pending.
+   Подготовить golden exporter формата `GS1-GOLDEN-TRACE v1`. Любой реальный
+   capture — private sensitive evidence и хранится вне Git. Canonical MAC, код
+   упаковки, DataMatrix и HMAC key не входят в trace; сохраняются trace-local
+   HMAC pseudonym/identity/exact sensitivity input, attempt/ordinal/time,
+   encrypted notification и ожидаемый диагностический результат. В repository
+   resources допускается только закреплённый SHA-256 детерминированного
+   synthetic fixture; новый файл требует отдельного privacy review.
 6. Сначала проверить весь продуктовый тракт на симуляторе, включая тревоги и
    потерю связи. Отдельно доказать, что демо не сохраняется в продуктовое
    хранилище, виджет после перезапуска, backend и Telegram.

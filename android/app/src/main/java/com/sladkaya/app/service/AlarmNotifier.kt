@@ -14,7 +14,9 @@ import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import com.sladkaya.app.AlarmNotificationCapability
 import com.sladkaya.app.MainActivity
+import com.sladkaya.app.readAlarmNotificationCapability
 import com.sladkaya.core.model.AlarmKind
 import com.sladkaya.core.model.GlucoseReading
 import java.util.Locale
@@ -85,15 +87,55 @@ class AlarmNotifier(private val context: Context) {
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setOngoing(true)
             .build()
-        NotificationManagerCompat.from(context).notify(kind.notificationId, notification)
+        runCatching {
+            NotificationManagerCompat.from(context)
+                .notify(AlarmNotificationIds.forAlarm(kind), notification)
+        }
     }
 
     fun cancel(kind: AlarmKind) {
-        NotificationManagerCompat.from(context).cancel(kind.notificationId)
+        NotificationManagerCompat.from(context).cancel(AlarmNotificationIds.forAlarm(kind))
     }
 
     fun cancelAllAlarms() {
         AlarmKind.values().forEach(::cancel)
+    }
+
+    fun showTest(): Boolean {
+        createChannels()
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return false
+        }
+        if (readAlarmNotificationCapability(context) != AlarmNotificationCapability.AVAILABLE) {
+            return false
+        }
+        val notification = NotificationCompat.Builder(context, ALARM_CHANNEL)
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle("Тест звука «Сладкой»")
+            .setContentText("Это проверка телефона, не тревога глюкозы")
+            .setStyle(
+                NotificationCompat.BigTextStyle()
+                    .bigText("Это проверка телефона, не тревога глюкозы. Уведомление исчезнет автоматически."),
+            )
+            .setContentIntent(openAppIntent())
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setCategory(NotificationCompat.CATEGORY_ALARM)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setOngoing(false)
+            .setAutoCancel(true)
+            .setTimeoutAfter(AlarmNotificationIds.TEST_TIMEOUT_MS)
+            .build()
+        return runCatching {
+            NotificationManagerCompat.from(context)
+                .notify(AlarmNotificationIds.TEST, notification)
+        }.isSuccess
+    }
+
+    fun cancelTest() {
+        NotificationManagerCompat.from(context).cancel(AlarmNotificationIds.TEST)
     }
 
     private fun openAppIntent(): PendingIntent = PendingIntent.getActivity(
@@ -106,6 +148,12 @@ class AlarmNotifier(private val context: Context) {
     companion object {
         const val ALARM_CHANNEL = "glucose_alarms_v1"
         const val STATUS_CHANNEL = "sensor_status_v1"
-        private val AlarmKind.notificationId: Int get() = 4_000 + ordinal
     }
+}
+
+internal object AlarmNotificationIds {
+    const val TEST = 4_900
+    const val TEST_TIMEOUT_MS = 10_000L
+
+    fun forAlarm(kind: AlarmKind): Int = 4_000 + kind.ordinal
 }

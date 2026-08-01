@@ -2,7 +2,7 @@ package com.sladkaya.sensor.sibionics
 
 import com.sladkaya.core.model.SensorFamily
 
-enum class Gs1ActivationProfileError {
+enum class Gs1DiagnosticActivationProfileError {
     INVALID_SENSOR_ID,
     UNSUPPORTED_FAMILY,
     INVALID_BLUETOOTH_ADDRESS,
@@ -10,9 +10,14 @@ enum class Gs1ActivationProfileError {
     INVALID_PACKAGE_CODE,
 }
 
-sealed interface Gs1ActivationProfileValidation {
-    data class Valid(val profile: Gs1ActivationProfile) : Gs1ActivationProfileValidation
-    data class Invalid(val error: Gs1ActivationProfileError) : Gs1ActivationProfileValidation
+sealed interface Gs1DiagnosticActivationProfileValidation {
+    data class Valid(
+        val profile: Gs1DiagnosticActivationProfile,
+    ) : Gs1DiagnosticActivationProfileValidation
+
+    data class Invalid(
+        val error: Gs1DiagnosticActivationProfileError,
+    ) : Gs1DiagnosticActivationProfileValidation
 }
 
 /**
@@ -20,7 +25,7 @@ sealed interface Gs1ActivationProfileValidation {
  * open storage, native state or Bluetooth. There is intentionally no scan-first
  * fallback: the configured MAC must identify the exact sensor.
  */
-class Gs1ActivationProfile private constructor(
+class Gs1DiagnosticActivationProfile private constructor(
     val sensorId: String,
     val family: SensorFamily,
     val bluetoothAddress: String,
@@ -42,38 +47,38 @@ class Gs1ActivationProfile private constructor(
             bluetoothAddress: String,
             transportVariant: Int,
             packageCode: String,
-        ): Gs1ActivationProfileValidation {
+        ): Gs1DiagnosticActivationProfileValidation {
             if (sensorId.isBlank() || sensorId.length > MAX_SENSOR_ID_CHARS) {
-                return Gs1ActivationProfileValidation.Invalid(
-                    Gs1ActivationProfileError.INVALID_SENSOR_ID,
+                return Gs1DiagnosticActivationProfileValidation.Invalid(
+                    Gs1DiagnosticActivationProfileError.INVALID_SENSOR_ID,
                 )
             }
             if (family != SensorFamily.SIBIONICS_GS1 &&
                 family != SensorFamily.SIBIONICS_GS1SB
             ) {
-                return Gs1ActivationProfileValidation.Invalid(
-                    Gs1ActivationProfileError.UNSUPPORTED_FAMILY,
+                return Gs1DiagnosticActivationProfileValidation.Invalid(
+                    Gs1DiagnosticActivationProfileError.UNSUPPORTED_FAMILY,
                 )
             }
             if (!BLUETOOTH_ADDRESS.matches(bluetoothAddress)) {
-                return Gs1ActivationProfileValidation.Invalid(
-                    Gs1ActivationProfileError.INVALID_BLUETOOTH_ADDRESS,
+                return Gs1DiagnosticActivationProfileValidation.Invalid(
+                    Gs1DiagnosticActivationProfileError.INVALID_BLUETOOTH_ADDRESS,
                 )
             }
             if (transportVariant !in VERIFIED_TRANSPORT_VARIANTS) {
-                return Gs1ActivationProfileValidation.Invalid(
-                    Gs1ActivationProfileError.UNVERIFIED_TRANSPORT_VARIANT,
+                return Gs1DiagnosticActivationProfileValidation.Invalid(
+                    Gs1DiagnosticActivationProfileError.UNVERIFIED_TRANSPORT_VARIANT,
                 )
             }
             if (packageCode.length != PACKAGE_CODE_CHARS ||
                 !packageCode.all(Char::isAsciiLetterOrDigit)
             ) {
-                return Gs1ActivationProfileValidation.Invalid(
-                    Gs1ActivationProfileError.INVALID_PACKAGE_CODE,
+                return Gs1DiagnosticActivationProfileValidation.Invalid(
+                    Gs1DiagnosticActivationProfileError.INVALID_PACKAGE_CODE,
                 )
             }
-            return Gs1ActivationProfileValidation.Valid(
-                Gs1ActivationProfile(
+            return Gs1DiagnosticActivationProfileValidation.Valid(
+                Gs1DiagnosticActivationProfile(
                     sensorId = sensorId,
                     family = family,
                     bluetoothAddress = bluetoothAddress.uppercase(),

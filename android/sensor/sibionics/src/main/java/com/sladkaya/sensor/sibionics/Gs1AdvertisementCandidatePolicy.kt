@@ -56,18 +56,17 @@ internal class Gs1AdvertisementCandidatePolicy(
     }
 
     fun evaluate(candidate: Gs1AdvertisementCandidate): Gs1AdvertisementCandidateResult {
-        if (!BLUETOOTH_ADDRESS.matches(candidate.bluetoothAddress)) {
-            return Gs1AdvertisementCandidateResult.Invalid(
-                Gs1AdvertisementInvalidReason.MALFORMED_BLUETOOTH_ADDRESS,
-            )
-        }
-
         val name = candidate.deviceName
         if (name == null || name.length < NAME_SUFFIX_LENGTH) {
             return Gs1AdvertisementCandidateResult.NoMatch
         }
         if (!name.endsWith(requiredNameSuffix, ignoreCase = false)) {
             return Gs1AdvertisementCandidateResult.NoMatch
+        }
+        if (!BLUETOOTH_ADDRESS.matches(candidate.bluetoothAddress)) {
+            return Gs1AdvertisementCandidateResult.Invalid(
+                Gs1AdvertisementInvalidReason.MALFORMED_BLUETOOTH_ADDRESS,
+            )
         }
         return Gs1AdvertisementCandidateResult.CandidateMatch(
             deviceName = name,

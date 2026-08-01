@@ -52,7 +52,7 @@ internal class Gs1DurableIngress(
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     suspend fun append(
-        profile: Gs1ActivationProfile,
+        profile: Gs1DiagnosticActivationProfile,
         attemptId: String,
         ordinal: Long,
         encryptedPacket: ByteArray,
@@ -68,7 +68,7 @@ internal class Gs1DurableIngress(
     }
 
     fun capture(
-        profile: Gs1ActivationProfile,
+        profile: Gs1DiagnosticActivationProfile,
         attemptId: String,
         ordinal: Long,
         encryptedPacket: ByteArray,

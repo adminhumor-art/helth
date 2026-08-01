@@ -30,7 +30,7 @@ internal class Gs1PendingIngressRecovery(
     private val replay: suspend (Long, DurablyJournaledGs1Packet) -> Gs1RuntimeAwaitResult,
 ) {
     suspend fun recover(
-        profile: Gs1ActivationProfile,
+        profile: Gs1DiagnosticActivationProfile,
         generation: Long,
         initialCoreCursor: Int,
     ): Gs1PendingIngressRecoveryResult {
@@ -185,15 +185,7 @@ internal class Gs1PendingIngressRecovery(
                     indices.firstOrNull() == expectedFirst &&
                     indices.lastOrNull() == expectedLast &&
                     indices.zipWithNext().all { (left, right) -> right == left + 1 }
-                if (core.readings.isNotEmpty()) {
-                    ReplayValidation.Failure(
-                        failed(
-                            "RECOVERY_PRODUCT_PUBLICATION_BYPASS",
-                            entry.record.ingressId,
-                            retryable = false,
-                        ),
-                    )
-                } else if (!exactRange) {
+                if (!exactRange) {
                     ReplayValidation.Failure(
                         failed(
                             "RECOVERY_COMMIT_RANGE_MISMATCH",

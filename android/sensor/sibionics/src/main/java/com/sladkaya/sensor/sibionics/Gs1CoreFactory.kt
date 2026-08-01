@@ -1,7 +1,6 @@
 package com.sladkaya.sensor.sibionics
 
 import com.sladkaya.core.data.SensorAlgorithmCheckpointRecord
-import com.sladkaya.core.data.SensorCheckpointProvenance
 import com.sladkaya.core.data.SensorCoreStore
 import com.sladkaya.core.model.SensorFamily
 import com.sladkaya.sensor.sibionics.algorithm.AlgorithmCheckpoint
@@ -43,7 +42,6 @@ internal enum class Gs1CoreOpenError {
     UNSUPPORTED_SENSITIVITY_ENCODING,
     STORAGE_UNAVAILABLE,
     CHECKPOINT_CALIBRATION_MISMATCH,
-    CHECKPOINT_PROVENANCE_UNVERIFIED,
     CHECKPOINT_PHYSICAL_IDENTITY_MISMATCH,
     CHECKPOINT_METADATA_MISMATCH,
     SENSOR_SEQUENCE_EXHAUSTED,
@@ -150,13 +148,6 @@ internal class Gs1CoreFactory private constructor(
                 Gs1CoreOpenError.CHECKPOINT_PHYSICAL_IDENTITY_MISMATCH,
                 "Bluetooth address is already bound to another sensor identity",
             )
-        }
-        if (stored != null &&
-            (stored.transportProtocol == SensorCheckpointProvenance.UNVERIFIED_LEGACY_V2 ||
-                stored.dataHandleBinarySetId == SensorCheckpointProvenance.UNVERIFIED_LEGACY_V2 ||
-                stored.bluetoothAddress == SensorCheckpointProvenance.UNVERIFIED_LEGACY_V3_IDENTITY)
-        ) {
-            return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.CHECKPOINT_PROVENANCE_UNVERIFIED)
         }
         if (stored != null && stored.bluetoothAddress != configuration.bluetoothAddress) {
             return Gs1CoreOpenResult.Failure(

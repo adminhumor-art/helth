@@ -20,7 +20,7 @@ internal interface Gs1RuntimeCoreLease : AutoCloseable {
 }
 
 internal fun interface Gs1RuntimeCoreOpener {
-    suspend fun open(profile: Gs1ActivationProfile): Gs1RuntimeCoreOpenResult
+    suspend fun open(profile: Gs1DiagnosticActivationProfile): Gs1RuntimeCoreOpenResult
 }
 
 internal sealed interface Gs1RuntimeCoreOpenResult {
@@ -116,7 +116,7 @@ internal class Gs1DiagnosticRuntime(
         require(stopTimeoutMillis > 0)
     }
 
-    suspend fun start(profile: Gs1ActivationProfile): Gs1RuntimeStartResult =
+    suspend fun start(profile: Gs1DiagnosticActivationProfile): Gs1RuntimeStartResult =
         lifecycle.withLock {
             current?.let { previous ->
                 if (stopAndJoin(previous) == Gs1RuntimeStopResult.PERSISTENCE_PENDING) {
@@ -321,16 +321,6 @@ internal class Gs1DiagnosticRuntime(
         generation: Long,
         result: Gs1PacketProcessingResult,
     ): Boolean {
-        if (result.productReadings().isNotEmpty()) {
-            eventSink(
-                Gs1DiagnosticRuntimeEvent.Failed(
-                    generation = generation,
-                    code = "PRODUCT_PUBLICATION_BYPASS",
-                    detail = "A product reading reached the diagnostic-only runtime",
-                ),
-            )
-            return false
-        }
         return when (result) {
             is Gs1PacketProcessingResult.Completed -> {
                 emitCommitted(
@@ -405,20 +395,7 @@ internal class Gs1DiagnosticRuntime(
         }
     }
 
-    private fun Gs1PacketProcessingResult.productReadings(): List<Gs1PacketProcessingResult.PublishedReading> =
-        when (this) {
-            is Gs1PacketProcessingResult.Completed -> readings
-            is Gs1PacketProcessingResult.Rejected -> readings
-            is Gs1PacketProcessingResult.StorageConflict -> readings
-            is Gs1PacketProcessingResult.Closed -> readings
-            is Gs1PacketProcessingResult.InvalidPacket,
-            is Gs1PacketProcessingResult.PersistenceUnavailable,
-            Gs1PacketProcessingResult.NoPendingCommit,
-            -> emptyList()
-        }
-
     private fun Gs1PacketProcessingResult.ingressDisposition(): Gs1RuntimeIngressDisposition {
-        if (productReadings().isNotEmpty()) return Gs1RuntimeIngressDisposition.UNRESOLVED
         return when (this) {
             is Gs1PacketProcessingResult.Completed -> if (committedSamples.isEmpty()) {
                 Gs1RuntimeIngressDisposition.NON_DATA
@@ -484,7 +461,7 @@ internal class Gs1DiagnosticRuntime(
 internal class FactoryGs1RuntimeCoreOpener(
     private val factory: Gs1CoreFactory,
 ) : Gs1RuntimeCoreOpener {
-    override suspend fun open(profile: Gs1ActivationProfile): Gs1RuntimeCoreOpenResult =
+    override suspend fun open(profile: Gs1DiagnosticActivationProfile): Gs1RuntimeCoreOpenResult =
         when (val opened = factory.open(profile.coreConfiguration())) {
             is Gs1CoreOpenResult.Failure -> Gs1RuntimeCoreOpenResult.Failure(
                 code = opened.error.name,

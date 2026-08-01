@@ -240,7 +240,7 @@ class SibionicsAlgorithmSession private constructor(
     }
 
     companion object {
-        const val CHECKPOINT_SCHEMA_VERSION = 3
+        const val CHECKPOINT_SCHEMA_VERSION = 1
         private const val FIRST_SENSOR_INDEX = 1
         private const val SECONDS_PER_SAMPLE = 60L
 

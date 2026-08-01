@@ -1,25 +1,14 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-
-type Sample = { minute: number; value: number };
+import { buildDemoSamples, formatHours, splitChartSegments } from "./glucose-data.mjs";
 
 const ranges = [3, 6, 24] as const;
 
-function buildSamples(hours: number): Sample[] {
-  const count = hours * 12;
-  return Array.from({ length: count }, (_, index) => {
-    const phase = index / Math.max(count - 1, 1);
-    const baseline = 112 + Math.sin(phase * Math.PI * 5) * 16;
-    const meal = Math.exp(-Math.pow((phase - 0.47) * 8, 2)) * 82;
-    const nightLow = Math.exp(-Math.pow((phase - 0.94) * 13, 2)) * 62;
-    return { minute: index * 5, value: Math.round(baseline + meal - nightLow) };
-  });
-}
-
 function GlucoseChart({ hours }: { hours: number }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const samples = useMemo(() => buildSamples(hours), [hours]);
+  const samples = useMemo(() => buildDemoSamples(hours), [hours]);
+  const segments = useMemo(() => splitChartSegments(samples), [samples]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -42,7 +31,8 @@ function GlucoseChart({ hours }: { hours: number }) {
       const min = 40;
       const max = 280;
       const y = (value: number) => pad.top + ((max - value) / (max - min)) * plotHeight;
-      const x = (index: number) => pad.left + (index / Math.max(samples.length - 1, 1)) * plotWidth;
+      const maximumMinute = Math.max(hours * 60 - 5, 1);
+      const x = (minute: number) => pad.left + (minute / maximumMinute) * plotWidth;
 
       context.clearRect(0, 0, width, height);
       context.fillStyle = "rgba(140, 205, 180, 0.14)";
@@ -69,17 +59,26 @@ function GlucoseChart({ hours }: { hours: number }) {
       context.lineWidth = 3;
       context.lineJoin = "round";
       context.lineCap = "round";
-      context.beginPath();
-      samples.forEach((sample, index) => {
-        if (index === 0) context.moveTo(x(index), y(sample.value));
-        else context.lineTo(x(index), y(sample.value));
+      segments.forEach((segment) => {
+        context.beginPath();
+        segment.forEach((sample, index) => {
+          if (index === 0) context.moveTo(x(sample.minute), y(sample.value));
+          else context.lineTo(x(sample.minute), y(sample.value));
+        });
+        context.stroke();
       });
-      context.stroke();
+
+      context.fillStyle = "#176b57";
+      samples.forEach((sample) => {
+        context.beginPath();
+        context.arc(x(sample.minute), y(sample.value), 1.25, 0, Math.PI * 2);
+        context.fill();
+      });
 
       const last = samples[samples.length - 1];
       context.fillStyle = last.value <= 70 ? "#d34949" : "#176b57";
       context.beginPath();
-      context.arc(x(samples.length - 1), y(last.value), 5, 0, Math.PI * 2);
+      context.arc(x(last.minute), y(last.value), 5, 0, Math.PI * 2);
       context.fill();
       context.strokeStyle = "white";
       context.lineWidth = 2;
@@ -90,9 +89,9 @@ function GlucoseChart({ hours }: { hours: number }) {
     observer.observe(canvas);
     render();
     return () => observer.disconnect();
-  }, [samples]);
+  }, [hours, samples, segments]);
 
-  return <canvas ref={canvasRef} role="img" aria-label={`График глюкозы за ${hours} часов`} />;
+  return <canvas ref={canvasRef} role="img" aria-label={`График глюкозы за ${formatHours(hours)}`} />;
 }
 
 export default function Dashboard() {
@@ -105,8 +104,8 @@ export default function Dashboard() {
         <div className="brand"><span className="brand-mark" aria-hidden="true" />Сладкая</div>
         <div className="top-status">
           <span className="online-dot" aria-hidden="true" />
-          <span>Все системы на связи</span>
-          <span className="avatar" aria-label="Профиль Михаила">МИ</span>
+          <span>Демо-экран активен</span>
+          <span className="avatar" aria-label="Профиль владельца">Я</span>
         </div>
       </header>
 
@@ -154,7 +153,7 @@ export default function Dashboard() {
 
           <div className="chart-section">
             <div className="chart-head">
-              <div><h2>История глюкозы</h2><p>Целевой диапазон 3,9–10,0 ммоль/л</p></div>
+              <div><h2>История глюкозы</h2><p>Демо-диапазон тревог 3,9–10,0 ммоль/л · разрыв не соединяется линией</p></div>
               <div className="range-tabs" role="group" aria-label="Период графика">
                 {ranges.map((hours) => (
                   <button key={hours} className={range === hours ? "active" : ""} onClick={() => setRange(hours)} aria-pressed={range === hours}>
@@ -164,7 +163,7 @@ export default function Dashboard() {
               </div>
             </div>
             <div className="chart-wrap"><GlucoseChart hours={range} /></div>
-            <div className="chart-legend"><span>{range} часов назад</span><span>Сейчас · обновлено минуту назад</span></div>
+            <div className="chart-legend"><span>{formatHours(range)} назад</span><span>Сейчас · обновлено минуту назад</span></div>
           </div>
         </section>
 

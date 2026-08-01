@@ -2,7 +2,10 @@ package delivery
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"log/slog"
+	"strings"
 	"time"
 
 	"glucose-monitor/backend/internal/domain"
@@ -17,33 +20,50 @@ type Worker struct {
 	store  store.Store
 	sender Sender
 	logger *slog.Logger
+	now    func() time.Time
 }
 
 func NewWorker(values store.Store, sender Sender, logger *slog.Logger) *Worker {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Worker{store: values, sender: sender, logger: logger}
+	return &Worker{store: values, sender: sender, logger: logger, now: time.Now}
 }
 
 func (w *Worker) RunOnce(ctx context.Context, at time.Time) {
-	deliveries, err := w.store.DueAlertDeliveries(ctx, at, 50)
+	leaseToken, err := newLeaseToken()
+	if err != nil {
+		w.logger.Error("create alert delivery lease", "error", err)
+		return
+	}
+	deliveries, err := w.store.ClaimDueAlertDeliveries(ctx, at, 10, leaseToken, at.Add(2*time.Minute))
 	if err != nil {
 		w.logger.Error("load alert deliveries", "error", err)
 		return
 	}
 	for _, value := range deliveries {
 		if err := w.sender.NotifyRecipient(ctx, value.Alert, value.Recipient); err != nil {
-			next := at.Add(retryDelay(value.Attempts + 1))
-			if markErr := w.store.MarkAlertDeliveryFailed(ctx, value.ID, next, truncate(err.Error(), 1_000)); markErr != nil {
+			completedAt := w.now().UTC()
+			next := completedAt.Add(retryDelay(value.Attempts + 1))
+			if markErr := w.store.MarkAlertDeliveryFailed(
+				ctx, value.ID, leaseToken, completedAt, next, truncate(err.Error(), 1_000),
+			); markErr != nil {
 				w.logger.Error("mark alert delivery failed", "error", markErr, "delivery_id", value.ID)
 			}
 			continue
 		}
-		if err := w.store.MarkAlertDeliverySent(ctx, value.ID, at); err != nil {
+		if err := w.store.MarkAlertDeliverySent(ctx, value.ID, leaseToken, w.now().UTC()); err != nil {
 			w.logger.Error("mark alert delivery sent", "error", err, "delivery_id", value.ID)
 		}
 	}
+}
+
+func newLeaseToken() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value[:]), nil
 }
 
 func retryDelay(attempt int) time.Duration {
@@ -58,8 +78,11 @@ func retryDelay(attempt int) time.Duration {
 }
 
 func truncate(value string, limit int) string {
-	if len(value) <= limit {
-		return value
+	if limit <= 0 {
+		return ""
 	}
-	return value[:limit]
+	if len(value) <= limit {
+		return strings.ToValidUTF8(value, "")
+	}
+	return strings.ToValidUTF8(value[:limit], "")
 }

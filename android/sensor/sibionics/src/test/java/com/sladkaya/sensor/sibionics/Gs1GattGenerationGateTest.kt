@@ -41,11 +41,11 @@ class Gs1GattGenerationGateTest {
         assertFalse(gate.accept(token, gatt, "AA:BB:CC:DD:EE:FF"))
     }
 
-    private fun profile() = (Gs1ActivationProfile.validate(
+    private fun profile() = (Gs1DiagnosticActivationProfile.validate(
         sensorId = "sensor-a",
         family = SensorFamily.SIBIONICS_GS1,
         bluetoothAddress = "AA:BB:CC:DD:EE:FF",
         transportVariant = 0,
         packageCode = "ABCDEFGH",
-    ) as Gs1ActivationProfileValidation.Valid).profile
+    ) as Gs1DiagnosticActivationProfileValidation.Valid).profile
 }

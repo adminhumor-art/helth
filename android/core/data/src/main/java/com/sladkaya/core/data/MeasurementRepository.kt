@@ -25,8 +25,8 @@ class MeasurementRepository private constructor(
         dao.markAttemptFailed(eventId)
     }
 
-    suspend fun discardLegacySimulation(eventId: String): Boolean =
-        dao.deleteLegacySimulator(eventId) > 0
+    suspend fun discardSimulation(eventId: String): Boolean =
+        dao.deleteSimulation(eventId) > 0
 
     companion object {
         fun create(context: Context): MeasurementRepository =

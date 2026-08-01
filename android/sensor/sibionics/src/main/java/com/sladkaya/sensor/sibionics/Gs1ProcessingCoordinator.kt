@@ -8,7 +8,6 @@ import com.sladkaya.core.data.SensorCoreCommitResult
 import com.sladkaya.core.data.SensorCoreStore
 import com.sladkaya.core.data.SensorFailureCommitResult
 import com.sladkaya.core.data.SensorIngestionFailureRecord
-import com.sladkaya.core.model.GlucoseReading
 import com.sladkaya.core.model.ReadingQuality
 import com.sladkaya.core.model.SensorFamily
 import com.sladkaya.sensor.sibionics.algorithm.AlgorithmCheckpoint
@@ -26,15 +25,9 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 internal sealed interface Gs1ProcessingResult {
-    data class Accepted(
-        val reading: GlucoseReading,
-        val alarmEligible: Boolean,
-    ) : Gs1ProcessingResult
-
     /**
-     * A physically unvalidated candidate. This deliberately is not a
-     * [GlucoseReading], so it cannot enter product measurement streams by
-     * type accident.
+     * A physically unvalidated candidate. Product measurement and alarm types
+     * are intentionally absent from this diagnostic-only boundary.
      */
     data class Diagnostic(
         val candidate: Gs1DiagnosticReading,
@@ -64,14 +57,6 @@ data class Gs1DiagnosticReading(
     val sequence: Long,
 )
 
-internal enum class Gs1PublicationMode {
-    /** Persist raw evidence, algorithm output and checkpoint only. */
-    DIAGNOSTIC_ONLY,
-
-    /** May be selected only after the physical release gate is satisfied. */
-    PRODUCT_RELEASED,
-}
-
 /**
  * Owns the strict boundary between one decoded GS1/GS1Sb sample, the stateful
  * native algorithm and durable storage. A new native step is never accepted
@@ -86,7 +71,6 @@ internal class Gs1ProcessingCoordinator(
     private val sensitivity: DecodedSensitivity,
     private val store: SensorCoreStore,
     private val phoneClock: () -> Long = System::currentTimeMillis,
-    private val publicationMode: Gs1PublicationMode = Gs1PublicationMode.DIAGNOSTIC_ONLY,
 ) : AutoCloseable, Gs1SampleProcessor {
     private val mutex = Mutex()
     private var pending: PendingCommit? = null
@@ -184,20 +168,9 @@ internal class Gs1ProcessingCoordinator(
                     realtime -> ReadingQuality.VALID
                     else -> ReadingQuality.DEGRADED
                 }
-                val productReleased = publicationMode == Gs1PublicationMode.PRODUCT_RELEASED
-                val alarmEligible = productReleased && quality == ReadingQuality.VALID
-                val reading = if (productReleased) {
-                    step.output.toReading(sample, phoneTime, quality)
-                } else {
-                    null
-                }
-                val completedResult = if (reading != null) {
-                    Gs1ProcessingResult.Accepted(reading, alarmEligible)
-                } else {
-                    Gs1ProcessingResult.Diagnostic(
-                        step.output.toDiagnosticReading(sample, phoneTime, quality),
-                    )
-                }
+                val completedResult = Gs1ProcessingResult.Diagnostic(
+                    step.output.toDiagnosticReading(sample, phoneTime, quality),
+                )
                 val record = try {
                     buildRecord(
                         encryptedPacket = packet,
@@ -205,8 +178,6 @@ internal class Gs1ProcessingCoordinator(
                         phoneTime = phoneTime,
                         output = step.output,
                         checkpoint = step.checkpoint,
-                        reading = reading,
-                        alarmEligible = alarmEligible,
                         algorithmErrorCode = null,
                     )
                 } catch (failure: Exception) {
@@ -254,8 +225,6 @@ internal class Gs1ProcessingCoordinator(
                         phoneTime = phoneTime,
                         output = diagnostic,
                         checkpoint = checkpoint,
-                        reading = null,
-                        alarmEligible = false,
                         algorithmErrorCode = step.error.code.name,
                     )
                 } catch (failure: Exception) {
@@ -426,8 +395,6 @@ internal class Gs1ProcessingCoordinator(
         phoneTime: Long,
         output: AlgorithmOutput,
         checkpoint: AlgorithmCheckpoint,
-        reading: GlucoseReading?,
-        alarmEligible: Boolean,
         algorithmErrorCode: String?,
     ): AtomicSensorCoreRecord {
         require(checkpoint.sensitivityToken == sensitivity.token) {
@@ -468,8 +435,8 @@ internal class Gs1ProcessingCoordinator(
             sensitivityCoefficient = sensitivity.coefficient.toDouble(),
             sensitivityEncoding = sensitivity.encoding.name,
             initializationMode = checkpoint.initializationMode.name,
-            publishable = reading != null,
-            alarmEligible = alarmEligible,
+            publishable = false,
+            alarmEligible = false,
             algorithmErrorCode = algorithmErrorCode,
         )
         val savedCheckpoint = SensorAlgorithmCheckpointRecord(
@@ -494,24 +461,8 @@ internal class Gs1ProcessingCoordinator(
             displayOffsetMmolL = checkpoint.displayOffsetMmolL,
             schemaVersion = checkpoint.schemaVersion,
         )
-        return AtomicSensorCoreRecord(raw, result, savedCheckpoint, reading)
+        return AtomicSensorCoreRecord(raw, result, savedCheckpoint, measurement = null)
     }
-
-    private fun AlgorithmOutput.toReading(
-        sample: DecodedGs1RawSample,
-        phoneTime: Long,
-        quality: ReadingQuality,
-    ) = GlucoseReading(
-        eventId = eventId(sample),
-        sensorId = sensorId,
-        sensorFamily = family,
-        sensorTimeEpochMs = sample.sensorTimeEpochSeconds * MILLIS_PER_SECOND,
-        phoneTimeEpochMs = phoneTime,
-        glucoseMgDl = (glucoseMmolL * MG_DL_PER_MMOL_L).roundToInt(),
-        trendMgDlPerMinute = (trend * NATIVE_TREND_SCALE).coerceIn(-20.0, 20.0),
-        quality = quality,
-        sequence = sample.index.toLong(),
-    )
 
     private fun AlgorithmOutput.toDiagnosticReading(
         sample: DecodedGs1RawSample,

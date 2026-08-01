@@ -5,17 +5,6 @@ import com.sladkaya.core.model.SensorFamily
 import java.security.MessageDigest
 import kotlin.math.roundToInt
 
-object SensorCheckpointProvenance {
-    /**
-     * Version-2 checkpoints are preserved during migration, but they cannot be
-     * restored because that schema did not identify the transport binaries.
-     */
-    const val UNVERIFIED_LEGACY_V2 = "UNVERIFIED_LEGACY_V2"
-
-    /** Version-3 checkpoints did not bind native state to a physical radio. */
-    const val UNVERIFIED_LEGACY_V3_IDENTITY = "UNVERIFIED_LEGACY_V3_IDENTITY"
-}
-
 class RawSensorSampleRecord(
     val eventId: String,
     val sensorId: String,
@@ -121,10 +110,7 @@ class SensorAlgorithmCheckpointRecord(
 
     init {
         require(sensorId.isNotBlank() && sensorId.length <= 128)
-        require(
-            bluetoothAddress == SensorCheckpointProvenance.UNVERIFIED_LEGACY_V3_IDENTITY ||
-                CANONICAL_BLUETOOTH_ADDRESS.matches(bluetoothAddress),
-        )
+        require(CANONICAL_BLUETOOTH_ADDRESS.matches(bluetoothAddress))
         require(sensorFamily != SensorFamily.SIMULATOR)
         require(transportVariant >= 0)
         require(transportProtocol.isNotBlank())
@@ -249,7 +235,7 @@ private val SENSITIVITY_ENCODINGS = setOf("NORMAL", "FACTION")
 private val INITIALIZATION_MODES = setOf("STANDARD")
 private val CANONICAL_BLUETOOTH_ADDRESS = Regex("^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$")
 private val ALGORITHM_STATE_SIZES = mapOf("V116A" to 2_480, "V115G" to 2_336)
-private const val CHECKPOINT_SCHEMA_VERSION = 3
+private const val CHECKPOINT_SCHEMA_VERSION = 1
 private const val MIN_SENSITIVITY = 0.8
 private const val MAX_SENSITIVITY = 2.5
 

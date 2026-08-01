@@ -1,6 +1,5 @@
 package com.sladkaya.sensor.sibionics
 
-import com.sladkaya.core.model.GlucoseReading
 import com.sladkaya.core.model.ReadingQuality
 import com.sladkaya.core.model.SensorFamily
 import kotlinx.coroutines.runBlocking
@@ -11,13 +10,13 @@ import org.junit.Test
 
 class Gs1PacketProcessorTest {
     @Test
-    fun verifiedBatchIsCommittedInOrderAndReturnsOnlyRealReadings() = runBlocking {
+    fun verifiedBatchIsCommittedInOrderAndReturnsOnlyDiagnostics() = runBlocking {
         val first = sample(1)
         val second = sample(2)
         val core = ScriptedGs1SampleProcessor(
             processResults = ArrayDeque(listOf(
-                accepted(reading(1)),
-                accepted(reading(2)),
+                diagnostic(1),
+                diagnostic(2),
             )),
         )
         val packet = byteArrayOf(4, 8, 15, 16, 23, 42)
@@ -28,8 +27,7 @@ class Gs1PacketProcessorTest {
         assertEquals(listOf(1, 2), core.processedSamples.map { it.index })
         core.packets.forEach { assertArrayEquals(packet, it) }
         assertEquals(listOf(1, 2), result.committedSamples.map { it.index })
-        assertEquals(listOf(1L, 2L), result.readings.map { it.reading.sequence })
-        assertTrue(result.readings.all { it.alarmEligible })
+        assertEquals(listOf(1L, 2L), result.diagnostics.map { it.sequence })
     }
 
     @Test
@@ -41,7 +39,7 @@ class Gs1PacketProcessorTest {
                     message = "diagnostic persisted",
                     checkpointCommitted = true,
                 ),
-                accepted(reading(2)),
+                diagnostic(2),
             )),
         )
         val processor = processor(core, listOf(sample(1), sample(2)))
@@ -49,7 +47,7 @@ class Gs1PacketProcessorTest {
         val result = processor.ingest(byteArrayOf(1)) as Gs1PacketProcessingResult.Completed
 
         assertEquals(listOf(1, 2), result.committedSamples.map { it.index })
-        assertEquals(listOf(2L), result.readings.map { it.reading.sequence })
+        assertEquals(listOf(2L), result.diagnostics.map { it.sequence })
         assertEquals(listOf(1), result.committedIssues.map { it.sequence })
         assertEquals(listOf("INVALID_GLUCOSE"), result.committedIssues.map { it.code })
         assertEquals(listOf("diagnostic persisted"), result.committedIssues.map { it.message })
@@ -81,7 +79,6 @@ class Gs1PacketProcessorTest {
         val result = processor.ingest(byteArrayOf(1)) as Gs1PacketProcessingResult.Completed
 
         assertEquals(listOf(1), result.committedSamples.map { it.index })
-        assertTrue(result.readings.isEmpty())
         assertEquals(listOf(108), result.diagnostics.map { it.glucoseMgDl })
     }
 
@@ -89,9 +86,9 @@ class Gs1PacketProcessorTest {
     fun uncertainCommitBlocksNewPacketsAndExactRetryContinuesRemainingBatch() = runBlocking {
         val core = ScriptedGs1SampleProcessor(
             processResults = ArrayDeque(listOf(Gs1ProcessingResult.PersistenceUnavailable("lost response"))),
-            retryResults = ArrayDeque(listOf(accepted(reading(1)))),
+            retryResults = ArrayDeque(listOf(diagnostic(1))),
         )
-        core.processResults += accepted(reading(2))
+        core.processResults += diagnostic(2)
         val processor = processor(core, listOf(sample(1), sample(2)))
 
         val uncertain = processor.ingest(byteArrayOf(7))
@@ -102,7 +99,7 @@ class Gs1PacketProcessorTest {
         assertTrue(blocked is Gs1PacketProcessingResult.PersistenceUnavailable)
         assertEquals(listOf(1, 2), core.processedSamples.map { it.index })
         assertEquals(1, core.retryCalls)
-        assertEquals(listOf(1L, 2L), recovered.readings.map { it.reading.sequence })
+        assertEquals(listOf(1L, 2L), recovered.diagnostics.map { it.sequence })
     }
 
     @Test
@@ -110,7 +107,7 @@ class Gs1PacketProcessorTest {
         val core = ScriptedGs1SampleProcessor(
             processResults = ArrayDeque(listOf(
                 Gs1ProcessingResult.Rejected("NON_SEQUENTIAL_INDEX", "gap"),
-                accepted(reading(2)),
+                diagnostic(2),
             )),
         )
         val processor = processor(core, listOf(sample(1), sample(2)))
@@ -142,8 +139,8 @@ class Gs1PacketProcessorTest {
         val core = ScriptedGs1SampleProcessor(
             processResults = ArrayDeque(
                 listOf(
-                    accepted(reading(1)),
-                    accepted(reading(3)),
+                    diagnostic(1),
+                    diagnostic(3),
                 ),
             ),
         )
@@ -159,7 +156,7 @@ class Gs1PacketProcessorTest {
     @Test
     fun restoredSessionAcceptsOnlyItsPersistedNextIndex() = runBlocking {
         val core = ScriptedGs1SampleProcessor(
-            processResults = ArrayDeque(listOf(accepted(reading(41)))),
+            processResults = ArrayDeque(listOf(diagnostic(41))),
         )
         val processor = Gs1PacketProcessor(
             core = core,
@@ -180,11 +177,11 @@ class Gs1PacketProcessorTest {
     }
 
     @Test
-    fun terminalFailureReturnsTheAlreadyCommittedPrefixWithoutLosingItsAlarmPolicy() = runBlocking {
+    fun terminalFailureReturnsTheAlreadyCommittedDiagnosticPrefix() = runBlocking {
         val core = ScriptedGs1SampleProcessor(
             processResults = ArrayDeque(
                 listOf(
-                    Gs1ProcessingResult.Accepted(reading(1), alarmEligible = false),
+                    diagnostic(1),
                     Gs1ProcessingResult.StorageConflict("checkpoint conflict"),
                 ),
             ),
@@ -194,8 +191,7 @@ class Gs1PacketProcessorTest {
         val result = processor.ingest(byteArrayOf(1)) as Gs1PacketProcessingResult.StorageConflict
 
         assertEquals(listOf(1), result.committedSamples.map { it.index })
-        assertEquals(listOf(1L), result.readings.map { it.reading.sequence })
-        assertTrue(result.readings.none { it.alarmEligible })
+        assertEquals(listOf(1L), result.diagnostics.map { it.sequence })
     }
 
     @Test
@@ -238,20 +234,19 @@ class Gs1PacketProcessorTest {
         reindex = 0,
     )
 
-    private fun reading(index: Int) = GlucoseReading(
-        eventId = "event-$index",
-        sensorId = "sensor-a",
-        sensorFamily = SensorFamily.SIBIONICS_GS1,
-        sensorTimeEpochMs = (1_700_000_000L + index * 60L) * 1_000L,
-        phoneTimeEpochMs = (1_700_000_001L + index * 60L) * 1_000L,
-        glucoseMgDl = 100 + index,
-        trendMgDlPerMinute = 0.0,
-        quality = ReadingQuality.VALID,
-        sequence = index.toLong(),
+    private fun diagnostic(index: Int) = Gs1ProcessingResult.Diagnostic(
+        Gs1DiagnosticReading(
+            eventId = "diagnostic-$index",
+            sensorId = "sensor-a",
+            sensorFamily = SensorFamily.SIBIONICS_GS1,
+            sensorTimeEpochMs = (1_700_000_000L + index * 60L) * 1_000L,
+            phoneTimeEpochMs = (1_700_000_001L + index * 60L) * 1_000L,
+            glucoseMgDl = 100 + index,
+            trendMgDlPerMinute = 0.0,
+            quality = ReadingQuality.VALID,
+            sequence = index.toLong(),
+        ),
     )
-
-    private fun accepted(reading: GlucoseReading) =
-        Gs1ProcessingResult.Accepted(reading, alarmEligible = true)
 }
 
 private class ScriptedGs1SampleProcessor(

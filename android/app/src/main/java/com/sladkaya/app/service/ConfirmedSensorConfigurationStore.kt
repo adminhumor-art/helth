@@ -3,35 +3,48 @@ package com.sladkaya.app.service
 import android.content.Context
 
 /**
- * Reads only the confirmation marker owned by the future onboarding flow.
- * This service never creates or guesses a sensor configuration itself.
+ * Reads only a marker provisioned after future physical validation.
+ * Code/advertisement onboarding never writes this store, and this service
+ * never creates or guesses a sensor configuration itself.
  */
 internal class ConfirmedSensorConfigurationStore(context: Context) {
     private val preferences = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
 
-    fun hasConfirmedConfiguration(): Boolean =
-        preferences.getInt(KEY_SCHEMA_VERSION, 0) == CURRENT_SCHEMA_VERSION &&
-            preferences.getBoolean(KEY_CONFIRMED, false) &&
-            !preferences.getString(KEY_SENSOR_ID, null).isNullOrBlank() &&
-            BLUETOOTH_ADDRESS.matches(preferences.getString(KEY_BLUETOOTH_ADDRESS, "").orEmpty()) &&
-            preferences.getString(KEY_PACKAGE_CODE, "").orEmpty().let { code ->
-                code.length == PACKAGE_CODE_LENGTH && code.all(Char::isAsciiLetterOrDigit)
-            } &&
-            preferences.getInt(KEY_TRANSPORT_VARIANT, -1) == VERIFIED_TRANSPORT_VARIANT
+    fun hasConfirmedConfiguration(): Boolean = try {
+        ConfirmedSensorConfigurationPolicy.isConfirmed(preferences.all)
+    } catch (_: RuntimeException) {
+        false
+    }
 
     private companion object {
         const val PREFERENCES = "confirmed_sensor_configuration"
-        const val KEY_SCHEMA_VERSION = "schema_version"
-        const val KEY_CONFIRMED = "confirmed"
-        const val KEY_SENSOR_ID = "sensor_id"
-        const val KEY_BLUETOOTH_ADDRESS = "bluetooth_address"
-        const val KEY_PACKAGE_CODE = "package_code"
-        const val KEY_TRANSPORT_VARIANT = "transport_variant"
-        const val CURRENT_SCHEMA_VERSION = 1
-        const val PACKAGE_CODE_LENGTH = 8
-        const val VERIFIED_TRANSPORT_VARIANT = 0
-        val BLUETOOTH_ADDRESS = Regex("^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
     }
+}
+
+internal object ConfirmedSensorConfigurationPolicy {
+    fun isConfirmed(values: Map<String, *>): Boolean {
+        val sensorId = values[KEY_SENSOR_ID] as? String ?: return false
+        val bluetoothAddress = values[KEY_BLUETOOTH_ADDRESS] as? String ?: return false
+        val packageCode = values[KEY_PACKAGE_CODE] as? String ?: return false
+        return values[KEY_SCHEMA_VERSION] as? Int == CURRENT_SCHEMA_VERSION &&
+            values[KEY_CONFIRMED] as? Boolean == true &&
+            sensorId.isNotBlank() &&
+            BLUETOOTH_ADDRESS.matches(bluetoothAddress) &&
+            packageCode.length == PACKAGE_CODE_LENGTH &&
+            packageCode.all(Char::isAsciiLetterOrDigit) &&
+            values[KEY_TRANSPORT_VARIANT] as? Int == VERIFIED_TRANSPORT_VARIANT
+    }
+
+    private const val KEY_SCHEMA_VERSION = "schema_version"
+    private const val KEY_CONFIRMED = "confirmed"
+    private const val KEY_SENSOR_ID = "sensor_id"
+    private const val KEY_BLUETOOTH_ADDRESS = "bluetooth_address"
+    private const val KEY_PACKAGE_CODE = "package_code"
+    private const val KEY_TRANSPORT_VARIANT = "transport_variant"
+    private const val CURRENT_SCHEMA_VERSION = 1
+    private const val PACKAGE_CODE_LENGTH = 8
+    private const val VERIFIED_TRANSPORT_VARIANT = 0
+    private val BLUETOOTH_ADDRESS = Regex("^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 }
 
 private fun Char.isAsciiLetterOrDigit(): Boolean =

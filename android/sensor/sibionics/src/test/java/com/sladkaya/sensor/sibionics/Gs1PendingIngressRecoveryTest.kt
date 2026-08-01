@@ -37,7 +37,6 @@ class Gs1PendingIngressRecoveryTest {
                 as DecodedPacket.Gs1RawSamples
             Gs1RuntimeAwaitResult.Processed(
                 Gs1PacketProcessingResult.Completed(
-                    readings = emptyList(),
                     committedSamples = decoded.values,
                 ),
             )
@@ -78,7 +77,6 @@ class Gs1PendingIngressRecoveryTest {
             replayedIndices += decoded.values.single().index
             Gs1RuntimeAwaitResult.Processed(
                 Gs1PacketProcessingResult.Completed(
-                    readings = emptyList(),
                     committedSamples = decoded.values,
                 ),
             )
@@ -235,14 +233,14 @@ class Gs1PendingIngressRecoveryTest {
         replay = { _, packet -> replay(packet) },
     )
 
-    private fun profile(): Gs1ActivationProfile =
-        (Gs1ActivationProfile.validate(
+    private fun profile(): Gs1DiagnosticActivationProfile =
+        (Gs1DiagnosticActivationProfile.validate(
             sensorId = "sensor-a",
             family = SensorFamily.SIBIONICS_GS1,
             bluetoothAddress = "AA:BB:CC:DD:EE:FF",
             transportVariant = 0,
             packageCode = "ABCDEFGH",
-        ) as Gs1ActivationProfileValidation.Valid).profile
+        ) as Gs1DiagnosticActivationProfileValidation.Valid).profile
 
     private fun record(ordinal: Long, packet: ByteArray) = SensorPacketIngressRecord(
         ingressId = "attempt-a:$ordinal",

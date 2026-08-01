@@ -23,5 +23,5 @@ internal interface MeasurementDao {
     suspend fun markAttemptFailed(eventId: String)
 
     @Query("DELETE FROM measurements WHERE eventId = :eventId AND sensorFamily = 'simulator'")
-    suspend fun deleteLegacySimulator(eventId: String): Int
+    suspend fun deleteSimulation(eventId: String): Int
 }

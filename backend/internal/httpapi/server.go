@@ -48,27 +48,23 @@ func (s *Server) Handler() http.Handler {
 	return s.securityHeaders(s.mux)
 }
 
-// PrimePatient gives the signal-loss detector a restart-safe baseline. If the
-// database is empty, startupAt provides one stale window for the phone to send
-// its first value instead of raising an alarm immediately on every deployment.
+// PrimePatient durably establishes the beginning of monitoring once. Restarts
+// never replace that baseline or rebuild medical state from process memory.
 func (s *Server) PrimePatient(ctx context.Context, patientID string, startupAt time.Time) error {
-	latest, err := s.store.Latest(ctx, patientID)
-	if errors.Is(err, store.ErrNotFound) {
-		s.alerts.SeedLatest(patientID, startupAt)
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	s.alerts.SeedLatest(patientID, latest.SensorTime)
-	return nil
+	return s.store.PrimePatient(ctx, patientID, startupAt)
 }
 
 // CheckStaleness is called by the process scheduler independently of incoming
 // measurements. This is essential: a lost phone cannot trigger its own alert.
 func (s *Server) CheckStaleness(ctx context.Context, patientID string, at time.Time) {
-	for _, change := range s.alerts.EvaluateStaleness(patientID, at) {
-		s.persistAndNotify(ctx, change)
+	if err := s.store.ProcessStaleness(
+		ctx,
+		patientID,
+		at,
+		s.config.TelegramRecipients,
+		s.alerts.PlanStaleness,
+	); err != nil {
+		s.config.Logger.Error("evaluate signal freshness", "error", err, "patientId", patientID)
 	}
 }
 
@@ -89,8 +85,13 @@ func (s *Server) ingestMeasurement(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusUnauthorized, "invalid device token")
 		return
 	}
-	var value domain.Measurement
-	if err := decodeJSON(w, r, &value); err != nil {
+	var input measurementInput
+	if err := decodeJSON(w, r, &input); err != nil {
+		writeProblem(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	value, err := input.measurement()
+	if err != nil {
 		writeProblem(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -101,19 +102,20 @@ func (s *Server) ingestMeasurement(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	duplicate, err := s.store.Ingest(r.Context(), value)
+	duplicate, err := s.store.ProcessMeasurement(
+		r.Context(),
+		value,
+		s.config.TelegramRecipients,
+		s.alerts.PlanMeasurement,
+	)
+	if errors.Is(err, store.ErrEventConflict) {
+		writeProblem(w, http.StatusConflict, "eventId already belongs to different measurement data")
+		return
+	}
 	if err != nil {
 		s.config.Logger.Error("store measurement", "error", err)
 		writeProblem(w, http.StatusInternalServerError, "measurement could not be stored")
 		return
-	}
-	if !duplicate {
-		for _, change := range s.alerts.Evaluate(value) {
-			s.persistAndNotify(r.Context(), change)
-		}
-		for _, change := range s.alerts.EvaluateStaleness(value.PatientID, now) {
-			s.persistAndNotify(r.Context(), change)
-		}
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"accepted": true, "duplicate": duplicate, "serverTime": now,
@@ -130,26 +132,23 @@ func (s *Server) patientSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusNotFound, "patient not found")
 		return
 	}
-	latest, err := s.store.Latest(r.Context(), patientID)
-	if errors.Is(err, store.ErrNotFound) {
-		writeJSON(w, http.StatusOK, domain.PatientSnapshot{
-			PatientID: patientID, Freshness: domain.FreshnessMissing,
-			OpenAlerts: s.alerts.OpenAlerts(patientID),
-		})
-		return
-	}
+	snapshot, err := s.store.PatientSnapshot(r.Context(), patientID)
 	if err != nil {
 		writeProblem(w, http.StatusInternalServerError, "snapshot could not be loaded")
 		return
 	}
-	freshness := domain.FreshnessFresh
-	if time.Since(latest.SensorTime) >= s.config.FreshAfter {
-		freshness = domain.FreshnessStale
+	snapshot.PatientID = patientID
+	if snapshot.Latest == nil {
+		snapshot.Freshness = domain.FreshnessMissing
+		writeJSON(w, http.StatusOK, snapshot)
+		return
 	}
-	writeJSON(w, http.StatusOK, domain.PatientSnapshot{
-		PatientID: patientID, Freshness: freshness, Latest: latest,
-		OpenAlerts: s.alerts.OpenAlerts(patientID),
-	})
+	snapshot.Freshness = domain.FreshnessFresh
+	if snapshot.Latest.Quality != domain.QualityValid ||
+		time.Since(snapshot.Latest.FreshnessTime()) >= s.config.FreshAfter {
+		snapshot.Freshness = domain.FreshnessStale
+	}
+	writeJSON(w, http.StatusOK, snapshot)
 }
 
 func (s *Server) listMeasurements(w http.ResponseWriter, r *http.Request) {
@@ -185,7 +184,12 @@ func (s *Server) acknowledgeAlert(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusUnauthorized, "family session is required")
 		return
 	}
-	if err := s.store.AcknowledgeAlert(r.Context(), r.PathValue("alertId"), time.Now().UTC()); errors.Is(err, store.ErrNotFound) {
+	alertID := r.PathValue("alertId")
+	if !domain.IsUUID(alertID) {
+		writeProblem(w, http.StatusBadRequest, "alertId must be a UUID")
+		return
+	}
+	if err := s.store.AcknowledgeAlert(r.Context(), s.config.PatientID, alertID, time.Now().UTC()); errors.Is(err, store.ErrNotFound) {
 		writeProblem(w, http.StatusNotFound, "alert not found")
 		return
 	} else if err != nil {
@@ -195,22 +199,36 @@ func (s *Server) acknowledgeAlert(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) persistAndNotify(ctx context.Context, change alerts.Change) {
-	var recipients []string
-	if change.Type == alerts.Opened {
-		recipients = s.config.TelegramRecipients
-	}
-	if err := s.store.SaveAlert(ctx, change.Alert, recipients); err != nil {
-		s.config.Logger.Error("save alert", "error", err, "kind", change.Alert.Kind)
-	}
-}
-
 func (s *Server) familyAuthorized(r *http.Request) bool {
 	cookie, err := r.Cookie("family_session")
 	if err == nil && secretMatches(cookie.Value, s.config.FamilySessionToken) {
 		return true
 	}
 	return bearerMatches(r, s.config.FamilySessionToken)
+}
+
+type measurementInput struct {
+	EventID            string                    `json:"eventId"`
+	SensorID           string                    `json:"sensorId"`
+	SensorFamily       domain.SensorFamily       `json:"sensorFamily"`
+	SensorTime         time.Time                 `json:"sensorTime"`
+	PhoneTime          time.Time                 `json:"phoneTime"`
+	GlucoseMgDL        int                       `json:"glucoseMgDl"`
+	TrendMgDLPerMinute float64                   `json:"trendMgDlPerMinute"`
+	Quality            domain.MeasurementQuality `json:"quality"`
+	Sequence           *uint64                   `json:"sequence"`
+}
+
+func (i measurementInput) measurement() (domain.Measurement, error) {
+	if i.Sequence == nil {
+		return domain.Measurement{}, errors.New("sequence is required")
+	}
+	return domain.Measurement{
+		EventID: i.EventID, SensorID: i.SensorID, SensorFamily: i.SensorFamily,
+		SensorTime: i.SensorTime, PhoneTime: i.PhoneTime,
+		GlucoseMgDL: i.GlucoseMgDL, TrendMgDLPerMinute: i.TrendMgDLPerMinute,
+		Quality: i.Quality, Sequence: *i.Sequence,
+	}, nil
 }
 
 func bearerMatches(r *http.Request, expected string) bool {

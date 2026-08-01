@@ -53,7 +53,7 @@ class SensorCoreRecordTest {
         assertEquals("STANDARD", bundle.result.initializationMode)
         assertEquals(true, bundle.result.alarmEligible)
         assertEquals(null, bundle.result.algorithmErrorCode)
-        assertEquals(3, bundle.checkpoint.schemaVersion)
+        assertEquals(1, bundle.checkpoint.schemaVersion)
         assertEquals("AA:BB:CC:DD:EE:FF", bundle.checkpoint.bluetoothAddress)
         assertEquals(SensorFamily.SIBIONICS_GS1.wireName, bundle.checkpoint.sensorFamily)
         assertEquals("GS1_V120", bundle.checkpoint.transportProtocol)
@@ -68,7 +68,7 @@ class SensorCoreRecordTest {
             valid.copy(sensitivityToken = "!!!!!!!!")
         }
         assertThrows(IllegalArgumentException::class.java) {
-            valid.copy(schemaVersion = 4)
+            valid.copy(schemaVersion = 2)
         }
         assertThrows(IllegalArgumentException::class.java) {
             valid.copy(bluetoothAddress = "aa:bb:cc:dd:ee:ff")
@@ -142,7 +142,7 @@ class SensorCoreRecordTest {
         state = ByteArray(2_480) { it.toByte() },
         stateSha256 = ByteArray(2_480) { it.toByte() }.sha256(),
         displayOffsetMmolL = 0.4,
-        schemaVersion = 3,
+        schemaVersion = 1,
     )
 
     private fun reading() = GlucoseReading(

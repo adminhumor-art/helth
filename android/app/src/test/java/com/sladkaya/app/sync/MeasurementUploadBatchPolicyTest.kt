@@ -8,15 +8,15 @@ import org.junit.Test
 
 class MeasurementUploadBatchPolicyTest {
     @Test
-    fun legacySimulationIsDiscardedWithoutBlockingFollowingPhysicalReading() {
+    fun simulationIsDiscardedWithoutBlockingFollowingPhysicalReading() {
         val actions = listOf(
-            reading("legacy-demo", SensorFamily.SIMULATOR),
+            reading("demo", SensorFamily.SIMULATOR),
             reading("physical", SensorFamily.SIBIONICS_GS1),
         ).map(MeasurementUploadBatchPolicy::action)
 
         assertEquals(
             listOf(
-                MeasurementUploadAction.DiscardLegacySimulation("legacy-demo"),
+                MeasurementUploadAction.DiscardSimulation("demo"),
                 MeasurementUploadAction.Upload,
             ),
             actions,

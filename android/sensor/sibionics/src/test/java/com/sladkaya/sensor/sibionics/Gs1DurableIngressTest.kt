@@ -111,14 +111,14 @@ class Gs1DurableIngressTest {
         assertArrayEquals(byteArrayOf(7, 8), recovered.packet.encryptedPacketCopy())
     }
 
-    private fun profile(): Gs1ActivationProfile =
-        (Gs1ActivationProfile.validate(
+    private fun profile(): Gs1DiagnosticActivationProfile =
+        (Gs1DiagnosticActivationProfile.validate(
             sensorId = "sensor-a",
             family = SensorFamily.SIBIONICS_GS1,
             bluetoothAddress = "AA:BB:CC:DD:EE:FF",
             transportVariant = 0,
             packageCode = "ABCDEFGH",
-        ) as Gs1ActivationProfileValidation.Valid).profile
+        ) as Gs1DiagnosticActivationProfileValidation.Valid).profile
 }
 
 private class FakeIngressJournal(

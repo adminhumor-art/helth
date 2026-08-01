@@ -11,6 +11,13 @@ internal enum class SensorServiceStartMode {
     Demo,
 }
 
+internal object SensorBackgroundStartPolicy {
+    fun shouldStart(
+        hasConfirmedConfiguration: Boolean,
+        hasMandatoryBlePermissions: Boolean,
+    ): Boolean = hasConfirmedConfiguration && hasMandatoryBlePermissions
+}
+
 /** Pure fail-closed policy kept independent from Android for JVM tests. */
 internal class SensorServiceStartPolicy {
     fun select(

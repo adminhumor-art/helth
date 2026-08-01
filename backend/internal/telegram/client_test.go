@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -30,7 +31,7 @@ func TestNotifySendsOneMessagePerChat(t *testing.T) {
 		}
 		received = append(received, value)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":42}}`))
 	}))
 	defer server.Close()
 
@@ -66,4 +67,63 @@ func TestNotifyReportsTelegramFailure(t *testing.T) {
 	if err := client.Notify(context.Background(), domain.Alert{Kind: domain.AlertSignalLoss, OpenedAt: time.Now()}); err == nil {
 		t.Fatal("expected non-2xx response to be reported")
 	}
+}
+
+func TestNotifyRejectsSuccessfulHTTPWithFailedTelegramEnvelope(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":false,"description":"chat not found"}`))
+	}))
+	defer server.Close()
+	client := Client{Token: "secret", HTTPClient: server.Client(), BaseURL: server.URL}
+	if err := client.NotifyRecipient(context.Background(), domain.Alert{Kind: domain.AlertLow, OpenedAt: time.Now()}, "family"); err == nil {
+		t.Fatal("ok=false response was accepted")
+	}
+}
+
+func TestNotifyRequiresValidTelegramMessageResult(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{}}`))
+	}))
+	defer server.Close()
+	client := Client{Token: "secret", HTTPClient: server.Client(), BaseURL: server.URL}
+	if err := client.NotifyRecipient(context.Background(), domain.Alert{Kind: domain.AlertLow, OpenedAt: time.Now()}, "family"); err == nil {
+		t.Fatal("Telegram response without message_id was accepted")
+	}
+}
+
+func TestNotifyBoundsTelegramResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":42},"padding":"` + strings.Repeat("x", 70<<10) + `"}`))
+	}))
+	defer server.Close()
+	client := Client{Token: "secret", HTTPClient: server.Client(), BaseURL: server.URL}
+	if err := client.NotifyRecipient(context.Background(), domain.Alert{Kind: domain.AlertLow, OpenedAt: time.Now()}, "family"); err == nil {
+		t.Fatal("oversized Telegram response was accepted")
+	}
+}
+
+func TestNotifyNetworkErrorNeverContainsBotToken(t *testing.T) {
+	const token = "very-secret-bot-token"
+	client := Client{
+		Token: token,
+		HTTPClient: &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("dial failed")
+		})},
+	}
+	err := client.NotifyRecipient(context.Background(), domain.Alert{Kind: domain.AlertLow, OpenedAt: time.Now()}, "family")
+	if err == nil {
+		t.Fatal("network error was ignored")
+	}
+	if strings.Contains(err.Error(), token) {
+		t.Fatalf("bot token leaked through error: %q", err)
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
 }

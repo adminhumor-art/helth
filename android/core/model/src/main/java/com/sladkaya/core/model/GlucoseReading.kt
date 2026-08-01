@@ -61,4 +61,23 @@ data class AlarmThresholds(
     val rapidRiseMgDlPerMinute: Double = 3.0,
     val recoveryHysteresisMgDl: Int = 5,
     val staleAfterMs: Long = 10 * 60 * 1000L,
-)
+) {
+    init {
+        require(lowMgDl in MIN_GLUCOSE_MG_DL..MAX_GLUCOSE_MG_DL)
+        require(highMgDl in MIN_GLUCOSE_MG_DL..MAX_GLUCOSE_MG_DL)
+        require(lowMgDl < highMgDl)
+        require(rapidFallMgDlPerMinute in -MAX_ABSOLUTE_TREND..<0.0)
+        require(rapidRiseMgDlPerMinute in 0.0..MAX_ABSOLUTE_TREND && rapidRiseMgDlPerMinute > 0.0)
+        require(recoveryHysteresisMgDl > 0)
+        require(recoveryHysteresisMgDl < highMgDl - lowMgDl)
+        require(staleAfterMs in MIN_STALE_AFTER_MS..MAX_STALE_AFTER_MS)
+    }
+
+    private companion object {
+        const val MIN_GLUCOSE_MG_DL = 20
+        const val MAX_GLUCOSE_MG_DL = 600
+        const val MAX_ABSOLUTE_TREND = 20.0
+        const val MIN_STALE_AFTER_MS = 60_000L
+        const val MAX_STALE_AFTER_MS = 60 * 60_000L
+    }
+}

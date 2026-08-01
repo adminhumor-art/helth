@@ -1,6 +1,5 @@
 package com.sladkaya.sensor.sibionics
 
-import com.sladkaya.core.model.GlucoseReading
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -14,11 +13,6 @@ internal interface Gs1SampleProcessor {
 }
 
 internal sealed interface Gs1PacketProcessingResult {
-    data class PublishedReading(
-        val reading: GlucoseReading,
-        val alarmEligible: Boolean,
-    )
-
     data class CommittedIssue(
         val sequence: Int,
         val code: String,
@@ -32,7 +26,6 @@ internal sealed interface Gs1PacketProcessingResult {
     }
 
     data class Completed(
-        val readings: List<PublishedReading>,
         val committedSamples: List<DecodedGs1RawSample>,
         val diagnostics: List<Gs1DiagnosticReading> = emptyList(),
         val committedIssues: List<CommittedIssue> = emptyList(),
@@ -46,7 +39,6 @@ internal sealed interface Gs1PacketProcessingResult {
     data class Rejected(
         val code: String,
         val message: String,
-        val readings: List<PublishedReading> = emptyList(),
         val committedSamples: List<DecodedGs1RawSample> = emptyList(),
         val diagnostics: List<Gs1DiagnosticReading> = emptyList(),
         val committedIssues: List<CommittedIssue> = emptyList(),
@@ -56,7 +48,6 @@ internal sealed interface Gs1PacketProcessingResult {
 
     data class StorageConflict(
         val reason: String,
-        val readings: List<PublishedReading> = emptyList(),
         val committedSamples: List<DecodedGs1RawSample> = emptyList(),
         val diagnostics: List<Gs1DiagnosticReading> = emptyList(),
         val committedIssues: List<CommittedIssue> = emptyList(),
@@ -64,7 +55,6 @@ internal sealed interface Gs1PacketProcessingResult {
 
     data class Closed(
         val reason: String,
-        val readings: List<PublishedReading> = emptyList(),
         val committedSamples: List<DecodedGs1RawSample> = emptyList(),
         val diagnostics: List<Gs1DiagnosticReading> = emptyList(),
         val committedIssues: List<CommittedIssue> = emptyList(),
@@ -104,7 +94,7 @@ internal class Gs1PacketProcessor(
             }
         }
         if (verified.samples.isEmpty()) {
-            return@withLock Gs1PacketProcessingResult.Completed(emptyList(), emptyList())
+            return@withLock Gs1PacketProcessingResult.Completed(committedSamples = emptyList())
         }
         val batchError = validateWholeBatch(verified.samples)
         if (batchError != null) {
@@ -137,14 +127,6 @@ internal class Gs1PacketProcessor(
                 core.process(batch.encryptedPacket, sample)
             }
             when (result) {
-                is Gs1ProcessingResult.Accepted -> {
-                    batch.readings += Gs1PacketProcessingResult.PublishedReading(
-                        reading = result.reading,
-                        alarmEligible = result.alarmEligible,
-                    )
-                    advanceCommittedSample(batch, sample)
-                }
-
                 is Gs1ProcessingResult.Diagnostic -> {
                     batch.diagnostics += result.candidate
                     advanceCommittedSample(batch, sample)
@@ -163,7 +145,6 @@ internal class Gs1PacketProcessor(
                         return Gs1PacketProcessingResult.Rejected(
                             code = result.code,
                             message = result.message,
-                            readings = batch.readings.toList(),
                             committedSamples = batch.committedSamples.toList(),
                             diagnostics = batch.diagnostics.toList(),
                             committedIssues = batch.committedIssues.toList(),
@@ -179,7 +160,6 @@ internal class Gs1PacketProcessor(
                     pending = null
                     return Gs1PacketProcessingResult.StorageConflict(
                         reason = result.reason,
-                        readings = batch.readings.toList(),
                         committedSamples = batch.committedSamples.toList(),
                         diagnostics = batch.diagnostics.toList(),
                         committedIssues = batch.committedIssues.toList(),
@@ -190,7 +170,6 @@ internal class Gs1PacketProcessor(
                     pending = null
                     return Gs1PacketProcessingResult.Closed(
                         reason = result.reason,
-                        readings = batch.readings.toList(),
                         committedSamples = batch.committedSamples.toList(),
                         diagnostics = batch.diagnostics.toList(),
                         committedIssues = batch.committedIssues.toList(),
@@ -201,7 +180,6 @@ internal class Gs1PacketProcessor(
                     pending = null
                     return Gs1PacketProcessingResult.Closed(
                         reason = "GS1 core lost an expected pending commit",
-                        readings = batch.readings.toList(),
                         committedSamples = batch.committedSamples.toList(),
                         diagnostics = batch.diagnostics.toList(),
                         committedIssues = batch.committedIssues.toList(),
@@ -211,7 +189,6 @@ internal class Gs1PacketProcessor(
         }
         pending = null
         return Gs1PacketProcessingResult.Completed(
-            readings = batch.readings.toList(),
             committedSamples = batch.committedSamples.toList(),
             diagnostics = batch.diagnostics.toList(),
             committedIssues = batch.committedIssues.toList(),
@@ -259,7 +236,6 @@ internal class Gs1PacketProcessor(
         val encryptedPacket: ByteArray,
         val samples: List<DecodedGs1RawSample>,
         var position: Int = 0,
-        val readings: MutableList<Gs1PacketProcessingResult.PublishedReading> = mutableListOf(),
         val committedSamples: MutableList<DecodedGs1RawSample> = mutableListOf(),
         val diagnostics: MutableList<Gs1DiagnosticReading> = mutableListOf(),
         val committedIssues: MutableList<Gs1PacketProcessingResult.CommittedIssue> = mutableListOf(),

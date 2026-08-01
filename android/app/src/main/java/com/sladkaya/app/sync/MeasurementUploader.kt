@@ -31,8 +31,8 @@ class MeasurementUploader(
                 if (batch.isEmpty()) return@withContext
                 for (next in batch) {
                     when (val action = MeasurementUploadBatchPolicy.action(next)) {
-                        is MeasurementUploadAction.DiscardLegacySimulation -> {
-                            repository.discardLegacySimulation(action.eventId)
+                        is MeasurementUploadAction.DiscardSimulation -> {
+                            repository.discardSimulation(action.eventId)
                         }
                         MeasurementUploadAction.Upload -> {
                             if (BuildConfig.API_BASE_URL.isBlank() ||
@@ -85,7 +85,7 @@ class MeasurementUploader(
 }
 
 internal sealed interface MeasurementUploadAction {
-    data class DiscardLegacySimulation(val eventId: String) : MeasurementUploadAction
+    data class DiscardSimulation(val eventId: String) : MeasurementUploadAction
     data object Upload : MeasurementUploadAction
 }
 
@@ -94,6 +94,6 @@ internal object MeasurementUploadBatchPolicy {
         if (reading.isEligibleForProductPublication) {
             MeasurementUploadAction.Upload
         } else {
-            MeasurementUploadAction.DiscardLegacySimulation(reading.eventId)
+            MeasurementUploadAction.DiscardSimulation(reading.eventId)
         }
 }

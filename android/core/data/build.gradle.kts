@@ -10,7 +10,9 @@ android {
 
     defaultConfig {
         minSdk = 26
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
+
 }
 
 room {
@@ -24,5 +26,8 @@ dependencies {
     implementation(libs.kotlinx.coroutines.core)
     ksp(libs.androidx.room.compiler)
     testImplementation(libs.junit)
-    testImplementation("org.xerial:sqlite-jdbc:3.41.2.2")
+    androidTestImplementation(libs.junit)
+    androidTestImplementation(libs.androidx.test.core)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.ext.junit)
 }
