@@ -1,0 +1,33 @@
+.DS_Store
+.env
+*.local
+*.log
+.idea/
+.vscode/
+*.iml
+
+# Local toolchains and generated release artifacts
+tools/
+artifacts/
+
+# Android
+android/.gradle/
+android/.kotlin/
+android/.cxx/
+android/local.properties
+android/**/build/
+android/.idea/
+android/captures/
+*.jks
+*.keystore
+
+# Backend
+backend/bin/
+backend/coverage.out
+
+# Web
+web/node_modules/
+web/.next/
+web/dist/
+web/.wrangler/
+web/.env.local

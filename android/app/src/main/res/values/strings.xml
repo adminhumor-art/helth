@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">Сладкая</string>
+    <string name="widget_description">Текущее значение глюкозы</string>
+    <string name="widget_empty_value">—</string>
+    <string name="widget_steady_arrow">→</string>
+    <string name="widget_waiting">Ожидание данных</string>
+    <string name="widget_setup_required">Требуется настройка датчика</string>
+</resources>

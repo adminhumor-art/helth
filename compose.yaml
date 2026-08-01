@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: sladkaya
+      POSTGRES_USER: sladkaya
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-development-only}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sladkaya -d sladkaya"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  api:
+    build: ./backend
+    environment:
+      APP_ENV: development
+      HTTP_ADDRESS: :8080
+      DATABASE_URL: postgres://sladkaya:${POSTGRES_PASSWORD:-local-development-only}@postgres:5432/sladkaya?sslmode=disable
+      DEVICE_TOKEN: ${DEVICE_TOKEN:-dev-device-token}
+      FAMILY_SESSION_TOKEN: ${FAMILY_SESSION_TOKEN:-dev-family-token}
+      PATIENT_ID: ${PATIENT_ID:-00000000-0000-4000-8000-000000000001}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_IDS: ${TELEGRAM_CHAT_IDS:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+
+volumes:
+  postgres-data:

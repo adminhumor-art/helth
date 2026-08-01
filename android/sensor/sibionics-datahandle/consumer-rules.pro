@@ -1,0 +1,1 @@
+-keep class com.no.sisense.enanddecryption.CGMDataHandle130 { *; }

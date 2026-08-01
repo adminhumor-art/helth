@@ -1,0 +1,207 @@
+openapi: 3.1.0
+info:
+  title: Сладкая API
+  version: 0.1.0
+servers:
+  - url: https://api.example.invalid
+paths:
+  /healthz:
+    get:
+      operationId: health
+      responses:
+        "200":
+          description: Service is healthy
+  /v1/device/measurements:
+    post:
+      operationId: ingestMeasurement
+      security:
+        - deviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MeasurementInput"
+      responses:
+        "202":
+          description: Measurement accepted idempotently
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestResult"
+        "400":
+          description: Invalid measurement
+        "401":
+          description: Invalid device token
+  /v1/patients/{patientId}/snapshot:
+    get:
+      operationId: getPatientSnapshot
+      security:
+        - familySession: []
+      parameters:
+        - $ref: "#/components/parameters/PatientId"
+      responses:
+        "200":
+          description: Latest patient state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PatientSnapshot"
+        "404":
+          description: Patient or measurement not found
+  /v1/patients/{patientId}/measurements:
+    get:
+      operationId: listMeasurements
+      security:
+        - familySession: []
+      parameters:
+        - $ref: "#/components/parameters/PatientId"
+        - in: query
+          name: from
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: to
+          required: true
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: Measurements in ascending sensor-time order
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Measurement"
+  /v1/alerts/{alertId}/acknowledge:
+    post:
+      operationId: acknowledgeAlert
+      security:
+        - familySession: []
+      parameters:
+        - in: path
+          name: alertId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Alert acknowledged idempotently
+components:
+  securitySchemes:
+    deviceToken:
+      type: http
+      scheme: bearer
+    familySession:
+      type: apiKey
+      in: cookie
+      name: family_session
+  parameters:
+    PatientId:
+      in: path
+      name: patientId
+      required: true
+      schema:
+        type: string
+        format: uuid
+  schemas:
+    MeasurementInput:
+      type: object
+      additionalProperties: false
+      required:
+        - eventId
+        - sensorId
+        - sensorFamily
+        - sensorTime
+        - phoneTime
+        - glucoseMgDl
+        - trendMgDlPerMinute
+        - quality
+      properties:
+        eventId:
+          type: string
+          format: uuid
+        sensorId:
+          type: string
+          minLength: 1
+          maxLength: 128
+        sensorFamily:
+          type: string
+          enum: [sibionics_gs1, sibionics_gs1sb, sibionics_gs3, simulator]
+        sensorTime:
+          type: string
+          format: date-time
+        phoneTime:
+          type: string
+          format: date-time
+        glucoseMgDl:
+          type: integer
+          minimum: 20
+          maximum: 600
+        trendMgDlPerMinute:
+          type: number
+          minimum: -20
+          maximum: 20
+        quality:
+          type: string
+          enum: [valid, warming_up, degraded]
+        sequence:
+          type: integer
+          minimum: 0
+    Measurement:
+      allOf:
+        - $ref: "#/components/schemas/MeasurementInput"
+        - type: object
+          required: [patientId, receivedAt]
+          properties:
+            patientId:
+              type: string
+              format: uuid
+            receivedAt:
+              type: string
+              format: date-time
+    IngestResult:
+      type: object
+      required: [accepted, duplicate, serverTime]
+      properties:
+        accepted:
+          type: boolean
+        duplicate:
+          type: boolean
+        serverTime:
+          type: string
+          format: date-time
+    PatientSnapshot:
+      type: object
+      required: [patientId, freshness, latest, openAlerts]
+      properties:
+        patientId:
+          type: string
+          format: uuid
+        freshness:
+          type: string
+          enum: [fresh, stale, missing]
+        latest:
+          oneOf:
+            - $ref: "#/components/schemas/Measurement"
+            - type: "null"
+        openAlerts:
+          type: array
+          items:
+            type: object
+            required: [id, kind, openedAt]
+            properties:
+              id:
+                type: string
+                format: uuid
+              kind:
+                type: string
+                enum: [low, high, rapid_fall, rapid_rise, signal_loss]
+              openedAt:
+                type: string
+                format: date-time
