@@ -138,10 +138,11 @@ type Alert struct {
 }
 
 type AlertDelivery struct {
-	ID        string
-	Alert     Alert
-	Recipient string
-	Attempts  int
+	ID                 string
+	Alert              Alert
+	PatientDisplayName string
+	Recipient          string
+	Attempts           int
 }
 
 type Freshness string

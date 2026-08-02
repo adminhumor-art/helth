@@ -5,6 +5,7 @@ import kotlinx.coroutines.sync.withLock
 
 internal interface Gs1SampleProcessor {
     suspend fun process(
+        sourceIngressId: String,
         encryptedPacket: ByteArray,
         sample: DecodedGs1RawSample,
         receivedAtEpochMs: Long,
@@ -29,6 +30,7 @@ internal sealed interface Gs1PacketProcessingResult {
     data class Completed(
         val committedSamples: List<DecodedGs1RawSample>,
         val diagnostics: List<Gs1DiagnosticReading> = emptyList(),
+        val publications: List<Gs1ProductPublication> = emptyList(),
         val committedIssues: List<CommittedIssue> = emptyList(),
         val resolvedWireProfile: Gs1WireProfile? = null,
         val validatedTransportEnvelope: Boolean = false,
@@ -44,6 +46,7 @@ internal sealed interface Gs1PacketProcessingResult {
         val message: String,
         val committedSamples: List<DecodedGs1RawSample> = emptyList(),
         val diagnostics: List<Gs1DiagnosticReading> = emptyList(),
+        val publications: List<Gs1ProductPublication> = emptyList(),
         val committedIssues: List<CommittedIssue> = emptyList(),
     ) : Gs1PacketProcessingResult
 
@@ -53,6 +56,7 @@ internal sealed interface Gs1PacketProcessingResult {
         val reason: String,
         val committedSamples: List<DecodedGs1RawSample> = emptyList(),
         val diagnostics: List<Gs1DiagnosticReading> = emptyList(),
+        val publications: List<Gs1ProductPublication> = emptyList(),
         val committedIssues: List<CommittedIssue> = emptyList(),
     ) : Gs1PacketProcessingResult
 
@@ -60,6 +64,7 @@ internal sealed interface Gs1PacketProcessingResult {
         val reason: String,
         val committedSamples: List<DecodedGs1RawSample> = emptyList(),
         val diagnostics: List<Gs1DiagnosticReading> = emptyList(),
+        val publications: List<Gs1ProductPublication> = emptyList(),
         val committedIssues: List<CommittedIssue> = emptyList(),
     ) : Gs1PacketProcessingResult
 
@@ -86,9 +91,12 @@ internal class Gs1PacketProcessor(
     }
 
     suspend fun ingest(
+        sourceIngressId: String,
         encryptedPacket: ByteArray,
         receivedAtEpochMs: Long,
+        verifiedCommittedPrefixSampleCount: Int = 0,
     ): Gs1PacketProcessingResult = mutex.withLock {
+        require(sourceIngressId.isNotBlank() && sourceIngressId.length <= MAX_INGRESS_ID_CHARS)
         require(receivedAtEpochMs > 0L)
         if (pending != null) {
             return@withLock Gs1PacketProcessingResult.PersistenceUnavailable(
@@ -109,7 +117,11 @@ internal class Gs1PacketProcessor(
                 validatedTransportEnvelope = true,
             )
         }
-        val batchError = validateWholeBatch(verified.samples, receivedAtEpochMs)
+        val batchError = validateWholeBatch(
+            samples = verified.samples,
+            receivedAtEpochMs = receivedAtEpochMs,
+            verifiedCommittedPrefixSampleCount = verifiedCommittedPrefixSampleCount,
+        )
         if (batchError != null) {
             return@withLock Gs1PacketProcessingResult.Rejected(
                 code = "BATCH_SEQUENCE_INVALID",
@@ -117,9 +129,10 @@ internal class Gs1PacketProcessor(
             )
         }
         pending = PendingBatch(
+            sourceIngressId = sourceIngressId,
             encryptedPacket = encryptedPacket.copyOf(),
             receivedAtEpochMs = receivedAtEpochMs,
-            samples = verified.samples.toList(),
+            samples = verified.samples.drop(verifiedCommittedPrefixSampleCount),
         )
         drainPendingLocked(retryCurrent = false)
     }
@@ -138,11 +151,25 @@ internal class Gs1PacketProcessor(
                 retry = false
                 core.retryPendingCommit()
             } else {
-                core.process(batch.encryptedPacket, sample, batch.receivedAtEpochMs)
+                core.process(
+                    batch.sourceIngressId,
+                    batch.encryptedPacket,
+                    sample,
+                    batch.receivedAtEpochMs,
+                )
             }
             when (result) {
                 is Gs1ProcessingResult.Diagnostic -> {
                     batch.diagnostics += result.candidate
+                    advanceCommittedSample(batch, sample)
+                }
+
+                is Gs1ProcessingResult.ProductPublicationReady -> {
+                    batch.publications += result.publication
+                    advanceCommittedSample(batch, sample)
+                }
+
+                is Gs1ProcessingResult.ApprovedCheckpointOnly -> {
                     advanceCommittedSample(batch, sample)
                 }
 
@@ -154,6 +181,17 @@ internal class Gs1PacketProcessor(
                             message = result.message,
                         )
                         advanceCommittedSample(batch, sample)
+                        if (result.terminalAfterCommit) {
+                            pending = null
+                            return Gs1PacketProcessingResult.Rejected(
+                                code = result.code,
+                                message = result.message,
+                                committedSamples = batch.committedSamples.toList(),
+                                diagnostics = batch.diagnostics.toList(),
+                                publications = batch.publications.toList(),
+                                committedIssues = batch.committedIssues.toList(),
+                            )
+                        }
                     } else {
                         pending = null
                         return Gs1PacketProcessingResult.Rejected(
@@ -161,6 +199,7 @@ internal class Gs1PacketProcessor(
                             message = result.message,
                             committedSamples = batch.committedSamples.toList(),
                             diagnostics = batch.diagnostics.toList(),
+                            publications = batch.publications.toList(),
                             committedIssues = batch.committedIssues.toList(),
                         )
                     }
@@ -176,6 +215,7 @@ internal class Gs1PacketProcessor(
                         reason = result.reason,
                         committedSamples = batch.committedSamples.toList(),
                         diagnostics = batch.diagnostics.toList(),
+                        publications = batch.publications.toList(),
                         committedIssues = batch.committedIssues.toList(),
                     )
                 }
@@ -186,6 +226,7 @@ internal class Gs1PacketProcessor(
                         reason = result.reason,
                         committedSamples = batch.committedSamples.toList(),
                         diagnostics = batch.diagnostics.toList(),
+                        publications = batch.publications.toList(),
                         committedIssues = batch.committedIssues.toList(),
                     )
                 }
@@ -196,6 +237,7 @@ internal class Gs1PacketProcessor(
                         reason = "GS1 core lost an expected pending commit",
                         committedSamples = batch.committedSamples.toList(),
                         diagnostics = batch.diagnostics.toList(),
+                        publications = batch.publications.toList(),
                         committedIssues = batch.committedIssues.toList(),
                     )
                 }
@@ -205,6 +247,7 @@ internal class Gs1PacketProcessor(
         return Gs1PacketProcessingResult.Completed(
             committedSamples = batch.committedSamples.toList(),
             diagnostics = batch.diagnostics.toList(),
+            publications = batch.publications.toList(),
             committedIssues = batch.committedIssues.toList(),
         )
     }
@@ -212,15 +255,16 @@ internal class Gs1PacketProcessor(
     private fun validateWholeBatch(
         samples: List<DecodedGs1RawSample>,
         receivedAtEpochMs: Long,
+        verifiedCommittedPrefixSampleCount: Int,
     ): String? {
         if (expectedNextIndex > MAX_SENSOR_INDEX) {
             return "The sensor sequence has already reached its maximum value"
         }
-        if (samples.first().index != expectedNextIndex) {
-            return "Expected sensor index $expectedNextIndex but received ${samples.first().index}"
+        if (verifiedCommittedPrefixSampleCount !in 0 until samples.size) {
+            return "Verified committed prefix must leave a non-empty suffix for the core"
         }
         samples.forEachIndexed { position, sample ->
-            val expectedIndex = expectedNextIndex + position
+            val expectedIndex = samples.first().index + position
             if (expectedIndex > MAX_SENSOR_INDEX || sample.index != expectedIndex) {
                 return "Sensor indexes in one batch must be consecutive"
             }
@@ -259,6 +303,10 @@ internal class Gs1PacketProcessor(
                 }
             }
         }
+        val firstUncommitted = samples[verifiedCommittedPrefixSampleCount]
+        if (firstUncommitted.index != expectedNextIndex) {
+            return "Expected sensor index $expectedNextIndex but received ${firstUncommitted.index}"
+        }
         return null
     }
 
@@ -275,12 +323,14 @@ internal class Gs1PacketProcessor(
     }
 
     private data class PendingBatch(
+        val sourceIngressId: String,
         val encryptedPacket: ByteArray,
         val receivedAtEpochMs: Long,
         val samples: List<DecodedGs1RawSample>,
         var position: Int = 0,
         val committedSamples: MutableList<DecodedGs1RawSample> = mutableListOf(),
         val diagnostics: MutableList<Gs1DiagnosticReading> = mutableListOf(),
+        val publications: MutableList<Gs1ProductPublication> = mutableListOf(),
         val committedIssues: MutableList<Gs1PacketProcessingResult.CommittedIssue> = mutableListOf(),
     )
 
@@ -289,5 +339,6 @@ internal class Gs1PacketProcessor(
         const val MAX_SENSOR_INDEX = 0xffff
         const val SECONDS_PER_SAMPLE = 60L
         const val MILLIS_PER_SECOND = 1_000L
+        const val MAX_INGRESS_ID_CHARS = 128
     }
 }

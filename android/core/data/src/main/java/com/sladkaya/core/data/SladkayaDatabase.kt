@@ -15,6 +15,10 @@ import androidx.room.RoomDatabase
         SensorPacketIngressEntity::class,
         SensorPacketIngressOutcomeEntity::class,
         SensorProtocolBindingEntity::class,
+        PhysicalSensorApprovalEntity::class,
+        ProductPublicationBindingEntity::class,
+        ActiveSensorPublicationBindingEntity::class,
+        UploadOutboxEntity::class,
     ],
     version = 1,
     exportSchema = true,
@@ -23,6 +27,7 @@ internal abstract class SladkayaDatabase : RoomDatabase() {
     abstract fun measurements(): MeasurementDao
     abstract fun sensorCore(): SensorCoreDao
     abstract fun sensorPacketIngress(): SensorPacketIngressDao
+    abstract fun committedSensorIngress(): CommittedSensorIngressDao
 
     companion object {
         @Volatile private var instance: SladkayaDatabase? = null

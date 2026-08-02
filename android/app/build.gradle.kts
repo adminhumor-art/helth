@@ -36,8 +36,6 @@ android {
         versionCode = 1
         versionName = "0.1.0-dev"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        buildConfigField("String", "API_BASE_URL", "\"\"")
-        buildConfigField("String", "DEVICE_TOKEN", "\"\"")
         ndk {
             abiFilters += setOf("arm64-v8a", "armeabi-v7a")
         }
@@ -101,11 +99,13 @@ dependencies {
     implementation(libs.google.mlkit.barcode.scanning)
     debugImplementation(libs.androidx.compose.ui.tooling)
     implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.androidx.work.runtime)
     testImplementation(libs.junit)
     androidTestImplementation(libs.junit)
     androidTestImplementation(libs.androidx.test.core)
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.androidx.work.testing)
 }
 
 val verifyPermanentReleaseSigning by tasks.registering {

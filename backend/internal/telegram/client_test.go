@@ -13,7 +13,7 @@ import (
 	"glucose-monitor/backend/internal/domain"
 )
 
-func TestNotifySendsOneMessagePerChat(t *testing.T) {
+func TestNotifyRecipientIncludesPatientDisplayName(t *testing.T) {
 	t.Helper()
 	type request struct {
 		ChatID              string `json:"chat_id"`
@@ -37,20 +37,24 @@ func TestNotifySendsOneMessagePerChat(t *testing.T) {
 
 	glucose := 58
 	client := Client{
-		Token: "secret", ChatIDs: []string{"family-1", "family-2"},
+		Token:      "secret",
 		HTTPClient: server.Client(), BaseURL: server.URL,
 	}
 	alert := domain.Alert{
 		Kind: domain.AlertLow, OpenedAt: time.Date(2026, 7, 31, 3, 4, 0, 0, time.FixedZone("local", 3*60*60)),
 		GlucoseMgDL: &glucose,
 	}
-	if err := client.Notify(context.Background(), alert); err != nil {
-		t.Fatal(err)
+	for _, chatID := range []string{"family-1", "family-2"} {
+		if err := client.NotifyRecipient(context.Background(), alert, "  Мама\n\t Иванова  ", chatID); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if len(received) != 2 || received[0].ChatID != "family-1" || received[1].ChatID != "family-2" {
 		t.Fatalf("unexpected recipients: %#v", received)
 	}
-	if !strings.Contains(received[0].Text, "58 мг/дл") || !strings.Contains(received[0].Text, "Время (UTC): 00:04") {
+	if !strings.Contains(received[0].Text, "Пациент: Мама Иванова") ||
+		!strings.Contains(received[0].Text, "58 мг/дл") ||
+		!strings.Contains(received[0].Text, "Время (UTC): 00:04") {
 		t.Fatalf("unexpected message: %q", received[0].Text)
 	}
 	if received[0].DisableNotification {
@@ -63,8 +67,10 @@ func TestNotifyReportsTelegramFailure(t *testing.T) {
 		w.WriteHeader(http.StatusBadGateway)
 	}))
 	defer server.Close()
-	client := Client{Token: "secret", ChatIDs: []string{"family"}, HTTPClient: server.Client(), BaseURL: server.URL}
-	if err := client.Notify(context.Background(), domain.Alert{Kind: domain.AlertSignalLoss, OpenedAt: time.Now()}); err == nil {
+	client := Client{Token: "secret", HTTPClient: server.Client(), BaseURL: server.URL}
+	if err := client.NotifyRecipient(
+		context.Background(), domain.Alert{Kind: domain.AlertSignalLoss, OpenedAt: time.Now()}, "Мама", "family",
+	); err == nil {
 		t.Fatal("expected non-2xx response to be reported")
 	}
 }
@@ -76,7 +82,7 @@ func TestNotifyRejectsSuccessfulHTTPWithFailedTelegramEnvelope(t *testing.T) {
 	}))
 	defer server.Close()
 	client := Client{Token: "secret", HTTPClient: server.Client(), BaseURL: server.URL}
-	if err := client.NotifyRecipient(context.Background(), domain.Alert{Kind: domain.AlertLow, OpenedAt: time.Now()}, "family"); err == nil {
+	if err := client.NotifyRecipient(context.Background(), domain.Alert{Kind: domain.AlertLow, OpenedAt: time.Now()}, "Мама", "family"); err == nil {
 		t.Fatal("ok=false response was accepted")
 	}
 }
@@ -88,7 +94,7 @@ func TestNotifyRequiresValidTelegramMessageResult(t *testing.T) {
 	}))
 	defer server.Close()
 	client := Client{Token: "secret", HTTPClient: server.Client(), BaseURL: server.URL}
-	if err := client.NotifyRecipient(context.Background(), domain.Alert{Kind: domain.AlertLow, OpenedAt: time.Now()}, "family"); err == nil {
+	if err := client.NotifyRecipient(context.Background(), domain.Alert{Kind: domain.AlertLow, OpenedAt: time.Now()}, "Мама", "family"); err == nil {
 		t.Fatal("Telegram response without message_id was accepted")
 	}
 }
@@ -100,7 +106,7 @@ func TestNotifyBoundsTelegramResponse(t *testing.T) {
 	}))
 	defer server.Close()
 	client := Client{Token: "secret", HTTPClient: server.Client(), BaseURL: server.URL}
-	if err := client.NotifyRecipient(context.Background(), domain.Alert{Kind: domain.AlertLow, OpenedAt: time.Now()}, "family"); err == nil {
+	if err := client.NotifyRecipient(context.Background(), domain.Alert{Kind: domain.AlertLow, OpenedAt: time.Now()}, "Мама", "family"); err == nil {
 		t.Fatal("oversized Telegram response was accepted")
 	}
 }
@@ -113,12 +119,28 @@ func TestNotifyNetworkErrorNeverContainsBotToken(t *testing.T) {
 			return nil, errors.New("dial failed")
 		})},
 	}
-	err := client.NotifyRecipient(context.Background(), domain.Alert{Kind: domain.AlertLow, OpenedAt: time.Now()}, "family")
+	err := client.NotifyRecipient(context.Background(), domain.Alert{Kind: domain.AlertLow, OpenedAt: time.Now()}, "Мама", "family")
 	if err == nil {
 		t.Fatal("network error was ignored")
 	}
 	if strings.Contains(err.Error(), token) {
 		t.Fatalf("bot token leaked through error: %q", err)
+	}
+}
+
+func TestMessagePatientDisplayNameCannotInjectLinesAndRemainsBounded(t *testing.T) {
+	name := "Ма\x00ма\n\u202e " + strings.Repeat("Я", domain.MaxPatientDisplayNameRunes+20)
+	text := message(domain.Alert{Kind: domain.AlertLow, OpenedAt: time.Now()}, name)
+	lines := strings.Split(text, "\n")
+	if len(lines) < 2 || !strings.HasPrefix(lines[1], "Пациент: ") {
+		t.Fatalf("patient display name line is missing: %q", text)
+	}
+	displayName := strings.TrimPrefix(lines[1], "Пациент: ")
+	if strings.ContainsAny(displayName, "\r\n\t\x00") {
+		t.Fatalf("patient display name injected control characters: %q", displayName)
+	}
+	if len([]rune(displayName)) > domain.MaxPatientDisplayNameRunes {
+		t.Fatalf("patient display name contains %d runes", len([]rune(displayName)))
 	}
 }
 

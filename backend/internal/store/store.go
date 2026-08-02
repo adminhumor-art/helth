@@ -22,27 +22,41 @@ type MeasurementAlertPlanner func(alertpolicy.State, domain.Measurement) []alert
 type StalenessAlertPlanner func(alertpolicy.State, string, time.Time) []alertpolicy.Change
 
 type Store interface {
-	PrimePatient(context.Context, string, time.Time) error
+	ResolveActiveDevice(context.Context, []byte, time.Time) (DeviceAccess, error)
+	ResolveActiveFamilySession(context.Context, []byte, time.Time) (FamilySessionAccess, error)
+	HouseholdCanAccessPatient(context.Context, string, string) (bool, error)
+	TelegramRecipients(context.Context, string) ([]string, error)
+	HasTelegramRecipients(context.Context) (bool, error)
+	ValidateProductionAccess(context.Context, time.Time) error
+	PatientIDs(context.Context) ([]string, error)
 	ProcessMeasurement(context.Context, domain.Measurement, []string, MeasurementAlertPlanner) (duplicate bool, err error)
+	ProcessDeviceMeasurement(context.Context, DeviceAccess, domain.Measurement, []string, MeasurementAlertPlanner) (duplicate bool, err error)
 	ProcessStaleness(context.Context, string, time.Time, []string, StalenessAlertPlanner) error
 	PatientSnapshot(context.Context, string) (domain.PatientSnapshot, error)
 	Latest(context.Context, string) (*domain.Measurement, error)
 	List(context.Context, string, time.Time, time.Time) ([]domain.Measurement, error)
 	OpenAlerts(context.Context, string) ([]domain.Alert, error)
 	AcknowledgeAlert(context.Context, string, string, time.Time) error
+	AcknowledgeAlertForHousehold(context.Context, string, string, time.Time) error
 	ClaimDueAlertDeliveries(context.Context, time.Time, int, string, time.Time) ([]domain.AlertDelivery, error)
 	MarkAlertDeliverySent(context.Context, string, string, time.Time) error
 	MarkAlertDeliveryFailed(context.Context, string, string, time.Time, time.Time, string) error
 }
 
 type Memory struct {
-	mu                sync.RWMutex
-	measurements      map[string]domain.Measurement
-	measurementBySeq  map[measurementSequenceKey]string
-	byPatient         map[string][]string
-	alerts            map[string]domain.Alert
-	deliveries        map[string]memoryDelivery
-	monitoringStarted map[string]time.Time
+	mu                          sync.RWMutex
+	measurements                map[string]domain.Measurement
+	measurementBySeq            map[measurementSequenceKey]string
+	byPatient                   map[string][]string
+	alerts                      map[string]domain.Alert
+	deliveries                  map[string]memoryDelivery
+	monitoringStarted           map[string]time.Time
+	devices                     map[string]memoryDeviceAccess
+	familySessions              map[string]memoryFamilySessionAccess
+	patientHouseholds           map[string]string
+	householdNames              map[string]string
+	patientNames                map[string]string
+	householdTelegramRecipients map[string][]string
 }
 
 type measurementSequenceKey struct {
@@ -64,23 +78,30 @@ type memoryDelivery struct {
 
 func NewMemory() *Memory {
 	return &Memory{
-		measurements:      make(map[string]domain.Measurement),
-		measurementBySeq:  make(map[measurementSequenceKey]string),
-		byPatient:         make(map[string][]string),
-		alerts:            make(map[string]domain.Alert),
-		deliveries:        make(map[string]memoryDelivery),
-		monitoringStarted: make(map[string]time.Time),
+		measurements:                make(map[string]domain.Measurement),
+		measurementBySeq:            make(map[measurementSequenceKey]string),
+		byPatient:                   make(map[string][]string),
+		alerts:                      make(map[string]domain.Alert),
+		deliveries:                  make(map[string]memoryDelivery),
+		monitoringStarted:           make(map[string]time.Time),
+		devices:                     make(map[string]memoryDeviceAccess),
+		familySessions:              make(map[string]memoryFamilySessionAccess),
+		patientHouseholds:           make(map[string]string),
+		householdNames:              make(map[string]string),
+		patientNames:                make(map[string]string),
+		householdTelegramRecipients: make(map[string][]string),
 	}
 }
 
-func (m *Memory) PrimePatient(_ context.Context, patientID string, at time.Time) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	existing := m.monitoringStarted[patientID]
-	if existing.IsZero() || at.Before(existing) {
-		m.monitoringStarted[patientID] = at.UTC()
+func (m *Memory) PatientIDs(_ context.Context) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	result := make([]string, 0, len(m.patientHouseholds))
+	for patientID := range m.patientHouseholds {
+		result = append(result, patientID)
 	}
-	return nil
+	sort.Strings(result)
+	return result, nil
 }
 
 func (m *Memory) ProcessMeasurement(
@@ -91,6 +112,45 @@ func (m *Memory) ProcessMeasurement(
 ) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.processMeasurementLocked(value, recipients, planner)
+}
+
+func (m *Memory) ProcessDeviceMeasurement(
+	_ context.Context,
+	expected DeviceAccess,
+	value domain.Measurement,
+	recipients []string,
+	planner MeasurementAlertPlanner,
+) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	device, ok := m.devices[expected.ID]
+	if !ok || device.RevokedAt != nil || device.PatientID != value.PatientID {
+		return false, ErrNotFound
+	}
+	if device.PatientID != expected.PatientID || !device.DeviceAccess.Matches(DeviceBinding{
+		DeviceID: expected.ID, BackendBindingID: expected.BackendBindingID,
+		CredentialID: expected.CredentialID, CredentialRevision: expected.CredentialRevision,
+	}) {
+		return false, ErrCredentialConflict
+	}
+	duplicate, err := m.processMeasurementLocked(value, recipients, planner)
+	if err != nil {
+		return false, err
+	}
+	acceptedAt := value.ReceivedAt.UTC()
+	if device.LastSeenAt == nil || acceptedAt.After(*device.LastSeenAt) {
+		device.LastSeenAt = timePointer(acceptedAt)
+	}
+	m.devices[expected.ID] = device
+	return duplicate, nil
+}
+
+func (m *Memory) processMeasurementLocked(
+	value domain.Measurement,
+	recipients []string,
+	planner MeasurementAlertPlanner,
+) (bool, error) {
 	if existing, ok := m.measurements[value.EventID]; ok {
 		if !sameMeasurementPayload(existing, value) {
 			return false, ErrEventConflict
@@ -105,13 +165,17 @@ func (m *Memory) ProcessMeasurement(
 	if _, exists := m.measurementBySeq[sequenceKey]; exists {
 		return false, ErrEventConflict
 	}
-	startedAt := m.monitoringStarted[value.PatientID]
-	if startedAt.IsZero() {
+	startedAt, monitoringActive := m.monitoringStarted[value.PatientID]
+	activatesMonitoring := !monitoringActive && value.Quality == domain.QualityValid
+	if activatesMonitoring {
 		startedAt = value.ReceivedAt.UTC()
 	}
 	state := m.alertStateLocked(value.PatientID)
 	state.MonitoringStartedAt = startedAt
-	changes := planner(state, value)
+	var changes []alertpolicy.Change
+	if monitoringActive || activatesMonitoring {
+		changes = planner(state, value)
+	}
 	if err := validateAlertChanges(value.PatientID, state.OpenAlerts, changes); err != nil {
 		return false, err
 	}
@@ -119,7 +183,7 @@ func (m *Memory) ProcessMeasurement(
 	m.measurements[value.EventID] = value
 	m.measurementBySeq[sequenceKey] = value.EventID
 	m.byPatient[value.PatientID] = append(m.byPatient[value.PatientID], value.EventID)
-	if m.monitoringStarted[value.PatientID].IsZero() {
+	if activatesMonitoring {
 		m.monitoringStarted[value.PatientID] = startedAt
 	}
 	m.applyAlertChangesLocked(changes, recipients)
@@ -135,18 +199,15 @@ func (m *Memory) ProcessStaleness(
 ) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	startedAt := m.monitoringStarted[patientID]
-	if startedAt.IsZero() {
-		startedAt = at.UTC()
+	startedAt, monitoringActive := m.monitoringStarted[patientID]
+	if !monitoringActive || startedAt.IsZero() {
+		return nil
 	}
 	state := m.alertStateLocked(patientID)
 	state.MonitoringStartedAt = startedAt
 	changes := planner(state, patientID, at)
 	if err := validateAlertChanges(patientID, state.OpenAlerts, changes); err != nil {
 		return err
-	}
-	if m.monitoringStarted[patientID].IsZero() {
-		m.monitoringStarted[patientID] = startedAt
 	}
 	m.applyAlertChangesLocked(changes, recipients)
 	return nil
@@ -346,6 +407,20 @@ func (m *Memory) AcknowledgeAlert(_ context.Context, patientID, alertID string, 
 	return nil
 }
 
+func (m *Memory) AcknowledgeAlertForHousehold(_ context.Context, householdID, alertID string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	alert, ok := m.alerts[alertID]
+	if !ok || m.patientHouseholds[alert.PatientID] != householdID {
+		return ErrNotFound
+	}
+	if alert.AcknowledgedAt == nil {
+		alert.AcknowledgedAt = &at
+		m.alerts[alertID] = alert
+	}
+	return nil
+}
+
 func (m *Memory) ClaimDueAlertDeliveries(
 	_ context.Context,
 	at time.Time,
@@ -382,10 +457,20 @@ func (m *Memory) ClaimDueAlertDeliveries(
 		m.deliveries[delivery.ID] = delivery
 		result = append(result, domain.AlertDelivery{
 			ID: delivery.ID, Alert: m.alerts[delivery.AlertID],
-			Recipient: delivery.Recipient, Attempts: delivery.Attempts,
+			PatientDisplayName: deliveryPatientDisplayName(m.patientNames[m.alerts[delivery.AlertID].PatientID]),
+			Recipient:          delivery.Recipient,
+			Attempts:           delivery.Attempts,
 		})
 	}
 	return result, nil
+}
+
+func deliveryPatientDisplayName(value string) string {
+	value = domain.NormalizePatientDisplayName(value)
+	if value == "" {
+		return "Пациент"
+	}
+	return value
 }
 
 func (m *Memory) MarkAlertDeliverySent(_ context.Context, id, leaseToken string, at time.Time) error {

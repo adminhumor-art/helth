@@ -28,15 +28,40 @@ CREATE TABLE IF NOT EXISTS family_members (
     UNIQUE (household_id, email)
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS family_members_household_telegram_uniq
+    ON family_members (household_id, telegram_chat_id)
+    WHERE telegram_chat_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS devices (
     id UUID PRIMARY KEY,
     patient_id UUID NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
-    token_hash BYTEA,
+    token_hash BYTEA NOT NULL UNIQUE CHECK (octet_length(token_hash) = 32),
+    backend_binding_id TEXT NOT NULL UNIQUE CHECK (backend_binding_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'),
+    credential_id TEXT NOT NULL CHECK (credential_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'),
+    credential_revision BIGINT NOT NULL CHECK (credential_revision BETWEEN 1 AND 9007199254740991),
     last_seen_at TIMESTAMPTZ,
     revoked_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS devices_credential_revision_uniq
+    ON devices (credential_id, credential_revision);
+
+CREATE INDEX IF NOT EXISTS devices_active_token_hash_idx
+    ON devices (token_hash) WHERE revoked_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS family_sessions (
+    id UUID PRIMARY KEY,
+    household_id UUID NOT NULL REFERENCES households(id) ON DELETE CASCADE,
+    token_hash BYTEA NOT NULL UNIQUE CHECK (octet_length(token_hash) = 32),
+    expires_at TIMESTAMPTZ,
+    revoked_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS family_sessions_active_token_hash_idx
+    ON family_sessions (token_hash) WHERE revoked_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS measurements (
     event_id TEXT PRIMARY KEY CHECK (

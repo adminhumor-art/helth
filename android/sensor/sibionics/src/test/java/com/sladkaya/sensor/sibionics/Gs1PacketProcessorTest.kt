@@ -2,6 +2,7 @@ package com.sladkaya.sensor.sibionics
 
 import com.sladkaya.core.model.ReadingQuality
 import com.sladkaya.core.model.SensorFamily
+import com.sladkaya.core.model.GlucoseReading
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -9,6 +10,44 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class Gs1PacketProcessorTest {
+    @Test
+    fun approvedHistoryAdvancesBatchButOnlyValidProductValueLeavesTheProcessor() = runBlocking {
+        val publication = Gs1ProductPublication(
+            reading = GlucoseReading(
+                eventId = "product-2",
+                sensorId = "sensor-a",
+                sensorFamily = SensorFamily.SIBIONICS_GS1,
+                sensorTimeEpochMs = 1_700_000_120_000L,
+                phoneTimeEpochMs = 1_700_000_121_000L,
+                glucoseMgDl = 108,
+                trendMgDlPerMinute = 0.0,
+                quality = ReadingQuality.VALID,
+                sequence = 2,
+            ),
+            approvalId = "ab".repeat(32),
+            publicationBindingId = "cd".repeat(32),
+        )
+        val core = ScriptedGs1SampleProcessor(
+            processResults = ArrayDeque(
+                listOf(
+                    Gs1ProcessingResult.ApprovedCheckpointOnly(
+                        sequence = 1,
+                        quality = ReadingQuality.DEGRADED,
+                    ),
+                    Gs1ProcessingResult.ProductPublicationReady(publication),
+                ),
+            ),
+        )
+        val processor = processor(core, listOf(sample(1), sample(2)))
+
+        val result = processor.ingest(byteArrayOf(1), RECEIVED_AT)
+            as Gs1PacketProcessingResult.Completed
+
+        assertEquals(listOf(1, 2), result.committedSamples.map { it.index })
+        assertTrue(result.diagnostics.isEmpty())
+        assertEquals(listOf(publication), result.publications)
+    }
+
     @Test
     fun verifiedEmptyEnvelopeIsTransportProgressWithoutCoreOrMedicalData() = runBlocking {
         val core = ScriptedGs1SampleProcessor()
@@ -111,6 +150,7 @@ class Gs1PacketProcessorTest {
         val result = processor.ingest(packet, RECEIVED_AT) as Gs1PacketProcessingResult.Completed
 
         assertEquals(listOf(1, 2), core.processedSamples.map { it.index })
+        assertEquals(listOf(TEST_INGRESS_ID, TEST_INGRESS_ID), core.sourceIngressIds)
         assertEquals(listOf(RECEIVED_AT, RECEIVED_AT), core.receivedAtValues)
         core.packets.forEach { assertArrayEquals(packet, it) }
         assertEquals(listOf(1, 2), result.committedSamples.map { it.index })
@@ -266,6 +306,37 @@ class Gs1PacketProcessorTest {
     }
 
     @Test
+    fun recoveryCanSkipOnlyAnExternallyVerifiedPrefixAndCommitTheOriginalIngressSuffix() =
+        runBlocking {
+            val core = ScriptedGs1SampleProcessor(
+                processResults = ArrayDeque(listOf(diagnostic(11))),
+            )
+            val processor = Gs1PacketProcessor(
+                core = core,
+                decoder = Gs1PacketVerifier { _, _ ->
+                    Gs1VerifiedPacketResult.Success(
+                        samples = listOf(sample(9), sample(10), sample(11)),
+                        nativeRecords = emptyList(),
+                        decrypted = true,
+                    )
+                },
+                initialExpectedIndex = 11,
+                wireProfile = Gs1WireProfile.V120,
+            )
+
+            val result = processor.ingest(
+                sourceIngressId = TEST_INGRESS_ID,
+                encryptedPacket = byteArrayOf(1),
+                receivedAtEpochMs = RECEIVED_AT,
+                verifiedCommittedPrefixSampleCount = 2,
+            ) as Gs1PacketProcessingResult.Completed
+
+            assertEquals(listOf(11), core.processedSamples.map { it.index })
+            assertEquals(listOf(11), result.committedSamples.map { it.index })
+            assertEquals(listOf(TEST_INGRESS_ID), core.sourceIngressIds)
+        }
+
+    @Test
     fun terminalFailureReturnsTheAlreadyCommittedDiagnosticPrefix() = runBlocking {
         val core = ScriptedGs1SampleProcessor(
             processResults = ArrayDeque(
@@ -305,6 +376,49 @@ class Gs1PacketProcessorTest {
         assertEquals(listOf("INVALID_GLUCOSE"), result.committedIssues.map { it.code })
     }
 
+    @Test
+    fun terminalCommittedProductErrorReturnsImmediatelyWithItsCommittedPrefix() = runBlocking {
+        val publication = Gs1ProductPublication(
+            reading = GlucoseReading(
+                eventId = "product-1",
+                sensorId = "sensor-a",
+                sensorFamily = SensorFamily.SIBIONICS_GS1,
+                sensorTimeEpochMs = 1_700_000_060_000L,
+                phoneTimeEpochMs = 1_700_000_061_000L,
+                glucoseMgDl = 108,
+                trendMgDlPerMinute = 0.0,
+                quality = ReadingQuality.VALID,
+                sequence = 1,
+            ),
+            approvalId = "ab".repeat(32),
+            publicationBindingId = "cd".repeat(32),
+        )
+        val core = ScriptedGs1SampleProcessor(
+            processResults = ArrayDeque(
+                listOf(
+                    Gs1ProcessingResult.ProductPublicationReady(publication),
+                    Gs1ProcessingResult.Rejected(
+                        code = "INVALID_GLUCOSE",
+                        message = "approved checkpoint persisted",
+                        checkpointCommitted = true,
+                        terminalAfterCommit = true,
+                    ),
+                    diagnostic(3),
+                ),
+            ),
+        )
+        val processor = processor(core, listOf(sample(1), sample(2), sample(3)))
+
+        val result = processor.ingest(byteArrayOf(1), RECEIVED_AT)
+            as Gs1PacketProcessingResult.Rejected
+
+        assertEquals("INVALID_GLUCOSE", result.code)
+        assertEquals(listOf(1, 2), result.committedSamples.map { it.index })
+        assertEquals(listOf(publication), result.publications)
+        assertEquals(listOf(2), result.committedIssues.map { it.sequence })
+        assertEquals(listOf(1, 2), core.processedSamples.map { it.index })
+    }
+
     private fun processor(
         core: ScriptedGs1SampleProcessor,
         samples: List<DecodedGs1RawSample>,
@@ -341,6 +455,7 @@ class Gs1PacketProcessorTest {
 
     private companion object {
         const val RECEIVED_AT = 1_700_000_061_123L
+        const val TEST_INGRESS_ID = "test-attempt:0"
     }
 }
 
@@ -349,15 +464,18 @@ private class ScriptedGs1SampleProcessor(
     private val retryResults: ArrayDeque<Gs1ProcessingResult> = ArrayDeque(),
 ) : Gs1SampleProcessor {
     val packets = mutableListOf<ByteArray>()
+    val sourceIngressIds = mutableListOf<String>()
     val receivedAtValues = mutableListOf<Long>()
     val processedSamples = mutableListOf<DecodedGs1RawSample>()
     var retryCalls = 0
 
     override suspend fun process(
+        sourceIngressId: String,
         encryptedPacket: ByteArray,
         sample: DecodedGs1RawSample,
         receivedAtEpochMs: Long,
     ): Gs1ProcessingResult {
+        sourceIngressIds += sourceIngressId
         packets += encryptedPacket.copyOf()
         receivedAtValues += receivedAtEpochMs
         processedSamples += sample
@@ -369,3 +487,12 @@ private class ScriptedGs1SampleProcessor(
         return retryResults.removeFirst()
     }
 }
+
+private suspend fun Gs1PacketProcessor.ingest(
+    encryptedPacket: ByteArray,
+    receivedAtEpochMs: Long,
+): Gs1PacketProcessingResult = ingest(
+    sourceIngressId = "test-attempt:0",
+    encryptedPacket = encryptedPacket,
+    receivedAtEpochMs = receivedAtEpochMs,
+)

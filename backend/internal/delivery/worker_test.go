@@ -24,6 +24,7 @@ func TestWorkerRetriesThenMarksDeliverySent(t *testing.T) {
 		ID: "00000000-0000-4000-8000-000000000020", PatientID: "patient-1",
 		Kind: domain.AlertLow, OpenedAt: now,
 	}
+	activateMonitoring(t, values, alert.PatientID, now)
 	if err := values.ProcessStaleness(ctx, alert.PatientID, now, []string{"family-chat"}, func(alerts.State, string, time.Time) []alerts.Change {
 		return []alerts.Change{{Type: alerts.Opened, Alert: alert}}
 	}); err != nil {
@@ -37,6 +38,9 @@ func TestWorkerRetriesThenMarksDeliverySent(t *testing.T) {
 	worker.RunOnce(ctx, now)
 	if sender.calls != 1 {
 		t.Fatalf("expected first attempt, got %d", sender.calls)
+	}
+	if sender.patientDisplayName != "Пациент" {
+		t.Fatalf("worker did not pass the delivery patient name: %q", sender.patientDisplayName)
 	}
 	if due, _ := values.ClaimDueAlertDeliveries(ctx, now.Add(4*time.Second), 10, "early-inspection", now.Add(time.Minute)); len(due) != 0 {
 		t.Fatalf("failed delivery must wait for backoff: %#v", due)
@@ -59,6 +63,7 @@ func TestConcurrentWorkersDoNotSendSameDelivery(t *testing.T) {
 		ID: "00000000-0000-4000-8000-000000000021", PatientID: "patient-1",
 		Kind: domain.AlertLow, OpenedAt: now,
 	}
+	activateMonitoring(t, values, alert.PatientID, now)
 	if err := values.ProcessStaleness(ctx, alert.PatientID, now, []string{"family-chat"}, func(alerts.State, string, time.Time) []alerts.Change {
 		return []alerts.Change{{Type: alerts.Opened, Alert: alert}}
 	}); err != nil {
@@ -109,8 +114,9 @@ func TestStoredDeliveryErrorTruncationPreservesUTF8(t *testing.T) {
 }
 
 type flakySender struct {
-	calls    int
-	failures int
+	calls              int
+	failures           int
+	patientDisplayName string
 }
 
 type countingSender struct {
@@ -119,7 +125,19 @@ type countingSender struct {
 	release chan struct{}
 }
 
-func (s *countingSender) NotifyRecipient(context.Context, domain.Alert, string) error {
+func activateMonitoring(t *testing.T, values *store.Memory, patientID string, at time.Time) {
+	t.Helper()
+	_, err := values.ProcessMeasurement(context.Background(), domain.Measurement{
+		EventID: "activation-event", PatientID: patientID, SensorID: "activation-sensor",
+		SensorFamily: domain.SensorSibionicsGS1, SensorTime: at, PhoneTime: at, ReceivedAt: at,
+		GlucoseMgDL: 110, Quality: domain.QualityValid,
+	}, nil, func(alerts.State, domain.Measurement) []alerts.Change { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (s *countingSender) NotifyRecipient(context.Context, domain.Alert, string, string) error {
 	if s.calls.Add(1) == 1 {
 		close(s.started)
 	}
@@ -127,8 +145,9 @@ func (s *countingSender) NotifyRecipient(context.Context, domain.Alert, string) 
 	return nil
 }
 
-func (f *flakySender) NotifyRecipient(_ context.Context, _ domain.Alert, _ string) error {
+func (f *flakySender) NotifyRecipient(_ context.Context, _ domain.Alert, patientDisplayName, _ string) error {
 	f.calls++
+	f.patientDisplayName = patientDisplayName
 	if f.calls <= f.failures {
 		return errors.New("temporary failure")
 	}

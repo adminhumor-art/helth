@@ -13,7 +13,7 @@ import (
 )
 
 type Sender interface {
-	NotifyRecipient(context.Context, domain.Alert, string) error
+	NotifyRecipient(context.Context, domain.Alert, string, string) error
 }
 
 type Worker struct {
@@ -42,7 +42,7 @@ func (w *Worker) RunOnce(ctx context.Context, at time.Time) {
 		return
 	}
 	for _, value := range deliveries {
-		if err := w.sender.NotifyRecipient(ctx, value.Alert, value.Recipient); err != nil {
+		if err := w.sender.NotifyRecipient(ctx, value.Alert, value.PatientDisplayName, value.Recipient); err != nil {
 			completedAt := w.now().UTC()
 			next := completedAt.Add(retryDelay(value.Attempts + 1))
 			if markErr := w.store.MarkAlertDeliveryFailed(

@@ -77,11 +77,24 @@ class SensorServiceStartPolicyTest {
             ),
         )
         assertEquals(
-            SensorServiceStartMode.SetupRequired,
+            SensorServiceStartMode.ConfiguredSensor,
             policy.select(
                 action = null,
-                hasConfirmedConfiguration = false,
+                hasConfirmedConfiguration = true,
                 hasPendingDiagnosticConfiguration = true,
+                diagnosticResumeIdentityMatches = false,
+            ),
+        )
+    }
+
+    @Test
+    fun nullIntentResumesConfirmedProductWhenNoDiagnosticSessionOwnsRecovery() {
+        assertEquals(
+            SensorServiceStartMode.ConfiguredSensor,
+            policy.select(
+                action = null,
+                hasConfirmedConfiguration = true,
+                hasPendingDiagnosticConfiguration = false,
                 diagnosticResumeIdentityMatches = false,
             ),
         )
@@ -90,7 +103,7 @@ class SensorServiceStartPolicyTest {
     @Test
     fun missingOrUnknownActionCannotEnableDemo() {
         listOf(false, true).forEach { hasConfirmedConfiguration ->
-            listOf(null, "", "unexpected.action").forEach { action ->
+            listOf("", "unexpected.action").forEach { action ->
                 assertEquals(
                     SensorServiceStartMode.SetupRequired,
                     policy.select(
@@ -171,9 +184,9 @@ class SensorServiceStartPolicyTest {
     }
 
     @Test
-    fun productAndDemoRequireAlarmReadinessButDiagnosticDoesNotPublishOrBlockOnIt() {
+    fun productDataPathSurvivesUnavailableLocalAlarmWhileDemoStillRequiresIt() {
         assertEquals(
-            false,
+            true,
             AlarmMonitoringStartGate.canStart(
                 SensorServiceStartMode.ConfiguredSensor,
                 alarmReady = false,

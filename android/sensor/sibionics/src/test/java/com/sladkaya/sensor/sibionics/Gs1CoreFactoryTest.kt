@@ -1,11 +1,16 @@
 package com.sladkaya.sensor.sibionics
 
 import com.sladkaya.core.data.AtomicSensorCoreRecord
+import com.sladkaya.core.data.ActiveProductPublicationConfiguration
+import com.sladkaya.core.data.PhysicalSensorApprovalRecord
+import com.sladkaya.core.data.ProductPublicationBindingRecord
+import com.sladkaya.core.data.ProductPublicationConfigurationReader
 import com.sladkaya.core.data.SensorAlgorithmCheckpointRecord
 import com.sladkaya.core.data.SensorCoreCommitResult
 import com.sladkaya.core.data.SensorCoreStore
 import com.sladkaya.core.data.SensorFailureCommitResult
 import com.sladkaya.core.data.SensorIngestionFailureRecord
+import com.sladkaya.core.data.SensorPacketIngressRecord
 import com.sladkaya.core.model.SensorFamily
 import com.sladkaya.core.sensor.SensorConfiguration
 import com.sladkaya.sensor.sibionics.algorithm.AlgorithmInitializationMode
@@ -30,6 +35,267 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class Gs1CoreFactoryTest {
+    @Test
+    fun productPermitRequiresAnExactActiveApprovalAndBindingSnapshot() = runBlocking {
+        val profile = activationProfile(0)
+        val absent = Gs1ProductPermitIssuer(ProductConfigurationReader(null)).issue(profile)
+
+        assertEquals(
+            Gs1ProductPermitError.ACTIVE_CONFIGURATION_REQUIRED,
+            (absent as Gs1ProductPermitIssueResult.Denied).error,
+        )
+
+        val native = FactoryNative()
+        val anchor = checkpoint(
+            native,
+            DecodedSensitivity(
+                SensitivityToken.packageCode("ABCDEFGH"),
+                1.42f,
+                SensitivityEncoding.NORMAL,
+            ),
+        )
+        val configuration = configuration()
+        val protocol = binding(configuration, Gs1WireProfile.V120)
+        val approved = activeProductConfiguration(
+            approval = physicalApproval(anchor, protocol).copyForSensor("other-sensor"),
+        )
+
+        val mismatch = Gs1ProductPermitIssuer(ProductConfigurationReader(approved)).issue(profile)
+
+        assertEquals(
+            Gs1ProductPermitError.PROFILE_APPROVAL_MISMATCH,
+            (mismatch as Gs1ProductPermitIssueResult.Denied).error,
+        )
+    }
+
+    @Test
+    fun exactApprovedAnchorOpensProductCoreWithVerifiedNativeIdentity() = runBlocking {
+        val native = FactoryNative()
+        val sensitivity = DecodedSensitivity(
+            SensitivityToken.packageCode("ABCDEFGH"),
+            1.42f,
+            SensitivityEncoding.NORMAL,
+        )
+        val anchor = checkpoint(native, sensitivity)
+        val configuration = configuration()
+        val protocol = binding(configuration, Gs1WireProfile.V120)
+        val active = activeProductConfiguration(physicalApproval(anchor, protocol))
+        val permit = grantedPermit(active, activationProfile(0))
+        val factory = productFactory(
+            store = FactoryStore(anchor, initialProtocolBinding = protocol),
+            native = native,
+            sensitivity = sensitivity,
+        )
+
+        val opened = factory.openApproved(activationProfile(0), permit)
+
+        assertTrue(opened is Gs1CoreOpenResult.Success)
+        assertEquals(41, (opened as Gs1CoreOpenResult.Success).nextSensorIndex)
+        assertEquals(listOf("create", "init:STANDARD:ABCDEFGH", "restore:2480"), native.calls)
+    }
+
+    @Test
+    fun approvedChineseGs1SbUsesTheSameProductFactoryForBothVerifiedWireProfiles() = runBlocking {
+        for (wireProfile in listOf(Gs1WireProfile.V115, Gs1WireProfile.V120)) {
+            val sensorId = "gs1sb-cn-${wireProfile.name.lowercase()}"
+            val configuration = configuration(
+                sensorId = sensorId,
+                family = SensorFamily.SIBIONICS_GS1SB,
+                transportVariant = 2,
+                wireProfile = wireProfile,
+            )
+            val activation = activationProfile(
+                transportVariant = 2,
+                sensorId = sensorId,
+                family = SensorFamily.SIBIONICS_GS1SB,
+            )
+            val spec = Gs1WireProfiles.requireResolved(wireProfile)
+            val native = FactoryNative(spec.algorithmProfile)
+            val sensitivity = DecodedSensitivity(
+                SensitivityToken.packageCode("ABCDEFGH"),
+                1.42f,
+                SensitivityEncoding.NORMAL,
+            )
+            val anchor = checkpoint(configuration, native, sensitivity)
+            val protocol = binding(configuration, wireProfile)
+            val active = activeProductConfiguration(physicalApproval(anchor, protocol))
+            val permit = grantedPermit(active, activation)
+            val factory = productFactory(
+                store = FactoryStore(anchor, initialProtocolBinding = protocol),
+                native = native,
+                sensitivity = sensitivity,
+            )
+
+            val opened = factory.openApproved(activation, permit)
+
+            assertTrue("$wireProfile: $opened", opened is Gs1CoreOpenResult.Success)
+            assertEquals(41, (opened as Gs1CoreOpenResult.Success).nextSensorIndex)
+            opened.coordinator.close()
+        }
+    }
+
+    @Test
+    fun alteredUnlinedAnchorCannotOpenProductCore() = runBlocking {
+        val native = FactoryNative()
+        val sensitivity = DecodedSensitivity(
+            SensitivityToken.packageCode("ABCDEFGH"),
+            1.42f,
+            SensitivityEncoding.NORMAL,
+        )
+        val anchor = checkpoint(native, sensitivity)
+        val alteredState = ByteArray(2_480) { (it * 11).toByte() }
+        val altered = anchor.copy(
+            state = alteredState,
+            stateSha256 = alteredState.sha256(),
+        )
+        val protocol = binding(configuration(), Gs1WireProfile.V120)
+        val active = activeProductConfiguration(physicalApproval(anchor, protocol))
+        val permit = grantedPermit(active, activationProfile(0))
+        val factory = productFactory(
+            store = FactoryStore(altered, initialProtocolBinding = protocol),
+            native = native,
+            sensitivity = sensitivity,
+        )
+
+        val result = factory.openApproved(activationProfile(0), permit)
+
+        assertEquals(
+            Gs1CoreOpenError.CHECKPOINT_APPROVAL_ANCHOR_MISMATCH,
+            (result as Gs1CoreOpenResult.Failure).error,
+        )
+        assertTrue(native.calls.isEmpty())
+    }
+
+    @Test
+    fun alteredSensorStartApprovalAnchorCannotOpenProductCore() = runBlocking {
+        val native = FactoryNative()
+        val sensitivity = DecodedSensitivity(
+            SensitivityToken.packageCode("ABCDEFGH"),
+            1.42f,
+            SensitivityEncoding.NORMAL,
+        )
+        val anchor = checkpoint(native, sensitivity)
+        val protocol = binding(configuration(), Gs1WireProfile.V120)
+        val alteredApproval = physicalApproval(anchor, protocol).copy(
+            sensorStartTimeEpochMs = anchor.sensorStartTimeEpochMs - 60_000L,
+        )
+        val active = activeProductConfiguration(alteredApproval)
+        val permit = grantedPermit(active, activationProfile(0))
+        val factory = productFactory(
+            store = FactoryStore(anchor, initialProtocolBinding = protocol),
+            native = native,
+            sensitivity = sensitivity,
+        )
+
+        val result = factory.openApproved(activationProfile(0), permit)
+
+        assertEquals(
+            Gs1CoreOpenError.CHECKPOINT_APPROVAL_ANCHOR_MISMATCH,
+            (result as Gs1CoreOpenResult.Failure).error,
+        )
+        assertTrue(native.calls.isEmpty())
+    }
+
+    @Test
+    fun approvedSequentialLineageAllowsMutableDisplayOffsetOnReopen() = runBlocking {
+        val native = FactoryNative()
+        val sensitivity = DecodedSensitivity(
+            SensitivityToken.packageCode("ABCDEFGH"),
+            1.42f,
+            SensitivityEncoding.NORMAL,
+        )
+        val anchor = checkpoint(native, sensitivity)
+        val protocol = binding(configuration(), Gs1WireProfile.V120)
+        val active = activeProductConfiguration(physicalApproval(anchor, protocol))
+        val progressedState = ByteArray(2_480) { (it * 17).toByte() }
+        val progressed = anchor.copy(
+            sequence = anchor.sequence + 1,
+            sensorTimeEpochMs = anchor.sensorTimeEpochMs + 60_000L,
+            state = progressedState,
+            stateSha256 = progressedState.sha256(),
+            displayOffsetMmolL = anchor.displayOffsetMmolL + 0.25,
+            publicationApprovalId = active.approval.approvalId,
+        )
+        val permit = grantedPermit(active, activationProfile(0))
+        val factory = productFactory(
+            store = FactoryStore(progressed, initialProtocolBinding = protocol),
+            native = native,
+            sensitivity = sensitivity,
+        )
+
+        val opened = factory.openApproved(activationProfile(0), permit)
+
+        assertTrue(opened is Gs1CoreOpenResult.Success)
+        assertEquals(42, (opened as Gs1CoreOpenResult.Success).nextSensorIndex)
+    }
+
+    @Test
+    fun foreignApprovalLineageAndChangedNativeHashesFailClosed() = runBlocking {
+        val native = FactoryNative()
+        val sensitivity = DecodedSensitivity(
+            SensitivityToken.packageCode("ABCDEFGH"),
+            1.42f,
+            SensitivityEncoding.NORMAL,
+        )
+        val anchor = checkpoint(native, sensitivity)
+        val protocol = binding(configuration(), Gs1WireProfile.V120)
+        val active = activeProductConfiguration(physicalApproval(anchor, protocol))
+        val permit = grantedPermit(active, activationProfile(0))
+        val foreign = anchor.copy(publicationApprovalId = "ef".repeat(32))
+
+        val foreignResult = productFactory(
+            store = FactoryStore(foreign, initialProtocolBinding = protocol),
+            native = native,
+            sensitivity = sensitivity,
+        ).openApproved(activationProfile(0), permit)
+
+        assertEquals(
+            Gs1CoreOpenError.CHECKPOINT_APPROVAL_LINEAGE_MISMATCH,
+            (foreignResult as Gs1CoreOpenResult.Failure).error,
+        )
+
+        val hashResult = Gs1CoreFactory(
+            store = FactoryStore(anchor, initialProtocolBinding = protocol),
+            decodeSensitivity = { SensitivityDecodeResult.Success(sensitivity) },
+            nativeProvider = { native },
+            nativeArtifactIdentityProvider = {
+                Gs1NativeArtifactIdentity("56".repeat(32), DATAHANDLE_HASH)
+            },
+        ).openApproved(activationProfile(0), permit)
+
+        assertEquals(
+            Gs1CoreOpenError.PRODUCT_NATIVE_BINARY_SET_MISMATCH,
+            (hashResult as Gs1CoreOpenResult.Failure).error,
+        )
+    }
+
+    @Test
+    fun diagnosticOpenCannotDowngradeAnApprovedCheckpointLineage() = runBlocking {
+        val native = FactoryNative()
+        val sensitivity = DecodedSensitivity(
+            SensitivityToken.packageCode("ABCDEFGH"),
+            1.42f,
+            SensitivityEncoding.NORMAL,
+        )
+        val protocol = binding(configuration(), Gs1WireProfile.V120)
+        val approvedCheckpoint = checkpoint(native, sensitivity).copy(
+            publicationApprovalId = "ab".repeat(32),
+        )
+        val factory = Gs1CoreFactory(
+            store = FactoryStore(approvedCheckpoint, initialProtocolBinding = protocol),
+            decodeSensitivity = { SensitivityDecodeResult.Success(sensitivity) },
+            nativeProvider = { native },
+        )
+
+        val result = factory.open(configuration(), protocol)
+
+        assertEquals(
+            Gs1CoreOpenError.DIAGNOSTIC_OPEN_FOR_APPROVED_LINEAGE,
+            (result as Gs1CoreOpenResult.Failure).error,
+        )
+        assertTrue(native.calls.isEmpty())
+    }
+
     @Test
     fun validPackageCodeIsDecodedAndPassedUnchangedToNormalInit() = runBlocking {
         val native = FactoryNative()
@@ -253,7 +519,11 @@ class Gs1CoreFactoryTest {
         val native = FactoryNative()
         val token = SensitivityToken.packageCode("ABCDEFGH")
         val sensitivity = DecodedSensitivity(token, 1.42f, SensitivityEncoding.NORMAL)
-        val saved = checkpoint(native, sensitivity).copy(sequence = 0xffff)
+        val anchor = checkpoint(native, sensitivity)
+        val saved = anchor.copy(
+            sequence = 0xffff,
+            sensorTimeEpochMs = anchor.sensorStartTimeEpochMs + 0xffffL * 60_000L,
+        )
         val factory = Gs1CoreFactory(
             store = FactoryStore(savedCheckpoint = saved),
             decodeSensitivity = { SensitivityDecodeResult.Success(sensitivity) },
@@ -546,7 +816,7 @@ class Gs1CoreFactoryTest {
             as Gs1RuntimeCoreOpenResult.Success).lease
 
         val result = lease.ingest(
-            DurablyJournaledGs1Packet(
+            factoryJournaledPacket(
                 ingressId = "challenge",
                 receivedAtEpochMs = 1_700_000_000_000L,
                 encryptedPacket = byteArrayOf(
@@ -583,7 +853,7 @@ class Gs1CoreFactoryTest {
             as Gs1RuntimeCoreOpenResult.Success).lease
 
         val result = lease.ingest(
-            DurablyJournaledGs1Packet(
+            factoryJournaledPacket(
                 ingressId = "faction-challenge",
                 receivedAtEpochMs = 1_700_000_000_000L,
                 encryptedPacket = byteArrayOf(
@@ -623,7 +893,7 @@ class Gs1CoreFactoryTest {
             as Gs1RuntimeCoreOpenResult.Success).lease
 
         val result = lease.ingest(
-            DurablyJournaledGs1Packet(
+            factoryJournaledPacket(
                 ingressId = "v115-data",
                 receivedAtEpochMs = 1_700_000_000_999L,
                 encryptedPacket = v115Response(index = 1),
@@ -673,17 +943,17 @@ class Gs1CoreFactoryTest {
         assertTrue(session.initial(profile.bluetoothAddress) is SessionAction.Write)
 
         try {
-            val outcome = runtime.submitAndAwait(
-                started.generation,
-                DurablyJournaledGs1Packet(
-                    ingressId = "empty-v115-first-bind",
-                    receivedAtEpochMs = 1_700_000_000_000L,
-                    encryptedPacket = v115EmptyResponse(),
+            assertEquals(
+                Gs1RuntimeSubmission.ACCEPTED,
+                runtime.submit(
+                    started.generation,
+                    factoryJournaledPacket(
+                        ingressId = "empty-v115-first-bind",
+                        receivedAtEpochMs = 1_700_000_000_000L,
+                        encryptedPacket = v115EmptyResponse(),
+                    ),
                 ),
-            ) as Gs1RuntimeAwaitResult.Processed
-            val completed = outcome.result as Gs1PacketProcessingResult.Completed
-            assertEquals(Gs1WireProfile.V115, completed.resolvedWireProfile)
-            assertTrue(completed.validatedTransportEnvelope)
+            )
             assertEquals(SessionAction.None, session.confirmWireProfile(Gs1WireProfile.V115))
 
             val event = withTimeout(1_000L) { committedEvent.await() }
@@ -769,19 +1039,25 @@ class Gs1CoreFactoryTest {
         transportVariant: Int = 0,
         bluetoothAddress: String = "AA:BB:CC:DD:EE:FF",
         wireProfile: Gs1WireProfile = Gs1WireProfile.V120,
+        sensorId: String = "sensor-a",
+        family: SensorFamily = SensorFamily.SIBIONICS_GS1,
     ) = Gs1CoreConfiguration(
-        sensorId = "sensor-a",
-        family = SensorFamily.SIBIONICS_GS1,
+        sensorId = sensorId,
+        family = family,
         bluetoothAddress = bluetoothAddress,
         transportVariant = transportVariant,
         packageCode = packageCode,
         wireProfile = wireProfile,
     )
 
-    private fun activationProfile(transportVariant: Int): Gs1DiagnosticActivationProfile =
+    private fun activationProfile(
+        transportVariant: Int,
+        sensorId: String = "sensor-a",
+        family: SensorFamily = SensorFamily.SIBIONICS_GS1,
+    ): Gs1DiagnosticActivationProfile =
         (Gs1DiagnosticActivationProfile.validate(
-            sensorId = "sensor-a",
-            family = SensorFamily.SIBIONICS_GS1,
+            sensorId = sensorId,
+            family = family,
             bluetoothAddress = "AA:BB:CC:DD:EE:FF",
             transportVariant = transportVariant,
             packageCode = "ABCDEFGH",
@@ -833,18 +1109,26 @@ class Gs1CoreFactoryTest {
     private fun checkpoint(
         native: FactoryNative,
         sensitivity: DecodedSensitivity,
+    ): SensorAlgorithmCheckpointRecord = checkpoint(configuration(), native, sensitivity)
+
+    private fun checkpoint(
+        configuration: Gs1CoreConfiguration,
+        native: FactoryNative,
+        sensitivity: DecodedSensitivity,
     ): SensorAlgorithmCheckpointRecord {
         val state = native.state.copyOf()
+        val spec = Gs1WireProfiles.requireResolved(configuration.wireProfile)
         return SensorAlgorithmCheckpointRecord(
-            sensorId = "sensor-a",
-            bluetoothAddress = "AA:BB:CC:DD:EE:FF",
-            sensorFamily = SensorFamily.SIBIONICS_GS1,
-            transportVariant = 0,
-            transportProtocol = "GS1_V120",
-            transportCodecId = SibionicsDataHandle.BINARY_SET_ID,
+            sensorId = configuration.sensorId,
+            bluetoothAddress = configuration.bluetoothAddress,
+            sensorFamily = configuration.family,
+            transportVariant = configuration.transportVariant,
+            transportProtocol = spec.transportProtocol,
+            transportCodecId = spec.transportCodecId,
             sequence = 40,
             sensorTimeEpochMs = 1_700_000_000_000L,
-            algorithmProfile = AlgorithmProfile.V116A.name,
+            sensorStartTimeEpochMs = 1_699_997_600_000L,
+            algorithmProfile = spec.algorithmProfile.name,
             algorithmVersion = native.algorithmVersion,
             binarySetId = native.binarySetId,
             sensitivityToken = sensitivity.token.value,
@@ -859,9 +1143,122 @@ class Gs1CoreFactoryTest {
         )
     }
 
+    private fun productFactory(
+        store: FactoryStore,
+        native: FactoryNative,
+        sensitivity: DecodedSensitivity,
+    ) = Gs1CoreFactory(
+        store = store,
+        decodeSensitivity = { SensitivityDecodeResult.Success(sensitivity) },
+        nativeProvider = { native },
+        nativeArtifactIdentityProvider = {
+            Gs1NativeArtifactIdentity(ALGORITHM_HASH, DATAHANDLE_HASH)
+        },
+    )
+
+    private fun physicalApproval(
+        anchor: SensorAlgorithmCheckpointRecord,
+        protocol: com.sladkaya.core.data.SensorProtocolBindingRecord,
+    ) = PhysicalSensorApprovalRecord(
+        sensorId = anchor.sensorId,
+        bluetoothAddress = anchor.bluetoothAddress,
+        sensorFamily = anchor.sensorFamily,
+        transportVariant = anchor.transportVariant,
+        sensitivityToken = anchor.sensitivityToken,
+        wireProfile = protocol.wireProfile,
+        transportProtocol = anchor.transportProtocol,
+        transportCodecId = anchor.transportCodecId,
+        algorithmProfile = anchor.algorithmProfile,
+        algorithmVersion = anchor.algorithmVersion,
+        binarySetId = anchor.binarySetId,
+        sensitivityTokenSource = anchor.sensitivityTokenSource,
+        sensitivityCoefficient = anchor.sensitivityCoefficient,
+        sensitivityEncoding = anchor.sensitivityEncoding,
+        initializationMode = anchor.initializationMode,
+        displayOffsetMmolL = anchor.displayOffsetMmolL,
+        protocolEvidenceKind = protocol.evidenceKind,
+        protocolEvidenceSha256 = protocol.evidenceSha256,
+        physicalValidationEvidenceSha256 = "ef".repeat(32),
+        checkpointSchemaVersion = anchor.schemaVersion,
+        approvedSequence = anchor.sequence,
+        approvedSensorTimeEpochMs = anchor.sensorTimeEpochMs,
+        sensorStartTimeEpochMs = anchor.sensorStartTimeEpochMs,
+        approvedCheckpointStateSha256 = anchor.stateSha256,
+        nativeBinarySetSha256 = ALGORITHM_HASH,
+        nativeDatahandleBinarySetSha256 = DATAHANDLE_HASH,
+        approvedAtEpochMs = 1_800_000_000_000L,
+    )
+
+    private fun PhysicalSensorApprovalRecord.copyForSensor(
+        sensorId: String,
+    ) = PhysicalSensorApprovalRecord(
+        sensorId = sensorId,
+        bluetoothAddress = bluetoothAddress,
+        sensorFamily = sensorFamily,
+        transportVariant = transportVariant,
+        sensitivityToken = sensitivityToken,
+        wireProfile = wireProfile,
+        transportProtocol = transportProtocol,
+        transportCodecId = transportCodecId,
+        algorithmProfile = algorithmProfile,
+        algorithmVersion = algorithmVersion,
+        binarySetId = binarySetId,
+        sensitivityTokenSource = sensitivityTokenSource,
+        sensitivityCoefficient = sensitivityCoefficient,
+        sensitivityEncoding = sensitivityEncoding,
+        initializationMode = initializationMode,
+        displayOffsetMmolL = displayOffsetMmolL,
+        protocolEvidenceKind = protocolEvidenceKind,
+        protocolEvidenceSha256 = protocolEvidenceSha256,
+        physicalValidationEvidenceSha256 = physicalValidationEvidenceSha256,
+        checkpointSchemaVersion = checkpointSchemaVersion,
+        approvedSequence = approvedSequence,
+        approvedSensorTimeEpochMs = approvedSensorTimeEpochMs,
+        sensorStartTimeEpochMs = sensorStartTimeEpochMs,
+        approvedCheckpointStateSha256 = approvedCheckpointStateSha256,
+        nativeBinarySetSha256 = nativeBinarySetSha256,
+        nativeDatahandleBinarySetSha256 = nativeDatahandleBinarySetSha256,
+        approvedAtEpochMs = approvedAtEpochMs,
+    )
+
+    private fun activeProductConfiguration(
+        approval: PhysicalSensorApprovalRecord,
+    ) = ActiveProductPublicationConfiguration(
+        approval = approval,
+        binding = ProductPublicationBindingRecord(
+            approvalId = approval.approvalId,
+            httpsOrigin = "https://family.example",
+            backendBindingId = "binding-1",
+            credentialId = "credential-1",
+            credentialRevision = 1,
+            expectedPatientId = "11111111-1111-4111-8111-111111111111",
+            expectedDeviceId = "22222222-2222-4222-8222-222222222222",
+            createdAtEpochMs = 1_800_000_100_000L,
+        ),
+    )
+
+    private suspend fun grantedPermit(
+        active: ActiveProductPublicationConfiguration,
+        profile: Gs1DiagnosticActivationProfile,
+    ): Gs1ProductPermit = (
+        Gs1ProductPermitIssuer(ProductConfigurationReader(active)).issue(profile)
+            as Gs1ProductPermitIssueResult.Granted
+        ).permit
+
     private fun ByteArray.sha256(): String = MessageDigest.getInstance("SHA-256")
         .digest(this)
         .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+
+    private companion object {
+        val ALGORITHM_HASH = "12".repeat(32)
+        val DATAHANDLE_HASH = "34".repeat(32)
+    }
+}
+
+private class ProductConfigurationReader(
+    private val value: ActiveProductPublicationConfiguration?,
+) : ProductPublicationConfigurationReader {
+    override suspend fun active(): ActiveProductPublicationConfiguration? = value
 }
 
 private class FactoryStore(
@@ -953,3 +1350,25 @@ private class FactoryNative(
 }
 
 private data object FactoryContext : NativeAlgorithmContext
+
+private fun factoryJournaledPacket(
+    ingressId: String,
+    receivedAtEpochMs: Long,
+    encryptedPacket: ByteArray,
+): DurablyJournaledGs1Packet {
+    val attemptId = "factory-test"
+    val record = SensorPacketIngressRecord(
+        ingressId = ingressId,
+        sensorId = "sensor-a",
+        sensorFamily = SensorFamily.SIBIONICS_GS1,
+        bluetoothAddress = "AA:BB:CC:DD:EE:FF",
+        attemptId = attemptId,
+        ordinal = 0,
+        receivedAtEpochMs = receivedAtEpochMs,
+        encryptedPacket = encryptedPacket,
+        packetSha256 = MessageDigest.getInstance("SHA-256")
+            .digest(encryptedPacket)
+            .joinToString("") { byte -> "%02x".format(byte) },
+    )
+    return DurablyJournaledGs1Packet(record)
+}

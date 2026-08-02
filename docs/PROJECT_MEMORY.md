@@ -67,6 +67,10 @@ Telegram. Сайт и Telegram дополняют, но не заменяют л
 - Демо запускается только отдельной кнопкой, явно помечено и не сохраняется как
   реальное показание. Обычный запуск без подтверждённого датчика показывает
   «требуется настройка».
+- Product UI state имеет отдельный generation gate: поздний callback старого
+  подключения, диагностической или demo-сессии не может заменить текущее
+  значение. `null`-перезапуск service выбирает подтверждённый product режим,
+  если нет явно восстанавливаемой диагностической сессии.
 - Политика виджета скрывает `demo`, `stale`, `clock-mismatch` и не-`VALID`
   значения; демо передаётся ему только временно и не записывается.
 - Повреждённая или неверно типизированная confirmed-настройка датчика читается
@@ -124,6 +128,27 @@ Telegram. Сайт и Telegram дополняют, но не заменяют л
   watchdog тишины, но не создаёт медицинское значение. Stop во время retry
   сохранения быстро отменяет текущий lease ровно один раз; исходный ingress
   остаётся durable для следующего поколения recovery.
+- Android Bluetooth реализован одним внутренним GATT engine. Сохранён прежний
+  diagnostic facade; отдельный product facade открывает то же ядро только через
+  approved opener и durable publication configuration, не отдаёт diagnostic
+  readings и выдаёт полные списки product publications без схлопывания batch.
+- Каждый raw sample имеет обязательный `sourceIngressId` и Room FK к точному
+  encrypted ingress. Атомарный commit до записи сверяет sensor/family/MAC,
+  receive-time, packet bytes и SHA-256. Product lineage при чтении повторно
+  проходит каноническую проверку approval, binding, measurement и outbox.
+- Live `Committed` поступает раньше `Finalized`; недоступный/закрытый GATT actor,
+  ошибка или cancellation не дают отметить ingress handled. Recovery-await не
+  публикует live events: caller сам проверяет, доставляет и только затем пишет
+  outcome.
+- `ALREADY_COVERED` и `PARTIAL_OVERLAP` больше не восстанавливают output из
+  входного packet. Read-only Room reader принимает только полный точный covered
+  prefix, связанный с текущим ingress, и запрещает output из suffix. Committed
+  prefixes терминальных `Rejected`/`Closed`/`StorageConflict` также повторно
+  доставляются и остаются pending после terminal result.
+- Между engine и единственным product-consumer стоит bounded `SUSPEND`-очередь.
+  Но enqueue в RAM больше не считается доставкой: consumer должен долговечно
+  применить local effects и вызвать `acknowledgeDurablyApplied()`. До этого
+  `Finalized` не обрабатывается; отказ имеет только typed bounded code.
 - Onboarding принимает ручной код или декодированный DataMatrix только вместе с
   отдельным явным выбором market-профиля. Код, SKU и GS1/GS1Sb не назначают
   региональный transport variant автоматически. Любой camera-result из восьми
@@ -165,6 +190,14 @@ Telegram. Сайт и Telegram дополняют, но не заменяют л
   и Emulator `37.1.11`. Системный ARM-образ не установлен: он требует отдельного
   принятия владельцем лицензии Google `android-sdk-arm-dbt-license`, поэтому
   runtime instrumentation не запускался без такого решения.
+- Быстрый Android upload-drain использует одну WorkManager-цепочку с
+  `APPEND_OR_REPLACE`: новый запрос, пришедший во время уже работающего drain,
+  добавляется следом и не отбрасывается. Периодический reconciler остаётся
+  единственным через `KEEP`.
+- После успешного сохранения credential coordinator сначала вызывает явный
+  `BlockedUploadRecoveryPort` с точной immutable metadata credential и только
+  затем запрашивает drain. Runtime-ошибка recovery не отменяет уже сохранённый
+  credential и не ломает локальную работу; cancellation не проглатывается.
 - Отдельными барьерами остаются смерть процесса и продолжение полного sensor
   replay после восстановления.
 
@@ -198,6 +231,34 @@ Telegram. Сайт и Telegram дополняют, но не заменяют л
 - Проверка потери сигнала и Telegram delivery работают в независимых scheduler
   goroutine и завершаются общим отменяемым context. Production не запускается
   без PostgreSQL.
+- Production безусловно требует непустой `TELEGRAM_BOT_TOKEN` уже при старте,
+  даже если получатели будут добавлены только после provisioning. Это не даёт
+  поздно добавленной семье попасть в бесконечный цикл неотправляемых тревог.
+- Production readiness требует для каждого пациента активное устройство,
+  активную family-session его семьи и хотя бы одного непустого Telegram-
+  получателя этой же семьи. Production provisioning отвергает пустые
+  `patientName` и `telegramChatIds`; глобального резервного адресата нет.
+- Alert delivery получает имя из `patients.display_name`. Имя приводится к
+  валидной однострочной форме без управляющих/format-символов и ограничивается
+  80 Unicode-символами; Telegram всегда показывает его отдельной строкой.
+- Запрос общего списка пациентов имеет deadline 5 секунд, один цикл Telegram
+  delivery — 90 секунд. Зависший DB-вызов не может навсегда остановить все
+  последующие scheduler-циклы.
+- HTTP приводит валидный `deviceId` UUID к строчной канонической записи до
+  точного сопоставления с активным устройством. Остальные части credential
+  tuple остаются регистрозависимыми и сравниваются точно.
+- Валидные UUID `patientId` и `alertId` в семейных URL также приводятся к
+  строчной канонической записи до обращения к Memory/PostgreSQL.
+- Семейные snapshot, history и acknowledge endpoints принимают session token
+  только из cookie `family_session`. Недокументированный Bearer fallback удалён;
+  `Authorization: Bearer` остаётся только у device ingest. Будущий server-side
+  issuer обязан выставлять `HttpOnly`, `Secure` и `SameSite=Strict`.
+- PostgreSQL-транзакции ingest блокируют сначала пациента, затем устройство — в
+  том же порядке, что provisioning. Интеграционный concurrency-тест удерживает
+  patient-lock и доказывает, что ожидающий ingest ещё не захватил device-lock.
+- Development compose передаёт полный credential binding и использует разные
+  длинные значения, явно помеченные как локальные и не являющиеся секретами;
+  отдельный тест прогоняет эти defaults через фактическую `validateConfig`.
 - `APP_ENV` задаётся явно: отсутствие или неизвестное значение останавливает
   запуск. Device token и family token обязаны различаться во всех режимах.
 - Семейный snapshot читается согласованно под одной блокировкой/транзакцией;
@@ -232,6 +293,12 @@ Telegram. Сайт и Telegram дополняют, но не заменяют л
 
 ### Автоматические проверки
 
+- Финальный локальный preflight этой итерации выполнил 680 Android Gradle-задач:
+  650 JVM-тестов без пропусков и ошибок, Room instrumentation APK, lint для app
+  и sensor-модулей, debug APK, Android-test APK и minified release/R8 — успешно.
+- Backend повторно прошёл unit, race, vet и govulncheck без найденных вызываемых
+  уязвимостей; чистая PostgreSQL 18 integration-среда и Compose-конфигурация
+  также проверены успешно.
 - Подготовлен least-privilege шаблон `ci/github-actions.yml` для backend, web и
   Android. Внешние actions закреплены полными commit SHA, PostgreSQL — digest
   образа; права workflow ограничены чтением репозитория.
@@ -267,18 +334,38 @@ Telegram. Сайт и Telegram дополняют, но не заменяют л
   protocol registration material, а не пользовательские, account- или deploy-
   credentials; выводить его в логи и ошибки запрещено.
 - Реальные показания ещё не подключены к экрану, тревогам, виджету и отправке.
-- После будущего физического допуска всё ещё нужен отдельный типизированный
-  product runtime. Текущий confirmed-config — только read-only marker;
-  `ConfiguredSensor` закрывается, product measurement/outbox не создаются,
-  `restoreProductHistory`, реальный widget и uploader не вызываются.
-- Токен устройства запрещено встраивать в APK. План: runtime-provisioning,
-  неэкспортируемый AES-GCM ключ Android Keystore, ciphertext с AAD и immutable
-  `backendBindingId/credentialRevision`; отсутствие ключа блокирует только
-  удалённую отправку, а не локальный контроль.
-- Надёжная отправка требует outbox в той же Room-транзакции, что measurement и
-  checkpoint, быстрого drain в foreground service и WorkManager 2.11.2 с
-  network constraint/retry/reconciliation. Смена credential не может отправить
-  старую очередь другому пациенту.
+- Текущий физический допуск смешивает два разных понятия: проверенный профиль
+  реализации и точную identity одного одноразового сенсора. Поэтому штатная
+  замена сенсора сейчас потребовала бы нового привилегированного допуска.
+  До configured-service модель нужно разделить на повторно используемый
+  `VerifiedSensorProfile`, точную `SensorActivation` и независимый remote route.
+- После будущего физического допуска product opener и общий GATT facade уже
+  существуют, но ещё не подключены к Android service. Текущий confirmed-config —
+  только read-only marker; `ConfiguredSensor` закрывается,
+  `restoreProductHistory`, реальный alarm/widget и post-commit uploader не
+  вызываются.
+- Токен устройства запрещено встраивать в APK. Runtime-provisioning и
+  Android-Keystore vault готовы программно; отсутствие ключа блокирует только
+  удалённую отправку, а не локальный контроль. Одноразовый контейнер входных
+  данных теперь внутренний и честно называется `RemoteProvisioningPayload`: он
+  не выдаёт произвольный ввод за проверенный. Authenticated/signed parser
+  provisioning-конверта ещё должен быть добавлен до пользовательского UI.
+- Для `BlockedUploadRecoveryPort` ещё нужен production adapter/query в
+  `core/data`: текущий `UploadOutboxStore` умеет восстановить только одну запись
+  по полному `UploadBlockedRecoveryKey`, но не перечисляет заблокированные записи
+  по точной credential metadata. No-op adapter намеренно не добавлен. До этого
+  нельзя утверждать, что сохранённая после перезапуска BLOCKED-очередь реально
+  возвращается в PENDING.
+- Measurement и remote outbox атомарны, но локальные alarm/widget/AppState
+  пока не имеют долговечного post-commit курсора/outbox. Смерть процесса между
+  Room commit и локальными эффектами не должна терять критическую тревогу; этот
+  recovery остаётся P0 product-service. Sensor facade уже требует explicit ack,
+  но production consumer, который сначала сохраняет такой cursor/outbox, ещё не
+  подключён; простое обновление RAM не имеет права подтверждать batch.
+- Новый duplicate ingress с тем же packet, но без собственных Room-linked raw
+  rows, сейчас блокируется fail-closed. Безопасная дедупликация должна доказать
+  более ранний exact ingress и его durable outcome; одного checkpoint
+  недостаточно. Нужен отдельный реальный BLE duplicate/reconnect test.
 - Программный повтор реализован, но не проверены громкость, DND, Doze, Samsung
   battery restrictions и реальное пробуждение человека ночью.
 - До первого разблокирования после перезагрузки локальное состояние недоступно:
@@ -287,7 +374,16 @@ Telegram. Сайт и Telegram дополняют, но не заменяют л
 - Точные и резервные системные alarm покрыты политиками и JVM-тестами, но
   фактическая задержка Samsung/Doze и поведение после отзыва разрешения должны
   быть измерены на первом телефоне.
-- Нет семейной авторизации, реального backend deploy и настоящего Telegram.
+- Backend уже имеет локально проверенную многосемейную авторизацию и
+  token→device→patient binding. Ещё нет реального deploy, браузерной BFF/session
+  и проверки доставки через настоящий Telegram bot/chat.
+- Актуальный backend preflight прошёл 132/132 теста на отдельной чистой
+  PostgreSQL 18, включая race detector; vet и govulncheck чисты. Локально
+  запущенный старый контейнер не считается актуальным backend и не должен
+  молча переиспользовать существующий volume до осознанного E2E rebuild.
+- Перед публичным deploy backend нужны rate limit и ограниченная пагинация либо
+  жёсткий предел строк для history; текущего ограничения окна в 90 дней
+  недостаточно как защиты доступности.
 - Web API ещё не подключается к сети: сначала нужен server-side BFF/session,
   который не отдаёт family token браузеру.
 
@@ -296,18 +392,26 @@ Telegram. Сайт и Telegram дополняют, но не заменяют л
 
 ## Следующий порядок работ
 
-1. Добавить typed approved configuration, которую обычный onboarding не может
-   создать, и проверять её против immutable binding/checkpoint/native metadata.
-2. Добавить отдельный product runtime поверх уже проверенных GATT/core, атомарно
-   создающий measurement и upload outbox только при действующем допуске.
-3. Восстанавливать историю, alarm/watchdog и widget только для того же approval;
-   затем подключить Keystore credential и durable WorkManager drain.
-4. Запустить существующие Room/JNI instrumentation-тесты на Android и отдельно
-   проверить process kill/reboot/Doze.
-5. Когда появятся Samsung и отдельный датчик — выполнить private capture/replay
-   и протокол физической проверки GS1/GS1Sb; GS3 остаётся отдельным трактом.
-6. Только после совпадения и решения владельца выдать физический допуск, затем
-   подключить backend, live-сайт и Telegram с настоящей авторизацией.
+Главная цель зафиксирована как один вертикальный цикл, который можно начать
+проверять сразу после появления телефона и датчика. Локальные улучшения ядра не
+должны откладывать подключение этого цикла.
+
+1. Сделать Room единственным источником активной конфигурации: модель, регион,
+   код, BLE identity, подтверждённый профиль и активация конкретного сенсора.
+2. Добавить атомарный локальный inbox/outbox для каждого подтверждённого
+   измерения и только после его записи подтверждать batch сенсорному runtime.
+3. Подключить product GATT facade к foreground service и провести одно
+   подтверждённое измерение через Room в крупную цифру, график, локальную
+   тревогу и виджет.
+4. Восстанавливать конфигурацию, историю, alarm/watchdog/widget после смерти
+   процесса; неверный код или датчик должны иметь явный безопасный сброс.
+5. Подключить post-commit upload к backend, затем сайт и тестовую доставку в
+   Telegram. Отсутствие сети не должно мешать локальной тревоге.
+6. Собрать устанавливаемый APK и прогнать весь цикл на симулированном входе,
+   включая перезапуск, пропадание данных и восстановление.
+7. Когда появятся Samsung и отдельный датчик — выполнить private capture/replay,
+   BLE/JNI, reboot/Doze и звуковой протокол. До совпадения реальные показания
+   остаются явно в режиме физической проверки, а не выдаются за подтверждённые.
 
 ## Решения, которые нельзя принимать молча
 

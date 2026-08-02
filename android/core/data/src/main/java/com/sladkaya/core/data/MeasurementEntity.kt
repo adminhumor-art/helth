@@ -17,8 +17,14 @@ data class MeasurementEntity(
     val trendMgDlPerMinute: Double,
     val quality: String,
     val sequence: Long,
-    val uploadedAtEpochMs: Long? = null,
-    val uploadAttempts: Int = 0,
+    val publicationApprovalId: String? = null,
+    val publicationBindingId: String? = null,
+    val httpsOrigin: String? = null,
+    val backendBindingId: String? = null,
+    val credentialId: String? = null,
+    val credentialRevision: Long? = null,
+    val expectedPatientId: String? = null,
+    val expectedDeviceId: String? = null,
 )
 
 internal fun GlucoseReading.toEntity() = MeasurementEntity(
@@ -31,6 +37,26 @@ internal fun GlucoseReading.toEntity() = MeasurementEntity(
     trendMgDlPerMinute = trendMgDlPerMinute,
     quality = quality.wireName,
     sequence = sequence,
+)
+
+internal fun GlucoseReading.toEntity(context: ProductPublicationContext) = MeasurementEntity(
+    eventId = eventId,
+    sensorId = sensorId,
+    sensorFamily = sensorFamily.wireName,
+    sensorTimeEpochMs = sensorTimeEpochMs,
+    phoneTimeEpochMs = phoneTimeEpochMs,
+    glucoseMgDl = glucoseMgDl,
+    trendMgDlPerMinute = trendMgDlPerMinute,
+    quality = quality.wireName,
+    sequence = sequence,
+    publicationApprovalId = context.approvalId,
+    publicationBindingId = context.publicationBindingId,
+    httpsOrigin = context.httpsOrigin,
+    backendBindingId = context.backendBindingId,
+    credentialId = context.credentialId,
+    credentialRevision = context.credentialRevision,
+    expectedPatientId = context.expectedPatientId,
+    expectedDeviceId = context.expectedDeviceId,
 )
 
 internal fun MeasurementEntity.toModel() = GlucoseReading(

@@ -2,11 +2,11 @@
   "formatVersion": 1,
   "database": {
     "version": 1,
-    "identityHash": "2f731a3cc8c34e37864beb20301b038a",
+    "identityHash": "b79f6509a3350adba6184cd3ede4c0fa",
     "entities": [
       {
         "tableName": "measurements",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`eventId` TEXT NOT NULL, `sensorId` TEXT NOT NULL, `sensorFamily` TEXT NOT NULL, `sensorTimeEpochMs` INTEGER NOT NULL, `phoneTimeEpochMs` INTEGER NOT NULL, `glucoseMgDl` INTEGER NOT NULL, `trendMgDlPerMinute` REAL NOT NULL, `quality` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `uploadedAtEpochMs` INTEGER, `uploadAttempts` INTEGER NOT NULL, PRIMARY KEY(`eventId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`eventId` TEXT NOT NULL, `sensorId` TEXT NOT NULL, `sensorFamily` TEXT NOT NULL, `sensorTimeEpochMs` INTEGER NOT NULL, `phoneTimeEpochMs` INTEGER NOT NULL, `glucoseMgDl` INTEGER NOT NULL, `trendMgDlPerMinute` REAL NOT NULL, `quality` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `publicationApprovalId` TEXT, `publicationBindingId` TEXT, `httpsOrigin` TEXT, `backendBindingId` TEXT, `credentialId` TEXT, `credentialRevision` INTEGER, `expectedPatientId` TEXT, `expectedDeviceId` TEXT, PRIMARY KEY(`eventId`))",
         "fields": [
           {
             "fieldPath": "eventId",
@@ -63,15 +63,44 @@
             "notNull": true
           },
           {
-            "fieldPath": "uploadedAtEpochMs",
-            "columnName": "uploadedAtEpochMs",
+            "fieldPath": "publicationApprovalId",
+            "columnName": "publicationApprovalId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "publicationBindingId",
+            "columnName": "publicationBindingId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "httpsOrigin",
+            "columnName": "httpsOrigin",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "backendBindingId",
+            "columnName": "backendBindingId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "credentialId",
+            "columnName": "credentialId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "credentialRevision",
+            "columnName": "credentialRevision",
             "affinity": "INTEGER"
           },
           {
-            "fieldPath": "uploadAttempts",
-            "columnName": "uploadAttempts",
-            "affinity": "INTEGER",
-            "notNull": true
+            "fieldPath": "expectedPatientId",
+            "columnName": "expectedPatientId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "expectedDeviceId",
+            "columnName": "expectedDeviceId",
+            "affinity": "TEXT"
           }
         ],
         "primaryKey": {
@@ -83,11 +112,17 @@
       },
       {
         "tableName": "sensor_raw_samples",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`eventId` TEXT NOT NULL, `sensorId` TEXT NOT NULL, `sensorFamily` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `sensorTimeEpochMs` INTEGER NOT NULL, `phoneTimeEpochMs` INTEGER NOT NULL, `packet` BLOB NOT NULL, `packetSha256` TEXT NOT NULL, `currentRaw` INTEGER NOT NULL, `temperatureRaw` INTEGER NOT NULL, `historyDistance` INTEGER NOT NULL, `transportVariant` INTEGER NOT NULL, `sensorTimeWasClamped` INTEGER NOT NULL, `addTimeSeconds` INTEGER, PRIMARY KEY(`eventId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`eventId` TEXT NOT NULL, `sourceIngressId` TEXT NOT NULL, `sensorId` TEXT NOT NULL, `sensorFamily` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `sensorTimeEpochMs` INTEGER NOT NULL, `phoneTimeEpochMs` INTEGER NOT NULL, `packet` BLOB NOT NULL, `packetSha256` TEXT NOT NULL, `currentRaw` INTEGER NOT NULL, `temperatureRaw` INTEGER NOT NULL, `historyDistance` INTEGER NOT NULL, `transportVariant` INTEGER NOT NULL, `sensorTimeWasClamped` INTEGER NOT NULL, `addTimeSeconds` INTEGER, PRIMARY KEY(`eventId`), FOREIGN KEY(`sourceIngressId`) REFERENCES `sensor_packet_ingress`(`ingressId`) ON UPDATE NO ACTION ON DELETE RESTRICT )",
         "fields": [
           {
             "fieldPath": "eventId",
             "columnName": "eventId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceIngressId",
+            "columnName": "sourceIngressId",
             "affinity": "TEXT",
             "notNull": true
           },
@@ -185,12 +220,35 @@
             ],
             "orders": [],
             "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_sensor_raw_samples_sensorId_sequence` ON `${TABLE_NAME}` (`sensorId`, `sequence`)"
+          },
+          {
+            "name": "index_sensor_raw_samples_sourceIngressId_sequence",
+            "unique": false,
+            "columnNames": [
+              "sourceIngressId",
+              "sequence"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_sensor_raw_samples_sourceIngressId_sequence` ON `${TABLE_NAME}` (`sourceIngressId`, `sequence`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "sensor_packet_ingress",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "sourceIngressId"
+            ],
+            "referencedColumns": [
+              "ingressId"
+            ]
           }
         ]
       },
       {
         "tableName": "sensor_algorithm_results",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`eventId` TEXT NOT NULL, `sensorId` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `sensorTimeEpochMs` INTEGER NOT NULL, `nativeGlucoseMmolL` REAL NOT NULL, `displayedGlucoseMmolL` REAL NOT NULL, `nativeTrend` INTEGER NOT NULL, `glucoseWarning` INTEGER NOT NULL, `currentWarning` INTEGER NOT NULL, `temperatureWarning` INTEGER NOT NULL, `algorithmProfile` TEXT NOT NULL, `algorithmVersion` TEXT NOT NULL, `binarySetId` TEXT NOT NULL, `sensitivityToken` TEXT NOT NULL, `sensitivityTokenSource` TEXT NOT NULL, `sensitivityCoefficient` REAL NOT NULL, `sensitivityEncoding` TEXT NOT NULL, `initializationMode` TEXT NOT NULL, `publishable` INTEGER NOT NULL, `alarmEligible` INTEGER NOT NULL, `algorithmErrorCode` TEXT, PRIMARY KEY(`eventId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`eventId` TEXT NOT NULL, `sensorId` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `sensorTimeEpochMs` INTEGER NOT NULL, `nativeGlucoseMmolL` REAL NOT NULL, `displayedGlucoseMmolL` REAL NOT NULL, `nativeTrend` INTEGER NOT NULL, `glucoseWarning` INTEGER NOT NULL, `currentWarning` INTEGER NOT NULL, `temperatureWarning` INTEGER NOT NULL, `algorithmProfile` TEXT NOT NULL, `algorithmVersion` TEXT NOT NULL, `binarySetId` TEXT NOT NULL, `sensitivityToken` TEXT NOT NULL, `sensitivityTokenSource` TEXT NOT NULL, `sensitivityCoefficient` REAL NOT NULL, `sensitivityEncoding` TEXT NOT NULL, `initializationMode` TEXT NOT NULL, `publishable` INTEGER NOT NULL, `alarmEligible` INTEGER NOT NULL, `algorithmErrorCode` TEXT, `publicationApprovalId` TEXT, PRIMARY KEY(`eventId`))",
         "fields": [
           {
             "fieldPath": "eventId",
@@ -316,6 +374,11 @@
             "fieldPath": "algorithmErrorCode",
             "columnName": "algorithmErrorCode",
             "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "publicationApprovalId",
+            "columnName": "publicationApprovalId",
+            "affinity": "TEXT"
           }
         ],
         "primaryKey": {
@@ -339,7 +402,7 @@
       },
       {
         "tableName": "sensor_algorithm_checkpoints",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`sensorId` TEXT NOT NULL, `bluetoothAddress` TEXT NOT NULL, `sensorFamily` TEXT NOT NULL, `transportVariant` INTEGER NOT NULL, `transportProtocol` TEXT NOT NULL, `transportCodecId` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `sensorTimeEpochMs` INTEGER NOT NULL, `algorithmProfile` TEXT NOT NULL, `algorithmVersion` TEXT NOT NULL, `binarySetId` TEXT NOT NULL, `sensitivityToken` TEXT NOT NULL, `sensitivityTokenSource` TEXT NOT NULL, `sensitivityCoefficient` REAL NOT NULL, `sensitivityEncoding` TEXT NOT NULL, `initializationMode` TEXT NOT NULL, `state` BLOB NOT NULL, `stateSha256` TEXT NOT NULL, `displayOffsetMmolL` REAL NOT NULL, `schemaVersion` INTEGER NOT NULL, PRIMARY KEY(`sensorId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`sensorId` TEXT NOT NULL, `bluetoothAddress` TEXT NOT NULL, `sensorFamily` TEXT NOT NULL, `transportVariant` INTEGER NOT NULL, `transportProtocol` TEXT NOT NULL, `transportCodecId` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `sensorTimeEpochMs` INTEGER NOT NULL, `sensorStartTimeEpochMs` INTEGER NOT NULL, `algorithmProfile` TEXT NOT NULL, `algorithmVersion` TEXT NOT NULL, `binarySetId` TEXT NOT NULL, `sensitivityToken` TEXT NOT NULL, `sensitivityTokenSource` TEXT NOT NULL, `sensitivityCoefficient` REAL NOT NULL, `sensitivityEncoding` TEXT NOT NULL, `initializationMode` TEXT NOT NULL, `state` BLOB NOT NULL, `stateSha256` TEXT NOT NULL, `displayOffsetMmolL` REAL NOT NULL, `schemaVersion` INTEGER NOT NULL, `publicationApprovalId` TEXT, PRIMARY KEY(`sensorId`))",
         "fields": [
           {
             "fieldPath": "sensorId",
@@ -386,6 +449,12 @@
           {
             "fieldPath": "sensorTimeEpochMs",
             "columnName": "sensorTimeEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sensorStartTimeEpochMs",
+            "columnName": "sensorStartTimeEpochMs",
             "affinity": "INTEGER",
             "notNull": true
           },
@@ -460,6 +529,11 @@
             "columnName": "schemaVersion",
             "affinity": "INTEGER",
             "notNull": true
+          },
+          {
+            "fieldPath": "publicationApprovalId",
+            "columnName": "publicationApprovalId",
+            "affinity": "TEXT"
           }
         ],
         "primaryKey": {
@@ -796,11 +870,465 @@
             "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_sensor_protocol_bindings_bluetoothAddress` ON `${TABLE_NAME}` (`bluetoothAddress`)"
           }
         ]
+      },
+      {
+        "tableName": "physical_sensor_approvals",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`approvalId` TEXT NOT NULL, `sensorId` TEXT NOT NULL, `bluetoothAddress` TEXT NOT NULL, `sensorFamily` TEXT NOT NULL, `transportVariant` INTEGER NOT NULL, `sensitivityToken` TEXT NOT NULL, `wireProfile` TEXT NOT NULL, `transportProtocol` TEXT NOT NULL, `transportCodecId` TEXT NOT NULL, `algorithmProfile` TEXT NOT NULL, `algorithmVersion` TEXT NOT NULL, `binarySetId` TEXT NOT NULL, `sensitivityTokenSource` TEXT NOT NULL, `sensitivityCoefficient` REAL NOT NULL, `sensitivityEncoding` TEXT NOT NULL, `initializationMode` TEXT NOT NULL, `displayOffsetMmolL` REAL NOT NULL, `protocolEvidenceKind` TEXT NOT NULL, `protocolEvidenceSha256` TEXT NOT NULL, `physicalValidationEvidenceSha256` TEXT NOT NULL, `checkpointSchemaVersion` INTEGER NOT NULL, `approvedSequence` INTEGER NOT NULL, `approvedSensorTimeEpochMs` INTEGER NOT NULL, `sensorStartTimeEpochMs` INTEGER NOT NULL, `approvedCheckpointStateSha256` TEXT NOT NULL, `nativeBinarySetSha256` TEXT NOT NULL, `nativeDatahandleBinarySetSha256` TEXT NOT NULL, `approvedAtEpochMs` INTEGER NOT NULL, `schemaVersion` INTEGER NOT NULL, PRIMARY KEY(`approvalId`))",
+        "fields": [
+          {
+            "fieldPath": "approvalId",
+            "columnName": "approvalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sensorId",
+            "columnName": "sensorId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bluetoothAddress",
+            "columnName": "bluetoothAddress",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sensorFamily",
+            "columnName": "sensorFamily",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "transportVariant",
+            "columnName": "transportVariant",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sensitivityToken",
+            "columnName": "sensitivityToken",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "wireProfile",
+            "columnName": "wireProfile",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "transportProtocol",
+            "columnName": "transportProtocol",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "transportCodecId",
+            "columnName": "transportCodecId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "algorithmProfile",
+            "columnName": "algorithmProfile",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "algorithmVersion",
+            "columnName": "algorithmVersion",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "binarySetId",
+            "columnName": "binarySetId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sensitivityTokenSource",
+            "columnName": "sensitivityTokenSource",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sensitivityCoefficient",
+            "columnName": "sensitivityCoefficient",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sensitivityEncoding",
+            "columnName": "sensitivityEncoding",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "initializationMode",
+            "columnName": "initializationMode",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "displayOffsetMmolL",
+            "columnName": "displayOffsetMmolL",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "protocolEvidenceKind",
+            "columnName": "protocolEvidenceKind",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "protocolEvidenceSha256",
+            "columnName": "protocolEvidenceSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "physicalValidationEvidenceSha256",
+            "columnName": "physicalValidationEvidenceSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "checkpointSchemaVersion",
+            "columnName": "checkpointSchemaVersion",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "approvedSequence",
+            "columnName": "approvedSequence",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "approvedSensorTimeEpochMs",
+            "columnName": "approvedSensorTimeEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sensorStartTimeEpochMs",
+            "columnName": "sensorStartTimeEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "approvedCheckpointStateSha256",
+            "columnName": "approvedCheckpointStateSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "nativeBinarySetSha256",
+            "columnName": "nativeBinarySetSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "nativeDatahandleBinarySetSha256",
+            "columnName": "nativeDatahandleBinarySetSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "approvedAtEpochMs",
+            "columnName": "approvedAtEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "schemaVersion",
+            "columnName": "schemaVersion",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "approvalId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_physical_sensor_approvals_sensorId",
+            "unique": false,
+            "columnNames": [
+              "sensorId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_physical_sensor_approvals_sensorId` ON `${TABLE_NAME}` (`sensorId`)"
+          },
+          {
+            "name": "index_physical_sensor_approvals_bluetoothAddress",
+            "unique": false,
+            "columnNames": [
+              "bluetoothAddress"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_physical_sensor_approvals_bluetoothAddress` ON `${TABLE_NAME}` (`bluetoothAddress`)"
+          }
+        ]
+      },
+      {
+        "tableName": "product_publication_bindings",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`publicationBindingId` TEXT NOT NULL, `approvalId` TEXT NOT NULL, `httpsOrigin` TEXT NOT NULL, `backendBindingId` TEXT NOT NULL, `credentialId` TEXT NOT NULL, `credentialRevision` INTEGER NOT NULL, `expectedPatientId` TEXT NOT NULL, `expectedDeviceId` TEXT NOT NULL, `createdAtEpochMs` INTEGER NOT NULL, `schemaVersion` INTEGER NOT NULL, PRIMARY KEY(`publicationBindingId`))",
+        "fields": [
+          {
+            "fieldPath": "publicationBindingId",
+            "columnName": "publicationBindingId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "approvalId",
+            "columnName": "approvalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "httpsOrigin",
+            "columnName": "httpsOrigin",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "backendBindingId",
+            "columnName": "backendBindingId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "credentialId",
+            "columnName": "credentialId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "credentialRevision",
+            "columnName": "credentialRevision",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "expectedPatientId",
+            "columnName": "expectedPatientId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "expectedDeviceId",
+            "columnName": "expectedDeviceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMs",
+            "columnName": "createdAtEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "schemaVersion",
+            "columnName": "schemaVersion",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "publicationBindingId"
+          ]
+        }
+      },
+      {
+        "tableName": "active_sensor_publication_binding",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`activeSlot` INTEGER NOT NULL, `publicationBindingId` TEXT NOT NULL, PRIMARY KEY(`activeSlot`))",
+        "fields": [
+          {
+            "fieldPath": "activeSlot",
+            "columnName": "activeSlot",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "publicationBindingId",
+            "columnName": "publicationBindingId",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "activeSlot"
+          ]
+        }
+      },
+      {
+        "tableName": "measurement_upload_outbox",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`outboxId` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `eventId` TEXT NOT NULL, `approvalId` TEXT NOT NULL, `publicationBindingId` TEXT NOT NULL, `httpsOrigin` TEXT NOT NULL, `backendBindingId` TEXT NOT NULL, `credentialId` TEXT NOT NULL, `credentialRevision` INTEGER NOT NULL, `expectedPatientId` TEXT NOT NULL, `expectedDeviceId` TEXT NOT NULL, `state` TEXT NOT NULL, `attempts` INTEGER NOT NULL, `enqueuedAtEpochMs` INTEGER NOT NULL, `nextAttemptEpochMs` INTEGER NOT NULL, `leaseToken` TEXT, `leaseExpiresAtEpochMs` INTEGER, `lastTransitionToken` TEXT, `sanitizedStatus` TEXT, `sanitizedDetail` TEXT)",
+        "fields": [
+          {
+            "fieldPath": "outboxId",
+            "columnName": "outboxId",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "eventId",
+            "columnName": "eventId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "approvalId",
+            "columnName": "approvalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "publicationBindingId",
+            "columnName": "publicationBindingId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "httpsOrigin",
+            "columnName": "httpsOrigin",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "backendBindingId",
+            "columnName": "backendBindingId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "credentialId",
+            "columnName": "credentialId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "credentialRevision",
+            "columnName": "credentialRevision",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "expectedPatientId",
+            "columnName": "expectedPatientId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "expectedDeviceId",
+            "columnName": "expectedDeviceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "state",
+            "columnName": "state",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "attempts",
+            "columnName": "attempts",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "enqueuedAtEpochMs",
+            "columnName": "enqueuedAtEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "nextAttemptEpochMs",
+            "columnName": "nextAttemptEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "leaseToken",
+            "columnName": "leaseToken",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "leaseExpiresAtEpochMs",
+            "columnName": "leaseExpiresAtEpochMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "lastTransitionToken",
+            "columnName": "lastTransitionToken",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "sanitizedStatus",
+            "columnName": "sanitizedStatus",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "sanitizedDetail",
+            "columnName": "sanitizedDetail",
+            "affinity": "TEXT"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "outboxId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_measurement_upload_outbox_eventId",
+            "unique": true,
+            "columnNames": [
+              "eventId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_measurement_upload_outbox_eventId` ON `${TABLE_NAME}` (`eventId`)"
+          },
+          {
+            "name": "index_measurement_upload_outbox_leaseToken",
+            "unique": false,
+            "columnNames": [
+              "leaseToken"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_measurement_upload_outbox_leaseToken` ON `${TABLE_NAME}` (`leaseToken`)"
+          },
+          {
+            "name": "index_measurement_upload_outbox_state_nextAttemptEpochMs_outboxId",
+            "unique": false,
+            "columnNames": [
+              "state",
+              "nextAttemptEpochMs",
+              "outboxId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_measurement_upload_outbox_state_nextAttemptEpochMs_outboxId` ON `${TABLE_NAME}` (`state`, `nextAttemptEpochMs`, `outboxId`)"
+          }
+        ]
       }
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '2f731a3cc8c34e37864beb20301b038a')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'b79f6509a3350adba6184cd3ede4c0fa')"
     ]
   }
 }

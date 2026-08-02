@@ -15,9 +15,8 @@ internal enum class SensorServiceStartMode {
 
 internal object AlarmMonitoringStartGate {
     fun canStart(mode: SensorServiceStartMode, alarmReady: Boolean): Boolean = when (mode) {
+        SensorServiceStartMode.Demo -> alarmReady
         SensorServiceStartMode.ConfiguredSensor,
-        SensorServiceStartMode.Demo,
-        -> alarmReady
         SensorServiceStartMode.DiagnosticSensor,
         SensorServiceStartMode.SetupRequired,
         -> true
@@ -77,6 +76,8 @@ internal class SensorServiceStartPolicy {
         }
         null -> if (diagnosticResumeIdentityMatches && hasPendingDiagnosticConfiguration) {
             SensorServiceStartMode.DiagnosticSensor
+        } else if (hasConfirmedConfiguration) {
+            SensorServiceStartMode.ConfiguredSensor
         } else {
             SensorServiceStartMode.SetupRequired
         }

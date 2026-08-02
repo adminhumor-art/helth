@@ -8,19 +8,20 @@ import java.util.concurrent.CancellationException
 
 /** A packet that has an append-only database receipt before core processing. */
 internal class DurablyJournaledGs1Packet(
-    val ingressId: String,
-    val receivedAtEpochMs: Long,
-    encryptedPacket: ByteArray,
+    val ingress: SensorPacketIngressRecord,
+    val verifiedCommittedPrefixSampleCount: Int = 0,
 ) {
-    private val encryptedPacket = encryptedPacket.copyOf()
+    val ingressId: String
+        get() = ingress.ingressId
+
+    val receivedAtEpochMs: Long
+        get() = ingress.receivedAtEpochMs
 
     init {
-        require(ingressId.isNotBlank())
-        require(receivedAtEpochMs > 0L)
-        require(this.encryptedPacket.isNotEmpty())
+        require(verifiedCommittedPrefixSampleCount >= 0)
     }
 
-    fun encryptedPacketCopy(): ByteArray = encryptedPacket.copyOf()
+    fun encryptedPacketCopy(): ByteArray = ingress.encryptedPacketCopy()
 }
 
 internal sealed interface Gs1DurableIngressResult {
@@ -108,9 +109,7 @@ internal class Gs1DurableIngress(
             Gs1PendingIngress(
                 record = record,
                 packet = DurablyJournaledGs1Packet(
-                    ingressId = record.ingressId,
-                    receivedAtEpochMs = record.receivedAtEpochMs,
-                    encryptedPacket = packet,
+                    ingress = record,
                 ),
             ),
         )

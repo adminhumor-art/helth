@@ -16,27 +16,18 @@ import (
 
 type Client struct {
 	Token      string
-	ChatIDs    []string
 	HTTPClient *http.Client
 	BaseURL    string
 }
 
 const maxTelegramResponseBytes = 64 << 10
 
-func (c Client) Notify(ctx context.Context, alert domain.Alert) error {
-	if c.Token == "" || len(c.ChatIDs) == 0 {
-		return nil
-	}
-	var errs []error
-	for _, chatID := range c.ChatIDs {
-		if err := c.NotifyRecipient(ctx, alert, chatID); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
-}
-
-func (c Client) NotifyRecipient(ctx context.Context, alert domain.Alert, chatID string) error {
+func (c Client) NotifyRecipient(
+	ctx context.Context,
+	alert domain.Alert,
+	patientDisplayName string,
+	chatID string,
+) error {
 	if c.Token == "" {
 		return errors.New("telegram token is not configured")
 	}
@@ -50,7 +41,7 @@ func (c Client) NotifyRecipient(ctx context.Context, alert domain.Alert, chatID 
 	}
 	payload := map[string]any{
 		"chat_id":              chatID,
-		"text":                 message(alert),
+		"text":                 message(alert, patientDisplayName),
 		"disable_notification": false,
 	}
 	body, _ := json.Marshal(payload)
@@ -109,7 +100,7 @@ func safeError(err error, token string) error {
 	return errors.New(message)
 }
 
-func message(alert domain.Alert) string {
+func message(alert domain.Alert, patientDisplayName string) string {
 	name := map[domain.AlertKind]string{
 		domain.AlertLow:        "Низкий уровень глюкозы",
 		domain.AlertHigh:       "Высокий уровень глюкозы",
@@ -117,7 +108,11 @@ func message(alert domain.Alert) string {
 		domain.AlertRapidRise:  "Глюкоза быстро повышается",
 		domain.AlertSignalLoss: "Нет свежих данных от датчика",
 	}[alert.Kind]
-	parts := []string{"⚠️ " + name}
+	patientDisplayName = domain.NormalizePatientDisplayName(patientDisplayName)
+	if patientDisplayName == "" {
+		patientDisplayName = "Пациент"
+	}
+	parts := []string{"⚠️ " + name, "Пациент: " + patientDisplayName}
 	if alert.GlucoseMgDL != nil {
 		parts = append(parts, fmt.Sprintf("Значение: %d мг/дл", *alert.GlucoseMgDL))
 	}

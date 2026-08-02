@@ -1,8 +1,10 @@
 package com.sladkaya.sensor.sibionics
 
+import com.sladkaya.core.data.SensorPacketIngressRecord
 import java.util.concurrent.CancellationException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -82,11 +84,23 @@ internal sealed interface Gs1DiagnosticRuntimeEvent {
 
     data class Committed(
         val generation: Long,
+        val ingress: SensorPacketIngressRecord,
         val samples: List<DecodedGs1RawSample>,
         val diagnostics: List<Gs1DiagnosticReading>,
+        val publications: List<Gs1ProductPublication> = emptyList(),
         val issues: List<Gs1PacketProcessingResult.CommittedIssue> = emptyList(),
         val validatedTransportEnvelope: Boolean = false,
-    ) : Gs1DiagnosticRuntimeEvent
+        private val settlement: Gs1CommittedEventSettlement? = null,
+    ) : Gs1DiagnosticRuntimeEvent {
+        fun acknowledgeDurablySettled(): Boolean = settlement?.accept() == true
+
+        internal fun rejectSettlement(code: String, detail: String? = null): Boolean =
+            settlement?.reject(code, detail) == true
+
+        internal suspend fun awaitSettlement() {
+            settlement?.await()
+        }
+    }
 
     data class Failed(
         val generation: Long,
@@ -167,7 +181,9 @@ internal class Gs1DiagnosticRuntime(
         if (active.id != generation) return Gs1RuntimeSubmission.STALE_GENERATION
         if (!active.accepting.get()) return Gs1RuntimeSubmission.CLOSED
 
-        val offered = active.mailbox.trySend(RuntimeSubmission(packet = packet))
+        val offered = active.mailbox.trySend(
+            RuntimeSubmission(packet = packet, dispatchLiveEvents = true),
+        )
         if (offered.isSuccess) return Gs1RuntimeSubmission.ACCEPTED
         if (offered.isClosed) return Gs1RuntimeSubmission.CLOSED
 
@@ -193,7 +209,13 @@ internal class Gs1DiagnosticRuntime(
         val receipt = CompletableDeferred<Gs1RuntimeAwaitResult>()
         active.pendingReceipts += receipt
         return try {
-            active.mailbox.send(RuntimeSubmission(packet, receipt))
+            active.mailbox.send(
+                RuntimeSubmission(
+                    packet = packet,
+                    receipt = receipt,
+                    dispatchLiveEvents = false,
+                ),
+            )
             receipt.await()
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -225,6 +247,16 @@ internal class Gs1DiagnosticRuntime(
     private suspend fun stopAndJoin(generation: Generation): Gs1RuntimeStopResult {
         generation.accepting.set(false)
         generation.stopRequested.set(true)
+        generation.activeSettlement.get()?.let { settlement ->
+            if (
+                settlement.reject(
+                    code = "APPLICATION_STOPPED",
+                    detail = "Runtime stopped before local effects were durably settled",
+                )
+            ) {
+                generation.persistenceAbandoned.set(true)
+            }
+        }
         generation.mailbox.close()
         if (generation.retryingPersistence.get()) {
             generation.persistenceAbandoned.set(true)
@@ -273,12 +305,14 @@ internal class Gs1DiagnosticRuntime(
                     }
                     generation.retryingPersistence.set(true)
                     retryAttempt += 1
-                    eventSink(
-                        Gs1DiagnosticRuntimeEvent.RetryingPersistence(
-                            generation = generation.id,
-                            attempt = retryAttempt,
-                        ),
-                    )
+                    if (submission.dispatchLiveEvents) {
+                        eventSink(
+                            Gs1DiagnosticRuntimeEvent.RetryingPersistence(
+                                generation = generation.id,
+                                attempt = retryAttempt,
+                            ),
+                        )
+                    }
                     if (retryDelayMillis > 0) delay(retryDelayMillis)
                     kotlinx.coroutines.currentCoroutineContext().ensureActive()
                     if (generation.stopRequested.get()) {
@@ -290,16 +324,27 @@ internal class Gs1DiagnosticRuntime(
                     result = generation.lease.retryPending()
                 }
                 generation.retryingPersistence.set(false)
-                eventSink(
-                    Gs1DiagnosticRuntimeEvent.Finalized(
-                        generation = generation.id,
-                        ingressId = submission.packet.ingressId,
-                        receivedAtEpochMs = submission.packet.receivedAtEpochMs,
-                        disposition = result.ingressDisposition(),
-                        detail = result.ingressDetail(),
-                    ),
-                )
-                val continueAccepting = emitFinalResult(generation.id, result)
+                val continueAccepting = if (submission.dispatchLiveEvents) {
+                    // A durable commit must reach the ordered downstream actor before
+                    // the ingress can be finalized. If delivery fails or is cancelled,
+                    // the missing outcome deliberately leaves the ingress recoverable.
+                    emitCommittedResult(generation, submission.packet.ingress, result)
+                    eventSink(
+                        Gs1DiagnosticRuntimeEvent.Finalized(
+                            generation = generation.id,
+                            ingressId = submission.packet.ingressId,
+                            receivedAtEpochMs = submission.packet.receivedAtEpochMs,
+                            disposition = result.ingressDisposition(),
+                            detail = result.ingressDetail(),
+                        ),
+                    )
+                    emitFinalResult(generation.id, result)
+                } else {
+                    // Recovery owns exact validation, output delivery and ingress
+                    // finalization. Emitting the live stream here would duplicate it
+                    // before the GATT attempt even exists.
+                    result is Gs1PacketProcessingResult.Completed
+                }
                 submission.receipt?.complete(Gs1RuntimeAwaitResult.Processed(result))
                 submission.receipt?.let(generation.pendingReceipts::remove)
                 if (!continueAccepting) {
@@ -351,16 +396,7 @@ internal class Gs1DiagnosticRuntime(
         result: Gs1PacketProcessingResult,
     ): Boolean {
         return when (result) {
-            is Gs1PacketProcessingResult.Completed -> {
-                emitCommitted(
-                    generation,
-                    result.committedSamples,
-                    result.diagnostics,
-                    result.committedIssues,
-                    result.validatedTransportEnvelope,
-                )
-                true
-            }
+            is Gs1PacketProcessingResult.Completed -> true
 
         is Gs1PacketProcessingResult.InvalidPacket -> {
             eventSink(
@@ -374,23 +410,11 @@ internal class Gs1DiagnosticRuntime(
         }
 
         is Gs1PacketProcessingResult.Rejected -> {
-            emitCommitted(
-                generation,
-                result.committedSamples,
-                result.diagnostics,
-                result.committedIssues,
-            )
             eventSink(Gs1DiagnosticRuntimeEvent.Failed(generation, result.code, result.message))
             false
         }
 
         is Gs1PacketProcessingResult.StorageConflict -> {
-            emitCommitted(
-                generation,
-                result.committedSamples,
-                result.diagnostics,
-                result.committedIssues,
-            )
             eventSink(
                 Gs1DiagnosticRuntimeEvent.Failed(generation, "STORAGE_CONFLICT", result.reason),
             )
@@ -398,12 +422,6 @@ internal class Gs1DiagnosticRuntime(
         }
 
         is Gs1PacketProcessingResult.Closed -> {
-            emitCommitted(
-                generation,
-                result.committedSamples,
-                result.diagnostics,
-                result.committedIssues,
-            )
             eventSink(Gs1DiagnosticRuntimeEvent.Failed(generation, "CORE_CLOSED", result.reason))
             false
         }
@@ -422,6 +440,56 @@ internal class Gs1DiagnosticRuntime(
         is Gs1PacketProcessingResult.PersistenceUnavailable -> error(
             "PersistenceUnavailable must be resolved before final dispatch",
         )
+        }
+    }
+
+    private suspend fun emitCommittedResult(
+        generation: Generation,
+        ingress: SensorPacketIngressRecord,
+        result: Gs1PacketProcessingResult,
+    ) {
+        when (result) {
+            is Gs1PacketProcessingResult.Completed -> emitCommitted(
+                generation = generation,
+                ingress = ingress,
+                samples = result.committedSamples,
+                diagnostics = result.diagnostics,
+                publications = result.publications,
+                issues = result.committedIssues,
+                validatedTransportEnvelope = result.validatedTransportEnvelope,
+            )
+
+            is Gs1PacketProcessingResult.Rejected -> emitCommitted(
+                generation = generation,
+                ingress = ingress,
+                samples = result.committedSamples,
+                diagnostics = result.diagnostics,
+                publications = result.publications,
+                issues = result.committedIssues,
+            )
+
+            is Gs1PacketProcessingResult.StorageConflict -> emitCommitted(
+                generation = generation,
+                ingress = ingress,
+                samples = result.committedSamples,
+                diagnostics = result.diagnostics,
+                publications = result.publications,
+                issues = result.committedIssues,
+            )
+
+            is Gs1PacketProcessingResult.Closed -> emitCommitted(
+                generation = generation,
+                ingress = ingress,
+                samples = result.committedSamples,
+                diagnostics = result.diagnostics,
+                publications = result.publications,
+                issues = result.committedIssues,
+            )
+
+            is Gs1PacketProcessingResult.InvalidPacket,
+            is Gs1PacketProcessingResult.PersistenceUnavailable,
+            Gs1PacketProcessingResult.NoPendingCommit,
+            -> Unit
         }
     }
 
@@ -448,24 +516,48 @@ internal class Gs1DiagnosticRuntime(
     }
 
     private suspend fun emitCommitted(
-        generation: Long,
+        generation: Generation,
+        ingress: SensorPacketIngressRecord,
         samples: List<DecodedGs1RawSample>,
         diagnostics: List<Gs1DiagnosticReading>,
+        publications: List<Gs1ProductPublication> = emptyList(),
         issues: List<Gs1PacketProcessingResult.CommittedIssue> = emptyList(),
         validatedTransportEnvelope: Boolean = false,
     ) {
-        if (samples.isEmpty() && diagnostics.isEmpty() && issues.isEmpty() &&
+        if (samples.isEmpty() && diagnostics.isEmpty() && publications.isEmpty() && issues.isEmpty() &&
             !validatedTransportEnvelope
         ) return
-        eventSink(
-            Gs1DiagnosticRuntimeEvent.Committed(
-                generation = generation,
-                samples = samples.toList(),
-                diagnostics = diagnostics.toList(),
-                issues = issues.toList(),
-                validatedTransportEnvelope = validatedTransportEnvelope,
-            ),
+        val settlement = Gs1CommittedEventSettlement()
+        val committed = Gs1DiagnosticRuntimeEvent.Committed(
+            generation = generation.id,
+            ingress = ingress,
+            samples = samples.toList(),
+            diagnostics = diagnostics.toList(),
+            publications = publications.toList(),
+            issues = issues.toList(),
+            validatedTransportEnvelope = validatedTransportEnvelope,
+            settlement = settlement,
         )
+        check(generation.activeSettlement.compareAndSet(null, settlement)) {
+            "A runtime generation cannot have more than one active committed settlement"
+        }
+        try {
+            if (
+                generation.stopRequested.get() &&
+                settlement.reject(
+                    code = "APPLICATION_STOPPED",
+                    detail = "Runtime stopped before local effects were durably settled",
+                )
+            ) {
+                generation.persistenceAbandoned.set(true)
+            }
+            eventSink(committed)
+            // The next native ingest and this ingress' Finalized event are forbidden
+            // until Room validation, local effects and durable cursor settlement finish.
+            committed.awaitSettlement()
+        } finally {
+            generation.activeSettlement.compareAndSet(settlement, null)
+        }
     }
 
     private class Generation(
@@ -477,6 +569,8 @@ internal class Gs1DiagnosticRuntime(
         val stopRequested: AtomicBoolean = AtomicBoolean(false),
         val retryingPersistence: AtomicBoolean = AtomicBoolean(false),
         val persistenceAbandoned: AtomicBoolean = AtomicBoolean(false),
+        val activeSettlement: AtomicReference<Gs1CommittedEventSettlement?> =
+            AtomicReference(null),
         val pendingReceipts: MutableSet<CompletableDeferred<Gs1RuntimeAwaitResult>> =
             ConcurrentHashMap.newKeySet(),
     ) {
@@ -486,6 +580,7 @@ internal class Gs1DiagnosticRuntime(
     private data class RuntimeSubmission(
         val packet: DurablyJournaledGs1Packet,
         val receipt: CompletableDeferred<Gs1RuntimeAwaitResult>? = null,
+        val dispatchLiveEvents: Boolean,
     )
 
     private companion object {
@@ -494,6 +589,23 @@ internal class Gs1DiagnosticRuntime(
         const val DEFAULT_STOP_TIMEOUT_MS = 2_000L
     }
 }
+
+internal class Gs1CommittedEventSettlement {
+    private val result = CompletableDeferred<Unit>()
+
+    fun accept(): Boolean = result.complete(Unit)
+
+    fun reject(code: String, detail: String?): Boolean = result.completeExceptionally(
+        Gs1CommittedSettlementRejectedException(code, detail),
+    )
+
+    suspend fun await() = result.await()
+}
+
+private class Gs1CommittedSettlementRejectedException(
+    code: String,
+    detail: String?,
+) : IllegalStateException(listOfNotNull(code, detail).joinToString(": "))
 
 internal class FactoryGs1RuntimeCoreOpener(
     private val factory: Gs1CoreFactory,
@@ -534,6 +646,42 @@ internal class FactoryGs1RuntimeCoreOpener(
                 ),
             )
         }
+}
+
+/** Product opener reuses the exact diagnostic transport, verifier and algorithm lease. */
+internal class FactoryGs1ApprovedRuntimeCoreOpener(
+    private val factory: Gs1CoreFactory,
+    private val permitIssuer: Gs1ProductPermitIssuer,
+) : Gs1RuntimeCoreOpener {
+    override suspend fun open(profile: Gs1DiagnosticActivationProfile): Gs1RuntimeCoreOpenResult {
+        val permit = when (val issued = permitIssuer.issue(profile)) {
+            is Gs1ProductPermitIssueResult.Granted -> issued.permit
+            is Gs1ProductPermitIssueResult.Denied -> return Gs1RuntimeCoreOpenResult.Failure(
+                code = issued.error.name,
+                detail = issued.detail,
+            )
+        }
+        return when (val opened = factory.openApproved(profile, permit)) {
+            is Gs1CoreOpenResult.Failure -> Gs1RuntimeCoreOpenResult.Failure(
+                code = opened.error.name,
+                detail = opened.detail,
+            )
+            is Gs1CoreOpenResult.Success -> {
+                val wireProfile = permit.active.approval.wireProfile
+                    .let { value -> Gs1WireProfile.entries.firstOrNull { it.name == value } }
+                    ?: return Gs1RuntimeCoreOpenResult.Failure(
+                        code = Gs1CoreOpenError.PRODUCT_APPROVAL_CONFIGURATION_MISMATCH.name,
+                    )
+                Gs1RuntimeCoreOpenResult.Success(
+                    FactoryGs1RuntimeCoreLease(
+                        coordinator = opened.coordinator,
+                        initialNextIndex = opened.nextSensorIndex,
+                        wireProfile = wireProfile,
+                    ),
+                )
+            }
+        }
+    }
 }
 
 private class ResolvingGs1RuntimeCoreLease(
@@ -718,7 +866,12 @@ private class FactoryGs1RuntimeCoreLease(
     )
 
     override suspend fun ingest(packet: DurablyJournaledGs1Packet): Gs1PacketProcessingResult =
-        processor.ingest(packet.encryptedPacketCopy(), packet.receivedAtEpochMs)
+        processor.ingest(
+            sourceIngressId = packet.ingressId,
+            encryptedPacket = packet.encryptedPacketCopy(),
+            receivedAtEpochMs = packet.receivedAtEpochMs,
+            verifiedCommittedPrefixSampleCount = packet.verifiedCommittedPrefixSampleCount,
+        )
 
     override suspend fun retryPending(): Gs1PacketProcessingResult =
         processor.retryPending()

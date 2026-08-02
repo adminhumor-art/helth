@@ -1,5 +1,6 @@
 package com.sladkaya.sensor.sibionics
 
+import com.sladkaya.core.data.PhysicalSensorApprovalRecord
 import com.sladkaya.core.data.SensorAlgorithmCheckpointRecord
 import com.sladkaya.core.data.SensorCoreStore
 import com.sladkaya.core.data.SensorProtocolBindingRecord
@@ -49,6 +50,12 @@ internal enum class Gs1CoreOpenError {
     CHECKPOINT_CALIBRATION_MISMATCH,
     CHECKPOINT_PHYSICAL_IDENTITY_MISMATCH,
     CHECKPOINT_METADATA_MISMATCH,
+    CHECKPOINT_APPROVAL_ANCHOR_MISMATCH,
+    CHECKPOINT_APPROVAL_LINEAGE_MISMATCH,
+    DIAGNOSTIC_OPEN_FOR_APPROVED_LINEAGE,
+    PRODUCT_PERMIT_PROFILE_MISMATCH,
+    PRODUCT_APPROVAL_CONFIGURATION_MISMATCH,
+    PRODUCT_NATIVE_BINARY_SET_MISMATCH,
     SENSOR_SEQUENCE_EXHAUSTED,
     NATIVE_LOAD_FAILED,
     ALGORITHM_OPEN_FAILED,
@@ -71,6 +78,7 @@ internal class Gs1CoreFactory private constructor(
     private val store: SensorCoreStore,
     private val decodeSensitivityForProfile: (AlgorithmProfile, SensitivityToken) -> SensitivityDecodeResult,
     private val nativeProvider: (AlgorithmProfile) -> NativeAlgorithmApi,
+    private val nativeArtifactIdentityProvider: Gs1NativeArtifactIdentityProvider,
 ) {
     private val protocolBindingResolver = Gs1ProtocolBindingResolver(store)
 
@@ -85,6 +93,7 @@ internal class Gs1CoreFactory private constructor(
                 AlgorithmProfile.V116A -> V116ANativeAlgorithmApi()
             }
         },
+        nativeArtifactIdentityProvider = Gs1InstalledNativeArtifactIdentityProvider,
     )
 
     internal constructor(
@@ -95,6 +104,19 @@ internal class Gs1CoreFactory private constructor(
         store = store,
         decodeSensitivityForProfile = { _, token -> decodeSensitivity(token) },
         nativeProvider = nativeProvider,
+        nativeArtifactIdentityProvider = Gs1InstalledNativeArtifactIdentityProvider,
+    )
+
+    internal constructor(
+        store: SensorCoreStore,
+        decodeSensitivity: (SensitivityToken) -> SensitivityDecodeResult,
+        nativeProvider: (AlgorithmProfile) -> NativeAlgorithmApi,
+        nativeArtifactIdentityProvider: Gs1NativeArtifactIdentityProvider,
+    ) : this(
+        store = store,
+        decodeSensitivityForProfile = { _, token -> decodeSensitivity(token) },
+        nativeProvider = nativeProvider,
+        nativeArtifactIdentityProvider = nativeArtifactIdentityProvider,
     )
 
     suspend fun inspectProtocol(
@@ -165,9 +187,46 @@ internal class Gs1CoreFactory private constructor(
         return open(profile.coreConfiguration(resolution.wireProfile), binding)
     }
 
+    suspend fun openApproved(
+        profile: Gs1DiagnosticActivationProfile,
+        permit: Gs1ProductPermit,
+    ): Gs1CoreOpenResult {
+        if (!permit.belongsTo(profile)) {
+            return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.PRODUCT_PERMIT_PROFILE_MISMATCH)
+        }
+        return when (val resolution = inspectProtocol(profile)) {
+            is Gs1ProtocolResolution.Failure -> Gs1CoreOpenResult.Failure(
+                error = if (resolution.code == "PROTOCOL_BINDING_MISMATCH") {
+                    Gs1CoreOpenError.PROTOCOL_BINDING_MISMATCH
+                } else {
+                    Gs1CoreOpenError.PROTOCOL_BINDING_REQUIRED
+                },
+                detail = resolution.detail ?: resolution.code,
+            )
+            Gs1ProtocolResolution.Unresolved ->
+                Gs1CoreOpenResult.Failure(Gs1CoreOpenError.PROTOCOL_BINDING_REQUIRED)
+            is Gs1ProtocolResolution.Resolved -> {
+                val binding = resolution.binding ?: return Gs1CoreOpenResult.Failure(
+                    Gs1CoreOpenError.PROTOCOL_BINDING_REQUIRED,
+                )
+                openInternal(
+                    configuration = profile.coreConfiguration(resolution.wireProfile),
+                    protocolBinding = binding,
+                    productPermit = permit,
+                )
+            }
+        }
+    }
+
     suspend fun open(
         configuration: Gs1CoreConfiguration,
         protocolBinding: SensorProtocolBindingRecord,
+    ): Gs1CoreOpenResult = openInternal(configuration, protocolBinding, productPermit = null)
+
+    private suspend fun openInternal(
+        configuration: Gs1CoreConfiguration,
+        protocolBinding: SensorProtocolBindingRecord,
+        productPermit: Gs1ProductPermit?,
     ): Gs1CoreOpenResult {
         if (configuration.family != SensorFamily.SIBIONICS_GS1 &&
             configuration.family != SensorFamily.SIBIONICS_GS1SB
@@ -200,6 +259,17 @@ internal class Gs1CoreFactory private constructor(
         if (!protocolBinding.matches(configuration, spec, token)) {
             return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.PROTOCOL_BINDING_MISMATCH)
         }
+        if (productPermit != null &&
+            !productPermit.active.approval.matchesStaticProductConfiguration(
+                configuration = configuration,
+                protocolBinding = protocolBinding,
+                spec = spec,
+            )
+        ) {
+            return Gs1CoreOpenResult.Failure(
+                Gs1CoreOpenError.PRODUCT_APPROVAL_CONFIGURATION_MISMATCH,
+            )
+        }
         val decoded = try {
                 decodeSensitivityForProfile(spec.algorithmProfile, token)
         } catch (cancelled: CancellationException) {
@@ -231,18 +301,45 @@ internal class Gs1CoreFactory private constructor(
 
         val native: NativeAlgorithmApi
         val nativeAlgorithmVersion: String
+        val nativeArtifactIdentity: Gs1NativeArtifactIdentity?
         try {
             native = nativeProvider(spec.algorithmProfile)
             nativeAlgorithmVersion = native.algorithmVersion
             require(nativeAlgorithmVersion.isNotBlank() &&
                 !nativeAlgorithmVersion.trim().equals("unknown", ignoreCase = true)
             ) { "Native algorithm version is absent or unknown" }
+            nativeArtifactIdentity = productPermit?.let {
+                nativeArtifactIdentityProvider.resolve(spec.algorithmProfile)
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: LinkageError) {
             return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.NATIVE_LOAD_FAILED, failure.message)
         } catch (failure: Exception) {
             return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.NATIVE_LOAD_FAILED, failure.message)
+        }
+
+        if (productPermit != null) {
+            val approval = productPermit.active.approval
+            val identity = checkNotNull(nativeArtifactIdentity)
+            if (identity.algorithmBinarySetSha256 != approval.nativeBinarySetSha256 ||
+                identity.datahandleBinarySetSha256 != approval.nativeDatahandleBinarySetSha256
+            ) {
+                return Gs1CoreOpenResult.Failure(
+                    Gs1CoreOpenError.PRODUCT_NATIVE_BINARY_SET_MISMATCH,
+                )
+            }
+            if (!approval.matchesDynamicProductConfiguration(
+                    sensitivity = sensitivity,
+                    initializationMode = initializationMode,
+                    nativeBinarySetId = native.binarySetId,
+                    nativeAlgorithmVersion = nativeAlgorithmVersion,
+                )
+            ) {
+                return Gs1CoreOpenResult.Failure(
+                    Gs1CoreOpenError.PRODUCT_APPROVAL_CONFIGURATION_MISMATCH,
+                )
+            }
         }
 
         val (stored, physicalCheckpoint) = try {
@@ -264,6 +361,11 @@ internal class Gs1CoreFactory private constructor(
                 Gs1CoreOpenError.CHECKPOINT_PHYSICAL_IDENTITY_MISMATCH,
             )
         }
+        if (productPermit == null && stored?.publicationApprovalId != null) {
+            return Gs1CoreOpenResult.Failure(
+                Gs1CoreOpenError.DIAGNOSTIC_OPEN_FOR_APPROVED_LINEAGE,
+            )
+        }
         if (stored != null && !stored.calibrationMatches(
                 configuration,
                 sensitivity,
@@ -274,6 +376,24 @@ internal class Gs1CoreFactory private constructor(
             )
         ) {
             return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.CHECKPOINT_CALIBRATION_MISMATCH)
+        }
+        if (productPermit != null) {
+            val approval = productPermit.active.approval
+            when (stored?.publicationApprovalId) {
+                null -> if (stored == null || !stored.matchesApprovalAnchor(approval)) {
+                    return Gs1CoreOpenResult.Failure(
+                        Gs1CoreOpenError.CHECKPOINT_APPROVAL_ANCHOR_MISMATCH,
+                    )
+                }
+                approval.approvalId -> if (!stored.matchesApprovedLineage(approval)) {
+                    return Gs1CoreOpenResult.Failure(
+                        Gs1CoreOpenError.CHECKPOINT_APPROVAL_LINEAGE_MISMATCH,
+                    )
+                }
+                else -> return Gs1CoreOpenResult.Failure(
+                    Gs1CoreOpenError.CHECKPOINT_APPROVAL_LINEAGE_MISMATCH,
+                )
+            }
         }
         val checkpoint = stored?.toAlgorithmCheckpoint(
             configuration,
@@ -316,6 +436,17 @@ internal class Gs1CoreFactory private constructor(
                     store = store,
                     transportProtocol = spec.transportProtocol,
                     transportCodecId = spec.transportCodecId,
+                    algorithmProfile = spec.algorithmProfile,
+                    initialSensorStartTimeEpochMs = stored?.sensorStartTimeEpochMs,
+                    productContext = if (productPermit == null) {
+                        null
+                    } else {
+                        val identity = checkNotNull(nativeArtifactIdentity)
+                        productPermit.active.verifiedRuntimeContext(
+                            nativeBinarySetSha256 = identity.algorithmBinarySetSha256,
+                            nativeDatahandleBinarySetSha256 = identity.datahandleBinarySetSha256,
+                        )
+                    },
                 ),
                 sensitivity = sensitivity,
                 nextSensorIndex = nextSensorIndex,
@@ -401,6 +532,53 @@ private fun SensorProtocolBindingRecord.matches(
     transportCodecId == spec.transportCodecId &&
     algorithmProfile == spec.algorithmProfile.name &&
     schemaVersion == SensorProtocolBindingRecord.SCHEMA_VERSION
+
+private fun PhysicalSensorApprovalRecord.matchesStaticProductConfiguration(
+    configuration: Gs1CoreConfiguration,
+    protocolBinding: SensorProtocolBindingRecord,
+    spec: Gs1WireProfileSpec,
+): Boolean = sensorId == configuration.sensorId &&
+    bluetoothAddress == configuration.bluetoothAddress &&
+    sensorFamily == configuration.family &&
+    transportVariant == configuration.transportVariant &&
+    sensitivityToken == configuration.packageCode &&
+    wireProfile == spec.wireProfile.name &&
+    transportProtocol == spec.transportProtocol &&
+    transportCodecId == spec.transportCodecId &&
+    algorithmProfile == spec.algorithmProfile.name &&
+    protocolEvidenceKind == protocolBinding.evidenceKind &&
+    protocolEvidenceSha256 == protocolBinding.evidenceSha256 &&
+    sensitivityEncoding == protocolBinding.sensitivityEncoding &&
+    checkpointSchemaVersion == SibionicsAlgorithmSession.CHECKPOINT_SCHEMA_VERSION
+
+private fun PhysicalSensorApprovalRecord.matchesDynamicProductConfiguration(
+    sensitivity: DecodedSensitivity,
+    initializationMode: AlgorithmInitializationMode,
+    nativeBinarySetId: String,
+    nativeAlgorithmVersion: String,
+): Boolean = sensitivityToken == sensitivity.token.value &&
+    sensitivityTokenSource == sensitivity.token.source.name &&
+    sensitivityCoefficient == sensitivity.coefficient.toDouble() &&
+    sensitivityEncoding == sensitivity.encoding.name &&
+    this.initializationMode == initializationMode.name &&
+    binarySetId == nativeBinarySetId &&
+    algorithmVersion == nativeAlgorithmVersion
+
+private fun SensorAlgorithmCheckpointRecord.matchesApprovalAnchor(
+    approval: PhysicalSensorApprovalRecord,
+): Boolean = publicationApprovalId == null &&
+    sequence == approval.approvedSequence &&
+    sensorTimeEpochMs == approval.approvedSensorTimeEpochMs &&
+    sensorStartTimeEpochMs == approval.sensorStartTimeEpochMs &&
+    stateSha256 == approval.approvedCheckpointStateSha256 &&
+    displayOffsetMmolL == approval.displayOffsetMmolL
+
+private fun SensorAlgorithmCheckpointRecord.matchesApprovedLineage(
+    approval: PhysicalSensorApprovalRecord,
+): Boolean = publicationApprovalId == approval.approvalId &&
+    sensorStartTimeEpochMs == approval.sensorStartTimeEpochMs &&
+    sequence > approval.approvedSequence &&
+    sensorTimeEpochMs >= approval.approvedSensorTimeEpochMs
 
 private fun DecodedSensitivity.initializationMode(): AlgorithmInitializationMode =
     when (encoding) {

@@ -19,9 +19,13 @@ services:
       APP_ENV: development
       HTTP_ADDRESS: :8080
       DATABASE_URL: postgres://sladkaya:${POSTGRES_PASSWORD:-local-development-only}@postgres:5432/sladkaya?sslmode=disable
-      DEVICE_TOKEN: ${DEVICE_TOKEN:-dev-device-token}
-      FAMILY_SESSION_TOKEN: ${FAMILY_SESSION_TOKEN:-dev-family-token}
+      DEVICE_TOKEN: ${DEVICE_TOKEN:-sladkaya-local-device-token-not-a-secret-0001}
+      FAMILY_SESSION_TOKEN: ${FAMILY_SESSION_TOKEN:-sladkaya-local-family-token-not-a-secret-0001}
       PATIENT_ID: ${PATIENT_ID:-00000000-0000-4000-8000-000000000001}
+      BOOTSTRAP_DEVICE_ID: ${BOOTSTRAP_DEVICE_ID:-00000000-0000-4000-8000-000000000200}
+      BACKEND_BINDING_ID: ${BACKEND_BINDING_ID:-backend-binding-development-1}
+      CREDENTIAL_ID: ${CREDENTIAL_ID:-device-credential-development-1}
+      CREDENTIAL_REVISION: ${CREDENTIAL_REVISION:-1}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_IDS: ${TELEGRAM_CHAT_IDS:-}
     depends_on:

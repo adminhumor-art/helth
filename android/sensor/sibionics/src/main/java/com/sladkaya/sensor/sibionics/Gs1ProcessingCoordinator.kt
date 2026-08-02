@@ -1,6 +1,7 @@
 package com.sladkaya.sensor.sibionics
 
 import com.sladkaya.core.data.AtomicSensorCoreRecord
+import com.sladkaya.core.data.ProductPublicationContext
 import com.sladkaya.core.data.RawSensorSampleRecord
 import com.sladkaya.core.data.SensorAlgorithmCheckpointRecord
 import com.sladkaya.core.data.SensorAlgorithmResultRecord
@@ -10,10 +11,12 @@ import com.sladkaya.core.data.SensorFailureCommitResult
 import com.sladkaya.core.data.SensorIngestionFailureRecord
 import com.sladkaya.core.model.ReadingQuality
 import com.sladkaya.core.model.SensorFamily
+import com.sladkaya.core.model.GlucoseReading
 import com.sladkaya.sensor.sibionics.algorithm.AlgorithmCheckpoint
 import com.sladkaya.sensor.sibionics.algorithm.AlgorithmCommitResult
 import com.sladkaya.sensor.sibionics.algorithm.AlgorithmErrorCode
 import com.sladkaya.sensor.sibionics.algorithm.AlgorithmOutput
+import com.sladkaya.sensor.sibionics.algorithm.AlgorithmProfile
 import com.sladkaya.sensor.sibionics.algorithm.AlgorithmStepResult
 import com.sladkaya.sensor.sibionics.algorithm.DecodedSensitivity
 import com.sladkaya.sensor.sibionics.algorithm.SibionicsAlgorithmSession
@@ -32,16 +35,43 @@ internal sealed interface Gs1ProcessingResult {
         val candidate: Gs1DiagnosticReading,
     ) : Gs1ProcessingResult
 
+    data class ProductPublicationReady(
+        val publication: Gs1ProductPublication,
+    ) : Gs1ProcessingResult
+
+    /** Approved state advanced, but no medical value was published. */
+    data class ApprovedCheckpointOnly(
+        val sequence: Long,
+        val quality: ReadingQuality,
+    ) : Gs1ProcessingResult
+
     data class Rejected(
         val code: String,
         val message: String,
         val checkpointCommitted: Boolean = false,
-    ) : Gs1ProcessingResult
+        val terminalAfterCommit: Boolean = false,
+    ) : Gs1ProcessingResult {
+        init {
+            require(!terminalAfterCommit || checkpointCommitted)
+        }
+    }
 
     data class PersistenceUnavailable(val message: String) : Gs1ProcessingResult
     data class StorageConflict(val reason: String) : Gs1ProcessingResult
     data class Closed(val reason: String) : Gs1ProcessingResult
     data object NoPendingCommit : Gs1ProcessingResult
+}
+
+class Gs1ProductPublication internal constructor(
+    val reading: GlucoseReading,
+    val approvalId: String,
+    val publicationBindingId: String,
+) {
+    init {
+        require(reading.quality == ReadingQuality.VALID)
+        require(SHA256_HEX.matches(approvalId))
+        require(SHA256_HEX.matches(publicationBindingId))
+    }
 }
 
 data class Gs1DiagnosticReading(
@@ -71,11 +101,15 @@ internal class Gs1ProcessingCoordinator(
     private val store: SensorCoreStore,
     private val transportProtocol: String,
     private val transportCodecId: String,
+    private val algorithmProfile: AlgorithmProfile,
+    initialSensorStartTimeEpochMs: Long? = null,
+    private val productContext: ProductPublicationContext? = null,
     private val phoneClock: () -> Long = System::currentTimeMillis,
 ) : AutoCloseable, Gs1SampleProcessor {
     private val mutex = Mutex()
     private var pending: PendingCommit? = null
     private var pendingFailure: PendingFailure? = null
+    private var sensorStartTimeEpochMs: Long? = initialSensorStartTimeEpochMs
     private var closed = false
 
     init {
@@ -83,13 +117,20 @@ internal class Gs1ProcessingCoordinator(
         require(CANONICAL_BLUETOOTH_ADDRESS.matches(bluetoothAddress))
         require(family == SensorFamily.SIBIONICS_GS1 || family == SensorFamily.SIBIONICS_GS1SB)
         require(transportVariant >= 0)
+        require(initialSensorStartTimeEpochMs == null || initialSensorStartTimeEpochMs > 0L)
+        require(
+            transportProtocol == "GS1_V120" && algorithmProfile == AlgorithmProfile.V116A ||
+                transportProtocol == "GS1_V115" && algorithmProfile == AlgorithmProfile.V115G,
+        )
     }
 
     override suspend fun process(
+        sourceIngressId: String,
         encryptedPacket: ByteArray,
         sample: DecodedGs1RawSample,
         receivedAtEpochMs: Long,
     ): Gs1ProcessingResult = mutex.withLock {
+        require(sourceIngressId.isNotBlank() && sourceIngressId.length <= MAX_INGRESS_ID_CHARS)
         if (closed) return@withLock Gs1ProcessingResult.Closed("Sensor processing session is closed")
         if (pendingFailure != null) {
             return@withLock Gs1ProcessingResult.PersistenceUnavailable(
@@ -136,29 +177,64 @@ internal class Gs1ProcessingCoordinator(
             )
         }
 
+        val sensorTimeMs = sample.sensorTimeEpochSeconds * MILLIS_PER_SECOND
+        val resolvedSensorStartTimeMs = sensorStartTimeEpochMs ?: run {
+            val elapsedSinceStartMs = sample.index.toLong() * MILLIS_PER_SENSOR_SAMPLE
+            sensorTimeMs - elapsedSinceStartMs
+        }
+        if (resolvedSensorStartTimeMs <= 0L || resolvedSensorStartTimeMs > sensorTimeMs) {
+            closed = true
+            algorithm.close()
+            return@withLock rejectAndRecord(
+                encryptedPacket = packet,
+                sample = sample,
+                phoneTime = phoneTime,
+                code = "INVALID_SENSOR_START_TIME",
+                message = "Sensor start time cannot be derived from the durable sample provenance",
+                nativeStateMayHaveChanged = false,
+            )
+        }
+        if (algorithmProfile == AlgorithmProfile.V116A &&
+            sensorTimeMs - resolvedSensorStartTimeMs !=
+            sample.index.toLong() * MILLIS_PER_SENSOR_SAMPLE
+        ) {
+            closed = true
+            algorithm.close()
+            return@withLock rejectAndRecord(
+                encryptedPacket = packet,
+                sample = sample,
+                phoneTime = phoneTime,
+                code = "SENSOR_START_TIME_MISMATCH",
+                message = "V116A sample time does not match the durable sensor start",
+                nativeStateMayHaveChanged = false,
+            )
+        }
+
         val step = algorithm.process(algorithmInput)
 
         when (step) {
             is AlgorithmStepResult.Success -> {
-                val sensorTimeMs = sample.sensorTimeEpochSeconds * MILLIS_PER_SECOND
                 val ageMs = phoneTime - sensorTimeMs
                 val realtime = sample.reindex == 0 && ageMs in 0 until MAX_REALTIME_AGE_MS
                 val quality = when {
-                    sample.index <= WARMUP_MINUTES -> ReadingQuality.WARMING_UP
-                    realtime -> ReadingQuality.VALID
-                    else -> ReadingQuality.DEGRADED
+                    !realtime -> ReadingQuality.DEGRADED
+                    algorithmProfile == AlgorithmProfile.V116A &&
+                        sensorTimeMs <= resolvedSensorStartTimeMs +
+                        V116A_WARMUP_MINUTES * MILLIS_PER_SENSOR_SAMPLE ->
+                        ReadingQuality.WARMING_UP
+                    else -> ReadingQuality.VALID
                 }
-                val completedResult = Gs1ProcessingResult.Diagnostic(
-                    step.output.toDiagnosticReading(sample, phoneTime, quality),
-                )
                 val record = try {
                     buildRecord(
+                        sourceIngressId = sourceIngressId,
                         encryptedPacket = packet,
                         sample = sample,
                         phoneTime = phoneTime,
                         output = step.output,
                         checkpoint = step.checkpoint,
                         algorithmErrorCode = null,
+                        quality = quality,
+                        sensorStartTimeEpochMs = resolvedSensorStartTimeMs,
                     )
                 } catch (failure: Exception) {
                     closed = true
@@ -172,10 +248,29 @@ internal class Gs1ProcessingCoordinator(
                         nativeStateMayHaveChanged = true,
                     )
                 }
+                val completedResult = if (productContext == null) {
+                    Gs1ProcessingResult.Diagnostic(
+                        step.output.toDiagnosticReading(sample, phoneTime, quality),
+                    )
+                } else if (quality == ReadingQuality.VALID) {
+                    Gs1ProcessingResult.ProductPublicationReady(
+                        Gs1ProductPublication(
+                            reading = checkNotNull(record.measurement),
+                            approvalId = productContext.approvalId,
+                            publicationBindingId = productContext.publicationBindingId,
+                        ),
+                    )
+                } else {
+                    Gs1ProcessingResult.ApprovedCheckpointOnly(
+                        sequence = sample.index.toLong(),
+                        quality = quality,
+                    )
+                }
                 pending = PendingCommit(
                     record = record,
                     checkpoint = step.checkpoint,
                     completedResult = completedResult,
+                    sensorStartTimeEpochMs = resolvedSensorStartTimeMs,
                 )
                 commitPendingLocked()
             }
@@ -200,12 +295,15 @@ internal class Gs1ProcessingCoordinator(
                 }
                 val record = try {
                     buildRecord(
+                        sourceIngressId = sourceIngressId,
                         encryptedPacket = packet,
                         sample = sample,
                         phoneTime = phoneTime,
                         output = diagnostic,
                         checkpoint = checkpoint,
                         algorithmErrorCode = step.error.code.name,
+                        quality = null,
+                        sensorStartTimeEpochMs = resolvedSensorStartTimeMs,
                     )
                 } catch (failure: Exception) {
                     closed = true
@@ -226,7 +324,10 @@ internal class Gs1ProcessingCoordinator(
                         code = step.error.code.name,
                         message = step.error.message,
                         checkpointCommitted = true,
+                        terminalAfterCommit = productContext != null,
                     ),
+                    sensorStartTimeEpochMs = resolvedSensorStartTimeMs,
+                    closeAfterCommit = productContext != null,
                 )
                 commitPendingLocked()
             }
@@ -237,7 +338,24 @@ internal class Gs1ProcessingCoordinator(
     internal suspend fun process(
         encryptedPacket: ByteArray,
         sample: DecodedGs1RawSample,
-    ): Gs1ProcessingResult = process(encryptedPacket, sample, phoneClock())
+    ): Gs1ProcessingResult = process(
+        sourceIngressId = UNIT_TEST_INGRESS_ID,
+        encryptedPacket = encryptedPacket,
+        sample = sample,
+        receivedAtEpochMs = phoneClock(),
+    )
+
+    /** Unit-test seam; production packet flow always supplies its durable ingress identity. */
+    internal suspend fun process(
+        encryptedPacket: ByteArray,
+        sample: DecodedGs1RawSample,
+        receivedAtEpochMs: Long,
+    ): Gs1ProcessingResult = process(
+        sourceIngressId = UNIT_TEST_INGRESS_ID,
+        encryptedPacket = encryptedPacket,
+        sample = sample,
+        receivedAtEpochMs = receivedAtEpochMs,
+    )
 
     override suspend fun retryPendingCommit(): Gs1ProcessingResult = mutex.withLock {
         if (pendingFailure != null) return@withLock commitPendingFailureLocked()
@@ -273,6 +391,11 @@ internal class Gs1ProcessingCoordinator(
         return when (val confirmation = algorithm.confirmPersisted(value.checkpoint)) {
             AlgorithmCommitResult.Success -> {
                 pending = null
+                sensorStartTimeEpochMs = value.sensorStartTimeEpochMs
+                if (value.closeAfterCommit) {
+                    closed = true
+                    algorithm.close()
+                }
                 value.completedResult
             }
 
@@ -376,12 +499,15 @@ internal class Gs1ProcessingCoordinator(
     }
 
     private fun buildRecord(
+        sourceIngressId: String,
         encryptedPacket: ByteArray,
         sample: DecodedGs1RawSample,
         phoneTime: Long,
         output: AlgorithmOutput,
         checkpoint: AlgorithmCheckpoint,
         algorithmErrorCode: String?,
+        quality: ReadingQuality?,
+        sensorStartTimeEpochMs: Long,
     ): AtomicSensorCoreRecord {
         require(checkpoint.sensitivityToken == sensitivity.token) {
             "Decoded sensitivity does not belong to the active algorithm token"
@@ -390,6 +516,7 @@ internal class Gs1ProcessingCoordinator(
         val eventId = eventId(sample)
         val raw = RawSensorSampleRecord(
             eventId = eventId,
+            sourceIngressId = sourceIngressId,
             sensorId = sensorId,
             sensorFamily = family,
             sequence = sample.index,
@@ -404,6 +531,10 @@ internal class Gs1ProcessingCoordinator(
             sensorTimeWasClamped = sample.sensorTimeWasClamped,
             addTimeSeconds = sample.addTimeSeconds,
         )
+        val publishable = productContext != null &&
+            algorithmErrorCode == null &&
+            quality == ReadingQuality.VALID
+        val publicationApprovalId = productContext?.approvalId
         val result = SensorAlgorithmResultRecord(
             eventId = eventId,
             sensorId = sensorId,
@@ -423,9 +554,10 @@ internal class Gs1ProcessingCoordinator(
             sensitivityCoefficient = sensitivity.coefficient.toDouble(),
             sensitivityEncoding = sensitivity.encoding.name,
             initializationMode = checkpoint.initializationMode.name,
-            publishable = false,
-            alarmEligible = false,
+            publishable = publishable,
+            alarmEligible = publishable,
             algorithmErrorCode = algorithmErrorCode,
+            publicationApprovalId = publicationApprovalId,
         )
         val savedCheckpoint = SensorAlgorithmCheckpointRecord(
             sensorId = sensorId,
@@ -436,6 +568,7 @@ internal class Gs1ProcessingCoordinator(
             transportCodecId = transportCodecId,
             sequence = checkpoint.lastProcessedIndex,
             sensorTimeEpochMs = checkpoint.lastSensorTimeEpochSeconds * MILLIS_PER_SECOND,
+            sensorStartTimeEpochMs = sensorStartTimeEpochMs,
             algorithmProfile = checkpoint.profile.name,
             algorithmVersion = checkpoint.algorithmVersion,
             binarySetId = checkpoint.binarySetId,
@@ -448,8 +581,21 @@ internal class Gs1ProcessingCoordinator(
             stateSha256 = checkpoint.nativeStateSha256,
             displayOffsetMmolL = checkpoint.displayOffsetMmolL,
             schemaVersion = checkpoint.schemaVersion,
+            publicationApprovalId = publicationApprovalId,
         )
-        return AtomicSensorCoreRecord(raw, result, savedCheckpoint, measurement = null)
+        val measurement = if (publishable) {
+            output.toGlucoseReading(sample, phoneTime, checkNotNull(quality))
+        } else {
+            null
+        }
+        return AtomicSensorCoreRecord(
+            raw = raw,
+            result = result,
+            checkpoint = savedCheckpoint,
+            measurement = measurement,
+            publicationContext = productContext.takeIf { publishable },
+            approvedCheckpointContext = productContext?.approvedCheckpointContext(),
+        )
     }
 
     private fun AlgorithmOutput.toDiagnosticReading(
@@ -457,6 +603,22 @@ internal class Gs1ProcessingCoordinator(
         phoneTime: Long,
         quality: ReadingQuality,
     ) = Gs1DiagnosticReading(
+        eventId = eventId(sample),
+        sensorId = sensorId,
+        sensorFamily = family,
+        sensorTimeEpochMs = sample.sensorTimeEpochSeconds * MILLIS_PER_SECOND,
+        phoneTimeEpochMs = phoneTime,
+        glucoseMgDl = (glucoseMmolL * MG_DL_PER_MMOL_L).roundToInt(),
+        trendMgDlPerMinute = (trend * NATIVE_TREND_SCALE).coerceIn(-20.0, 20.0),
+        quality = quality,
+        sequence = sample.index.toLong(),
+    )
+
+    private fun AlgorithmOutput.toGlucoseReading(
+        sample: DecodedGs1RawSample,
+        phoneTime: Long,
+        quality: ReadingQuality,
+    ) = GlucoseReading(
         eventId = eventId(sample),
         sensorId = sensorId,
         sensorFamily = family,
@@ -477,6 +639,8 @@ internal class Gs1ProcessingCoordinator(
         val record: AtomicSensorCoreRecord,
         val checkpoint: AlgorithmCheckpoint,
         val completedResult: Gs1ProcessingResult,
+        val sensorStartTimeEpochMs: Long,
+        val closeAfterCommit: Boolean = false,
     )
 
     private data class PendingFailure(
@@ -486,14 +650,17 @@ internal class Gs1ProcessingCoordinator(
 
     private companion object {
         const val MAX_PACKET_BYTES = 250
+        const val MAX_INGRESS_ID_CHARS = 128
+        const val UNIT_TEST_INGRESS_ID = "unit-test-ingress:0"
         const val MAX_FAILURE_MESSAGE_CHARS = 1_024
         const val UNKNOWN_PHONE_TIME = 0L
         const val MAX_SENSOR_TIME_SECONDS = Long.MAX_VALUE / 1_000L
         const val MAX_REALTIME_AGE_MS = 330_000L
+        const val V116A_WARMUP_MINUTES = 45
+        const val MILLIS_PER_SENSOR_SAMPLE = 60_000L
         const val MG_DL_PER_MMOL_L = 18.0
         const val NATIVE_TREND_SCALE = 1.3
         const val MILLIS_PER_SECOND = 1_000L
-        const val WARMUP_MINUTES = 60
         const val TRANSPORT_PROTOCOL = "GS1_V120"
         val CANONICAL_BLUETOOTH_ADDRESS = Regex("^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$")
         val TERMINAL_ALGORITHM_ERRORS = setOf(
@@ -509,6 +676,8 @@ internal class Gs1ProcessingCoordinator(
         )
     }
 }
+
+private val SHA256_HEX = Regex("^[0-9a-f]{64}$")
 
 private fun ByteArray.sha256(): String = MessageDigest.getInstance("SHA-256")
     .digest(this)

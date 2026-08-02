@@ -26,6 +26,7 @@ internal data class Gs1PendingIngressRecoveryEntry(
     val projectedCursorAfter: Int,
     val firstIndex: Int? = null,
     val lastIndex: Int? = null,
+    val expectedSamples: List<DecodedGs1RawSample> = emptyList(),
     val detail: String? = null,
 ) {
     fun encryptedPacketCopy(): ByteArray = record.encryptedPacketCopy()
@@ -213,6 +214,7 @@ internal class Gs1PendingIngressRecoveryPlanner(
             cursor = projectedCursor,
             firstIndex = first,
             lastIndex = last,
+            expectedSamples = samples,
         )
     }
 
@@ -222,6 +224,7 @@ internal class Gs1PendingIngressRecoveryPlanner(
         cursor: Int,
         firstIndex: Int? = null,
         lastIndex: Int? = null,
+        expectedSamples: List<DecodedGs1RawSample> = emptyList(),
         detail: String? = null,
     ) = Gs1PendingIngressRecoveryEntry(
         record = record,
@@ -230,6 +233,7 @@ internal class Gs1PendingIngressRecoveryPlanner(
         projectedCursorAfter = cursor,
         firstIndex = firstIndex,
         lastIndex = lastIndex,
+        expectedSamples = expectedSamples.toList(),
         detail = detail,
     )
 

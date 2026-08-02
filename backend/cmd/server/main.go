@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -17,6 +20,13 @@ import (
 	"glucose-monitor/backend/internal/httpapi"
 	"glucose-monitor/backend/internal/store"
 	"glucose-monitor/backend/internal/telegram"
+)
+
+const (
+	stalenessMaxConcurrency = 4
+	stalenessListTimeout    = 5 * time.Second
+	stalenessPatientTimeout = 5 * time.Second
+	deliveryCycleTimeout    = 90 * time.Second
 )
 
 func main() {
@@ -38,10 +48,6 @@ func main() {
 			logger.Error("initialize postgres schema", "error", err)
 			os.Exit(1)
 		}
-		if err := postgres.Bootstrap(context.Background(), config.patientID); err != nil {
-			logger.Error("bootstrap postgres", "error", err)
-			os.Exit(1)
-		}
 		values = postgres
 		closeStore = postgres.Close
 	} else {
@@ -49,17 +55,35 @@ func main() {
 		closeStore = func() {}
 	}
 	defer closeStore()
+	if config.hasBootstrapAccess() {
+		bootstrapper, ok := values.(interface {
+			BootstrapAccess(context.Context, store.BootstrapIdentity) error
+		})
+		if !ok {
+			logger.Error("access bootstrap is not supported by the configured store")
+			os.Exit(1)
+		}
+		if err := bootstrapper.BootstrapAccess(context.Background(), config.bootstrapIdentity()); err != nil {
+			logger.Error("bootstrap development access", "error", err)
+			os.Exit(1)
+		}
+	}
 	engine := alerts.NewEngine(alerts.DefaultThresholds())
 	api := httpapi.New(httpapi.Config{
-		DeviceToken: config.deviceToken, FamilySessionToken: config.familyToken,
-		PatientID: config.patientID, Logger: logger, TelegramRecipients: config.telegramChatIDs,
+		Logger: logger,
 	}, values, engine)
-	deliveryWorker := delivery.NewWorker(values, telegram.Client{Token: config.telegramToken}, logger)
 	startupAt := time.Now().UTC()
-	if err := api.PrimePatient(context.Background(), config.patientID, startupAt); err != nil {
-		logger.Error("prime patient alert state", "error", err)
-		os.Exit(1)
+	if config.production {
+		if err := values.ValidateProductionAccess(context.Background(), startupAt); err != nil {
+			logger.Error("production access is not fully provisioned", "error", err)
+			os.Exit(1)
+		}
+		if err := validateProductionNotifications(context.Background(), config, values); err != nil {
+			logger.Error("production notifications are not fully configured", "error", err)
+			os.Exit(1)
+		}
 	}
+	deliveryWorker := delivery.NewWorker(values, telegram.Client{Token: config.telegramToken}, logger)
 
 	server := &http.Server{
 		Addr: config.address, Handler: api.Handler(),
@@ -77,8 +101,21 @@ func main() {
 			schedulerCtx,
 			30*time.Second,
 			2*time.Second,
-			func(ctx context.Context, at time.Time) { api.CheckStaleness(ctx, config.patientID, at) },
-			func(ctx context.Context, _ time.Time) { deliveryWorker.RunOnce(ctx, time.Now().UTC()) },
+			func(ctx context.Context, at time.Time) {
+				patientIDs, err := loadPatientIDsForStaleness(ctx, stalenessListTimeout, values.PatientIDs)
+				if err != nil {
+					logger.Error("list patients for signal freshness", "error", err)
+					return
+				}
+				checkPatientsStaleness(
+					ctx, patientIDs, at,
+					stalenessMaxConcurrency, stalenessPatientTimeout,
+					api.CheckStaleness,
+				)
+			},
+			func(ctx context.Context, _ time.Time) {
+				runBoundedDeliveryCycle(ctx, deliveryCycleTimeout, time.Now().UTC(), deliveryWorker.RunOnce)
+			},
 		)
 		close(schedulersDone)
 	}()
@@ -100,6 +137,84 @@ func main() {
 	case <-ctx.Done():
 		logger.Error("background schedulers did not stop", "error", ctx.Err())
 	}
+}
+
+func loadPatientIDsForStaleness(
+	ctx context.Context,
+	timeout time.Duration,
+	load func(context.Context) ([]string, error),
+) ([]string, error) {
+	boundedCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return load(boundedCtx)
+}
+
+func runBoundedDeliveryCycle(
+	ctx context.Context,
+	timeout time.Duration,
+	at time.Time,
+	run func(context.Context, time.Time),
+) {
+	boundedCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	run(boundedCtx, at)
+}
+
+type telegramRecipientReadiness interface {
+	HasTelegramRecipients(context.Context) (bool, error)
+}
+
+func validateProductionNotifications(ctx context.Context, config appConfig, readiness telegramRecipientReadiness) error {
+	if !config.production {
+		return nil
+	}
+	hasRecipients, err := readiness.HasTelegramRecipients(ctx)
+	if err != nil {
+		return fmt.Errorf("check database Telegram recipients: %w", err)
+	}
+	if hasRecipients && strings.TrimSpace(config.telegramToken) == "" {
+		return errors.New("TELEGRAM_BOT_TOKEN is required because database Telegram recipients are configured")
+	}
+	return nil
+}
+
+func checkPatientsStaleness(
+	ctx context.Context,
+	patientIDs []string,
+	at time.Time,
+	maxConcurrency int,
+	perPatientTimeout time.Duration,
+	check func(context.Context, string, time.Time),
+) {
+	if len(patientIDs) == 0 || maxConcurrency <= 0 {
+		return
+	}
+	if maxConcurrency > len(patientIDs) {
+		maxConcurrency = len(patientIDs)
+	}
+	jobs := make(chan string)
+	var workers sync.WaitGroup
+	workers.Add(maxConcurrency)
+	for worker := 0; worker < maxConcurrency; worker++ {
+		go func() {
+			defer workers.Done()
+			for patientID := range jobs {
+				patientCtx, cancel := context.WithTimeout(ctx, perPatientTimeout)
+				check(patientCtx, patientID, at)
+				cancel()
+			}
+		}()
+	}
+sendPatients:
+	for _, patientID := range patientIDs {
+		select {
+		case jobs <- patientID:
+		case <-ctx.Done():
+			break sendPatients
+		}
+	}
+	close(jobs)
+	workers.Wait()
 }
 
 func runSchedulers(
@@ -140,15 +255,21 @@ func runScheduler(ctx context.Context, interval time.Duration, task func(context
 }
 
 type appConfig struct {
-	environment     string
-	address         string
-	production      bool
-	deviceToken     string
-	familyToken     string
-	patientID       string
-	telegramToken   string
-	telegramChatIDs []string
-	databaseURL     string
+	environment                 string
+	address                     string
+	production                  bool
+	bootstrapDeviceToken        string
+	bootstrapFamilyToken        string
+	bootstrapPatientID          string
+	bootstrapHouseholdID        string
+	bootstrapDeviceID           string
+	bootstrapBackendBindingID   string
+	bootstrapCredentialID       string
+	bootstrapCredentialRevision int64
+	bootstrapFamilySessionID    string
+	telegramToken               string
+	telegramChatIDs             []string
+	databaseURL                 string
 }
 
 func validateConfig(config appConfig) error {
@@ -160,26 +281,52 @@ func validateConfig(config appConfig) error {
 	if (config.environment == "production") != config.production {
 		return errors.New("APP_ENV and production mode are inconsistent")
 	}
-	if config.deviceToken != "" && config.deviceToken == config.familyToken {
-		return errors.New("DEVICE_TOKEN and FAMILY_SESSION_TOKEN must be different")
-	}
-	if !config.production {
-		return nil
-	}
-	if config.deviceToken == "" || config.familyToken == "" || config.patientID == "" {
-		return errors.New("DEVICE_TOKEN, FAMILY_SESSION_TOKEN and PATIENT_ID are required in production")
-	}
-	if config.databaseURL == "" {
+	if config.production && config.databaseURL == "" {
 		return errors.New("DATABASE_URL is required in production")
 	}
-	if !domain.IsUUID(config.patientID) {
-		return errors.New("PATIENT_ID must be a UUID in production")
+	if config.production && strings.TrimSpace(config.telegramToken) == "" {
+		return errors.New("TELEGRAM_BOT_TOKEN is required in production")
 	}
-	if len(config.deviceToken) < 32 || len(config.familyToken) < 32 {
-		return errors.New("DEVICE_TOKEN and FAMILY_SESSION_TOKEN must each contain at least 32 characters in production")
+	if config.production && config.hasBootstrapAccess() {
+		return errors.New("plaintext startup access provisioning is forbidden in production")
+	}
+	if !config.production && config.hasBootstrapAccess() {
+		if config.bootstrapDeviceToken == "" || config.bootstrapFamilyToken == "" || config.bootstrapPatientID == "" {
+			return errors.New("DEVICE_TOKEN, FAMILY_SESSION_TOKEN and PATIENT_ID must be set together for development bootstrap")
+		}
+		if err := (store.DeviceBinding{
+			DeviceID:           config.bootstrapDeviceID,
+			BackendBindingID:   config.bootstrapBackendBindingID,
+			CredentialID:       config.bootstrapCredentialID,
+			CredentialRevision: config.bootstrapCredentialRevision,
+		}).Validate(); err != nil {
+			return errors.New("development device credential binding is incomplete or malformed")
+		}
+		if config.bootstrapDeviceToken == config.bootstrapFamilyToken {
+			return errors.New("DEVICE_TOKEN and FAMILY_SESSION_TOKEN must be different")
+		}
+		if len(config.bootstrapDeviceToken) < 32 || len(config.bootstrapFamilyToken) < 32 {
+			return errors.New("development bootstrap tokens must each contain at least 32 characters")
+		}
+		for name, value := range map[string]string{
+			"PATIENT_ID":                  config.bootstrapPatientID,
+			"BOOTSTRAP_HOUSEHOLD_ID":      config.bootstrapHouseholdID,
+			"BOOTSTRAP_DEVICE_ID":         config.bootstrapDeviceID,
+			"BOOTSTRAP_FAMILY_SESSION_ID": config.bootstrapFamilySessionID,
+		} {
+			if !domain.IsUUID(value) {
+				return errors.New(name + " must be a UUID")
+			}
+		}
+	}
+	if !config.production && config.databaseURL == "" && !config.hasBootstrapAccess() {
+		return errors.New("development memory store requires explicit access bootstrap credentials")
 	}
 	if len(config.telegramChatIDs) > 0 && config.telegramToken == "" {
 		return errors.New("TELEGRAM_BOT_TOKEN is required when TELEGRAM_CHAT_IDS is configured")
+	}
+	if len(config.telegramChatIDs) > 0 && !config.hasBootstrapAccess() {
+		return errors.New("TELEGRAM_CHAT_IDS is allowed only for an explicit development household bootstrap")
 	}
 	return nil
 }
@@ -189,13 +336,54 @@ func loadConfig() appConfig {
 	return appConfig{
 		environment: environment,
 		address:     env("HTTP_ADDRESS", ":8080"), production: environment == "production",
-		deviceToken:     env("DEVICE_TOKEN", developmentOnly(environment, "dev-device-token")),
-		familyToken:     env("FAMILY_SESSION_TOKEN", developmentOnly(environment, "dev-family-token")),
-		patientID:       env("PATIENT_ID", developmentOnly(environment, "00000000-0000-4000-8000-000000000001")),
-		telegramToken:   os.Getenv("TELEGRAM_BOT_TOKEN"),
-		telegramChatIDs: splitCSV(os.Getenv("TELEGRAM_CHAT_IDS")),
-		databaseURL:     strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		bootstrapDeviceToken:        strings.TrimSpace(os.Getenv("DEVICE_TOKEN")),
+		bootstrapFamilyToken:        strings.TrimSpace(os.Getenv("FAMILY_SESSION_TOKEN")),
+		bootstrapPatientID:          strings.TrimSpace(os.Getenv("PATIENT_ID")),
+		bootstrapHouseholdID:        env("BOOTSTRAP_HOUSEHOLD_ID", developmentOnly(environment, "00000000-0000-4000-8000-000000000100")),
+		bootstrapDeviceID:           env("BOOTSTRAP_DEVICE_ID", developmentOnly(environment, "00000000-0000-4000-8000-000000000200")),
+		bootstrapBackendBindingID:   strings.TrimSpace(os.Getenv("BACKEND_BINDING_ID")),
+		bootstrapCredentialID:       strings.TrimSpace(os.Getenv("CREDENTIAL_ID")),
+		bootstrapCredentialRevision: envInt64("CREDENTIAL_REVISION"),
+		bootstrapFamilySessionID:    env("BOOTSTRAP_FAMILY_SESSION_ID", developmentOnly(environment, "00000000-0000-4000-8000-000000000300")),
+		telegramToken:               strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN")),
+		telegramChatIDs:             splitCSV(os.Getenv("TELEGRAM_CHAT_IDS")),
+		databaseURL:                 strings.TrimSpace(os.Getenv("DATABASE_URL")),
 	}
+}
+
+func (c appConfig) hasBootstrapAccess() bool {
+	return c.bootstrapDeviceToken != "" || c.bootstrapFamilyToken != "" || c.bootstrapPatientID != "" ||
+		c.bootstrapBackendBindingID != "" || c.bootstrapCredentialID != "" || c.bootstrapCredentialRevision != 0
+}
+
+func (c appConfig) bootstrapIdentity() store.BootstrapIdentity {
+	return store.BootstrapIdentity{
+		HouseholdID: canonicalUUID(c.bootstrapHouseholdID), PatientID: canonicalUUID(c.bootstrapPatientID),
+		DeviceID: canonicalUUID(c.bootstrapDeviceID), DeviceTokenHash: store.HashAccessToken(c.bootstrapDeviceToken),
+		BackendBindingID: c.bootstrapBackendBindingID, CredentialID: c.bootstrapCredentialID,
+		CredentialRevision: c.bootstrapCredentialRevision,
+		FamilySessionID:    canonicalUUID(c.bootstrapFamilySessionID), FamilyTokenHash: store.HashAccessToken(c.bootstrapFamilyToken),
+		TelegramRecipients: c.telegramChatIDs,
+	}
+}
+
+func canonicalUUID(value string) string {
+	if domain.IsUUID(value) {
+		return strings.ToLower(value)
+	}
+	return value
+}
+
+func envInt64(name string) int64 {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return 0
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return parsed
 }
 
 func developmentOnly(environment, value string) string {

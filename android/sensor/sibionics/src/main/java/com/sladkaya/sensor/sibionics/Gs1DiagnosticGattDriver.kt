@@ -14,12 +14,16 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.SystemClock
 import androidx.core.content.ContextCompat
+import com.sladkaya.core.data.CommittedSensorIngressReader
+import com.sladkaya.core.data.RoomCommittedSensorIngressReader
 import com.sladkaya.core.data.RoomSensorPacketIngressJournal
 import com.sladkaya.core.data.SensorCoreRepository
 import com.sladkaya.core.data.SensorPacketIngressJournal
 import com.sladkaya.core.data.SensorPacketIngressMarkHandledResult
 import com.sladkaya.core.data.SensorPacketIngressOutcomeRecord
 import com.sladkaya.core.data.SensorPacketIngressOutcomeStatus
+import com.sladkaya.core.data.ProductPublicationConfigurationReader
+import com.sladkaya.core.data.ProductPublicationRepository
 import com.sladkaya.core.model.ReadingQuality
 import com.sladkaya.core.sensor.SensorConfiguration
 import com.sladkaya.sensor.sibionics.datahandle.SibionicsDataHandle
@@ -42,6 +46,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
@@ -78,19 +83,90 @@ sealed interface Gs1DiagnosticGattState {
     ) : Gs1DiagnosticGattState
 }
 
-/**
- * Android-only shell for GS1/GS1Sb diagnostics. It intentionally exposes no
- * product measurement stream.
- *
- * Every attempt owns one callback, GATT object, protocol session and bounded
- * mailbox. The stateful core is reached only through [Gs1DiagnosticRuntime].
- */
+sealed interface Gs1ProductGattState {
+    data object Idle : Gs1ProductGattState
+    data object OpeningCore : Gs1ProductGattState
+    data object Connecting : Gs1ProductGattState
+    data class ConnectingForHistoryBackfill(
+        val expectedIndex: Int,
+        val firstPendingIndex: Int?,
+        val reason: String,
+    ) : Gs1ProductGattState
+    data object DiscoveringServices : Gs1ProductGattState
+    data object Subscribing : Gs1ProductGattState
+    data object Authenticating : Gs1ProductGattState
+    data class RetryingPersistence(val attempt: Int) : Gs1ProductGattState
+    data class RetryingIngressPersistence(val attempt: Int) : Gs1ProductGattState
+    data class Reconnecting(val attempt: Int, val delayMillis: Long) : Gs1ProductGattState
+    data object PersistencePending : Gs1ProductGattState
+    data object Streaming : Gs1ProductGattState
+    data class WaitingForPublishableReading(val sequence: Long?) : Gs1ProductGattState
+    data class DataRejected(
+        val sequence: Int,
+        val code: String,
+        val detail: String,
+    ) : Gs1ProductGattState
+    data class Failed(
+        val code: String,
+        val detail: String? = null,
+        val retryable: Boolean,
+    ) : Gs1ProductGattState
+}
+
+private sealed interface Gs1GattEngineState {
+    data object Idle : Gs1GattEngineState
+    data object OpeningCore : Gs1GattEngineState
+    data object Connecting : Gs1GattEngineState
+    data class ConnectingForHistoryBackfill(
+        val expectedIndex: Int,
+        val firstPendingIndex: Int?,
+        val reason: String,
+    ) : Gs1GattEngineState
+    data object DiscoveringServices : Gs1GattEngineState
+    data object Subscribing : Gs1GattEngineState
+    data object Authenticating : Gs1GattEngineState
+    data class RetryingPersistence(val attempt: Int) : Gs1GattEngineState
+    data class RetryingIngressPersistence(val attempt: Int) : Gs1GattEngineState
+    data class Reconnecting(val attempt: Int, val delayMillis: Long) : Gs1GattEngineState
+    data object PersistencePending : Gs1GattEngineState
+    data object Streaming : Gs1GattEngineState
+    data class DataNotFresh(
+        val sequence: Long?,
+        val quality: ReadingQuality?,
+    ) : Gs1GattEngineState
+    data class DataRejected(
+        val sequence: Int,
+        val code: String,
+        val detail: String,
+    ) : Gs1GattEngineState
+    data class Failed(
+        val code: String,
+        val detail: String? = null,
+        val retryable: Boolean,
+    ) : Gs1GattEngineState
+}
+
+private class Gs1GattStatePublisher<T>(
+    initial: T,
+    private val map: (Gs1GattEngineState) -> T,
+) {
+    private val mutable = MutableStateFlow(initial)
+    val state: StateFlow<T> = mutable.asStateFlow()
+
+    fun publish(value: Gs1GattEngineState) {
+        mutable.value = map(value)
+    }
+}
+
+/** Diagnostic facade retained for onboarding and physical validation. */
 class Gs1DiagnosticGattDriver internal constructor(
     context: Context,
     factory: Gs1CoreFactory,
-    private val ingressJournal: SensorPacketIngressJournal,
-    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
-    private val elapsedClock: () -> Long = SystemClock::elapsedRealtime,
+    ingressJournal: SensorPacketIngressJournal,
+    committedIngressReader: CommittedSensorIngressReader =
+        RoomCommittedSensorIngressReader.create(context.applicationContext),
+    scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    elapsedClock: () -> Long = SystemClock::elapsedRealtime,
 ) {
     constructor(context: Context) : this(
         context = context,
@@ -98,6 +174,133 @@ class Gs1DiagnosticGattDriver internal constructor(
         ingressJournal = RoomSensorPacketIngressJournal.create(context.applicationContext),
     )
 
+    private val committedOutput = Gs1DiagnosticGattOutput()
+    private val statePublisher = Gs1GattStatePublisher<Gs1DiagnosticGattState>(
+        initial = Gs1DiagnosticGattState.Idle,
+        map = { it.toDiagnosticState() },
+    )
+    private val engine = Gs1GattEngine(
+        context = context,
+        opener = FactoryGs1RuntimeCoreOpener(factory),
+        ingressJournal = ingressJournal,
+        committedIngressReader = committedIngressReader,
+        committedOutput = committedOutput,
+        publishState = statePublisher::publish,
+        scope = scope,
+        elapsedClock = elapsedClock,
+    )
+
+    val state: StateFlow<Gs1DiagnosticGattState> = statePublisher.state
+    val latestDiagnostic: StateFlow<Gs1DiagnosticReading?> = committedOutput.latestDiagnostic
+
+    suspend fun start(profile: Gs1DiagnosticActivationProfile) = engine.start(profile)
+    suspend fun stop() = engine.stop()
+    fun requestStop() = engine.requestStop()
+}
+
+/** Product facade over the same Bluetooth engine; it never exposes diagnostics. */
+class Gs1ProductGattDriver internal constructor(
+    context: Context,
+    factory: Gs1CoreFactory,
+    configurationReader: ProductPublicationConfigurationReader,
+    ingressJournal: SensorPacketIngressJournal,
+    committedIngressReader: CommittedSensorIngressReader =
+        RoomCommittedSensorIngressReader.create(context.applicationContext),
+    scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    elapsedClock: () -> Long = SystemClock::elapsedRealtime,
+) {
+    constructor(context: Context) : this(
+        context = context,
+        factory = Gs1CoreFactory(SensorCoreRepository.create(context.applicationContext)),
+        configurationReader = ProductPublicationRepository.create(context.applicationContext),
+        ingressJournal = RoomSensorPacketIngressJournal.create(context.applicationContext),
+    )
+
+    private val committedOutput = Gs1ProductGattOutput()
+    private val statePublisher = Gs1GattStatePublisher<Gs1ProductGattState>(
+        initial = Gs1ProductGattState.Idle,
+        map = { it.toProductState() },
+    )
+    private val engine = Gs1GattEngine(
+        context = context,
+        opener = FactoryGs1ApprovedRuntimeCoreOpener(
+            factory = factory,
+            permitIssuer = Gs1ProductPermitIssuer(configurationReader),
+        ),
+        ingressJournal = ingressJournal,
+        committedIngressReader = committedIngressReader,
+        committedOutput = committedOutput,
+        publishState = statePublisher::publish,
+        scope = scope,
+        elapsedClock = elapsedClock,
+    )
+
+    val state: StateFlow<Gs1ProductGattState> = statePublisher.state
+    val committedPublicationBatches: Flow<Gs1ProductPublicationBatch> =
+        committedOutput.committedPublicationBatches
+
+    suspend fun start(profile: Gs1DiagnosticActivationProfile) = engine.start(profile)
+    suspend fun stop() = engine.stop()
+    fun requestStop() = engine.requestStop()
+}
+
+private fun Gs1GattEngineState.toDiagnosticState(): Gs1DiagnosticGattState = when (this) {
+    Gs1GattEngineState.Idle -> Gs1DiagnosticGattState.Idle
+    Gs1GattEngineState.OpeningCore -> Gs1DiagnosticGattState.OpeningCore
+    Gs1GattEngineState.Connecting -> Gs1DiagnosticGattState.Connecting
+    is Gs1GattEngineState.ConnectingForHistoryBackfill ->
+        Gs1DiagnosticGattState.ConnectingForHistoryBackfill(expectedIndex, firstPendingIndex, reason)
+    Gs1GattEngineState.DiscoveringServices -> Gs1DiagnosticGattState.DiscoveringServices
+    Gs1GattEngineState.Subscribing -> Gs1DiagnosticGattState.Subscribing
+    Gs1GattEngineState.Authenticating -> Gs1DiagnosticGattState.Authenticating
+    is Gs1GattEngineState.RetryingPersistence -> Gs1DiagnosticGattState.RetryingPersistence(attempt)
+    is Gs1GattEngineState.RetryingIngressPersistence ->
+        Gs1DiagnosticGattState.RetryingIngressPersistence(attempt)
+    is Gs1GattEngineState.Reconnecting ->
+        Gs1DiagnosticGattState.Reconnecting(attempt, delayMillis)
+    Gs1GattEngineState.PersistencePending -> Gs1DiagnosticGattState.PersistencePending
+    Gs1GattEngineState.Streaming -> Gs1DiagnosticGattState.StreamingDiagnostic
+    is Gs1GattEngineState.DataNotFresh ->
+        Gs1DiagnosticGattState.DiagnosticDataNotFresh(sequence, quality)
+    is Gs1GattEngineState.DataRejected ->
+        Gs1DiagnosticGattState.DiagnosticDataRejected(sequence, code, detail)
+    is Gs1GattEngineState.Failed -> Gs1DiagnosticGattState.Failed(code, detail, retryable)
+}
+
+private fun Gs1GattEngineState.toProductState(): Gs1ProductGattState = when (this) {
+    Gs1GattEngineState.Idle -> Gs1ProductGattState.Idle
+    Gs1GattEngineState.OpeningCore -> Gs1ProductGattState.OpeningCore
+    Gs1GattEngineState.Connecting -> Gs1ProductGattState.Connecting
+    is Gs1GattEngineState.ConnectingForHistoryBackfill ->
+        Gs1ProductGattState.ConnectingForHistoryBackfill(expectedIndex, firstPendingIndex, reason)
+    Gs1GattEngineState.DiscoveringServices -> Gs1ProductGattState.DiscoveringServices
+    Gs1GattEngineState.Subscribing -> Gs1ProductGattState.Subscribing
+    Gs1GattEngineState.Authenticating -> Gs1ProductGattState.Authenticating
+    is Gs1GattEngineState.RetryingPersistence -> Gs1ProductGattState.RetryingPersistence(attempt)
+    is Gs1GattEngineState.RetryingIngressPersistence ->
+        Gs1ProductGattState.RetryingIngressPersistence(attempt)
+    is Gs1GattEngineState.Reconnecting -> Gs1ProductGattState.Reconnecting(attempt, delayMillis)
+    Gs1GattEngineState.PersistencePending -> Gs1ProductGattState.PersistencePending
+    Gs1GattEngineState.Streaming -> Gs1ProductGattState.Streaming
+    is Gs1GattEngineState.DataNotFresh -> Gs1ProductGattState.WaitingForPublishableReading(sequence)
+    is Gs1GattEngineState.DataRejected -> Gs1ProductGattState.DataRejected(sequence, code, detail)
+    is Gs1GattEngineState.Failed -> Gs1ProductGattState.Failed(code, detail, retryable)
+}
+
+/**
+ * Every attempt owns one callback, GATT object, protocol session and bounded
+ * mailbox. The stateful core is reached only through [Gs1DiagnosticRuntime].
+ */
+private class Gs1GattEngine(
+    context: Context,
+    opener: Gs1RuntimeCoreOpener,
+    private val ingressJournal: SensorPacketIngressJournal,
+    private val committedIngressReader: CommittedSensorIngressReader,
+    private val committedOutput: Gs1GattCommittedOutput,
+    private val publishState: (Gs1GattEngineState) -> Unit,
+    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    private val elapsedClock: () -> Long = SystemClock::elapsedRealtime,
+) {
     private val appContext = context.applicationContext
     private val bluetoothManager: BluetoothManager? =
         appContext.getSystemService(BluetoothManager::class.java)
@@ -114,27 +317,60 @@ class Gs1DiagnosticGattDriver internal constructor(
     private val desired = AtomicReference<DesiredConnection?>(null)
     private val reconnectGate = Gs1ReconnectGate()
     private val durableIngress = Gs1DurableIngress(ingressJournal)
-
-    private val mutableState = MutableStateFlow<Gs1DiagnosticGattState>(Gs1DiagnosticGattState.Idle)
-    val state: StateFlow<Gs1DiagnosticGattState> = mutableState.asStateFlow()
-
-    private val mutableLatestDiagnostic = MutableStateFlow<Gs1DiagnosticReading?>(null)
-    val latestDiagnostic: StateFlow<Gs1DiagnosticReading?> = mutableLatestDiagnostic.asStateFlow()
+    private val durableCommitGate = Gs1GattDurableCommitGate(committedOutput)
+    private val committedEventValidator =
+        Gs1CommittedIngressEventValidator(committedIngressReader)
+    private val unresolvedLiveSettler = Gs1UnresolvedLiveSettler(
+        journal = ingressJournal,
+        committedEventValidator = committedEventValidator,
+    )
 
     private val coreRuntime = Gs1DiagnosticRuntime(
         scope = scope,
-        opener = FactoryGs1RuntimeCoreOpener(factory),
+        opener = opener,
         eventSink = ::onCoreEvent,
     )
     private val pendingIngressRecovery = Gs1PendingIngressRecovery(
         journal = ingressJournal,
+        committedIngressReader = committedIngressReader,
         codec = codec,
         replay = coreRuntime::submitAndAwait,
+        onValidatedCommit = { event ->
+            val roomEvent = when (val validated = committedEventValidator.validate(event)) {
+                is Gs1CommittedIngressEventValidation.Accepted -> validated.event
+                is Gs1CommittedIngressEventValidation.Failed -> throw
+                    Gs1CommittedDeliveryUnavailableException(
+                        code = validated.code,
+                        detail = validated.detail,
+                        retryable = validated.retryable,
+                    )
+            }
+            when (val delivered = durableCommitGate.dispatchValidatedRecovery(roomEvent)) {
+                is Gs1GattDurableCommitResult.Accepted -> Unit
+                is Gs1GattDurableCommitResult.Rejected -> throw
+                    Gs1CommittedDeliveryUnavailableException(
+                        code = delivered.code,
+                        detail = delivered.detail,
+                        retryable = delivered.retryable,
+                    )
+            }
+        },
+    )
+    private val liveIngressDuplicateGate = Gs1LiveIngressDuplicateGate(
+        journal = ingressJournal,
+        committedIngressReader = committedIngressReader,
+        codec = codec,
     )
 
     suspend fun start(profile: Gs1DiagnosticActivationProfile) {
         lifecycle.withLock {
-            desired.getAndSet(null)?.let { reconnectGate.stop(it.reconnectToken) }
+            committedOutput.abortPendingApplications(
+                Gs1ProductLocalEffectsFailureCode.APPLICATION_STOPPED,
+            )
+            desired.getAndSet(null)?.let {
+                it.stopRequested.set(true)
+                reconnectGate.stop(it.reconnectToken)
+            }
             val requested = DesiredConnection(
                 profile = profile,
                 reconnectToken = reconnectGate.begin(),
@@ -150,21 +386,27 @@ class Gs1DiagnosticGattDriver internal constructor(
             try {
                 requirePermissions()
             } catch (failure: Exception) {
-                mutableState.value = Gs1DiagnosticGattState.Failed(
+                publishState(Gs1GattEngineState.Failed(
                     code = "BLUETOOTH_PERMISSION_REQUIRED",
                     detail = failure.message,
                     retryable = false,
+                ))
+                return
+            }
+            committedOutput.resetAttempt()
+            if (requested.stopRequested.get() || desired.get() !== requested) {
+                committedOutput.abortPendingApplications(
+                    Gs1ProductLocalEffectsFailureCode.APPLICATION_STOPPED,
                 )
                 return
             }
-            mutableLatestDiagnostic.value = null
-            mutableState.value = Gs1DiagnosticGattState.OpeningCore
+            publishState(Gs1GattEngineState.OpeningCore)
 
             val core = when (val result = coreRuntime.start(profile)) {
                 is Gs1RuntimeStartResult.Started -> result
                 is Gs1RuntimeStartResult.Failed -> {
                     if (result.code == "PERSISTENCE_PENDING") {
-                        mutableState.value = Gs1DiagnosticGattState.PersistencePending
+                        publishState(Gs1GattEngineState.PersistencePending)
                         reconnectGate.onRetryableFailure(requested.reconnectToken)?.let(::scheduleReconnect)
                     } else {
                         publishPreAttemptFailure(
@@ -176,6 +418,13 @@ class Gs1DiagnosticGattDriver internal constructor(
                     }
                     return
                 }
+            }
+            if (requested.stopRequested.get() || desired.get() !== requested) {
+                committedOutput.abortPendingApplications(
+                    Gs1ProductLocalEffectsFailureCode.APPLICATION_STOPPED,
+                )
+                coreRuntime.stop(expectedGeneration = core.generation)
+                return
             }
             var coreTransferred = false
             try {
@@ -201,20 +450,20 @@ class Gs1DiagnosticGattDriver internal constructor(
                 val recoveryCursor = completedRecovery.finalCoreCursor
                 val adapter = bluetoothManager?.adapter
                 if (adapter == null) {
-                    mutableState.value = Gs1DiagnosticGattState.Failed(
+                    publishState(Gs1GattEngineState.Failed(
                         code = "BLUETOOTH_UNAVAILABLE",
                         retryable = false,
-                    )
+                    ))
                     return
                 }
                 val enabled = try {
                     adapter.isEnabled
                 } catch (failure: SecurityException) {
-                    mutableState.value = Gs1DiagnosticGattState.Failed(
+                    publishState(Gs1GattEngineState.Failed(
                         code = "BLUETOOTH_PERMISSION_REVOKED",
                         detail = failure.message,
                         retryable = false,
-                    )
+                    ))
                     return
                 }
                 if (!enabled) {
@@ -255,13 +504,13 @@ class Gs1DiagnosticGattDriver internal constructor(
                 attempt.job = scope.launch { runAttempt(attempt) }
                 active.set(attempt)
                 coreTransferred = true
-                mutableState.value = completedRecovery.blocked?.let { blocked ->
-                    Gs1DiagnosticGattState.ConnectingForHistoryBackfill(
+                publishState(completedRecovery.blocked?.let { blocked ->
+                    Gs1GattEngineState.ConnectingForHistoryBackfill(
                         expectedIndex = recoveryCursor,
                         firstPendingIndex = blocked.firstIndex,
                         reason = blocked.disposition.name,
                     )
-                } ?: Gs1DiagnosticGattState.Connecting
+                } ?: Gs1GattEngineState.Connecting)
                 scheduleDeadline(attempt, initialDeadline.deadline)
 
                 val device = try {
@@ -304,7 +553,12 @@ class Gs1DiagnosticGattDriver internal constructor(
     }
 
     suspend fun stop() {
+        // Abort local-effects delivery before waiting for the lifecycle mutex.
+        // Recovery may be holding that mutex while waiting for this exact ack.
+        requestStop()
         lifecycle.withLock {
+            // Closes the narrow race where stop started before start published
+            // its desired connection.
             requestStop()
             val attempt = active.getAndSet(null)
             val drained = if (attempt != null) {
@@ -312,11 +566,11 @@ class Gs1DiagnosticGattDriver internal constructor(
             } else {
                 coreRuntime.stop() == Gs1RuntimeStopResult.DRAINED
             }
-            mutableState.value = if (drained) {
-                Gs1DiagnosticGattState.Idle
+            publishState(if (drained) {
+                Gs1GattEngineState.Idle
             } else {
-                Gs1DiagnosticGattState.PersistencePending
-            }
+                Gs1GattEngineState.PersistencePending
+            })
         }
     }
 
@@ -325,7 +579,13 @@ class Gs1DiagnosticGattDriver internal constructor(
      * The suspend [stop] call must still follow to drain and persist native state.
      */
     fun requestStop() {
-        desired.getAndSet(null)?.let { reconnectGate.stop(it.reconnectToken) }
+        committedOutput.abortPendingApplications(
+            Gs1ProductLocalEffectsFailureCode.APPLICATION_STOPPED,
+        )
+        desired.getAndSet(null)?.let {
+            it.stopRequested.set(true)
+            reconnectGate.stop(it.reconnectToken)
+        }
         active.get()?.let { attempt ->
             attempt.stopRequested.set(true)
             closeAttemptTransport(attempt)
@@ -472,6 +732,13 @@ class Gs1DiagnosticGattDriver internal constructor(
                         )
                         terminal = attempt.terminalFailure.offer(ingressFailure)
                     }
+                } else if (event is GattEvent.Core &&
+                    event.value is Gs1DiagnosticRuntimeEvent.Committed
+                ) {
+                    event.value.rejectSettlement(
+                        "APPLICATION_STOPPED",
+                        "GATT attempt ended before committed output settlement",
+                    )
                 }
             }
         } finally {
@@ -491,19 +758,19 @@ class Gs1DiagnosticGattDriver internal constructor(
                     } else {
                         null
                     }
-                    mutableState.value = when {
+                    publishState(when {
                         coreStop == Gs1RuntimeStopResult.PERSISTENCE_PENDING ->
-                            Gs1DiagnosticGattState.PersistencePending
-                        reconnect != null -> Gs1DiagnosticGattState.Reconnecting(
+                            Gs1GattEngineState.PersistencePending
+                        reconnect != null -> Gs1GattEngineState.Reconnecting(
                             attempt = reconnect.attempt,
                             delayMillis = reconnect.delayMillis,
                         )
-                        else -> Gs1DiagnosticGattState.Failed(
+                        else -> Gs1GattEngineState.Failed(
                             code = failure.code,
                             detail = failure.detail,
                             retryable = failure.retryable,
                         )
-                    }
+                    })
                     if (reconnect != null) scheduleReconnect(reconnect)
                 }
                 active.compareAndSet(attempt, null)
@@ -520,7 +787,7 @@ class Gs1DiagnosticGattDriver internal constructor(
                         failure("OUT_OF_PHASE_CONNECTION", null, false)
                     } else {
                         attempt.phase = GattPhase.DISCOVERING
-                        mutableState.value = Gs1DiagnosticGattState.DiscoveringServices
+                        publishState(Gs1GattEngineState.DiscoveringServices)
                         enterDeadline(attempt, Gs1GattDeadlinePhase.DISCOVERING)
                         val gatt = transportRegistry.current(attempt.transport)
                             ?: return failure("GATT_UNBOUND", null, false)
@@ -557,7 +824,7 @@ class Gs1DiagnosticGattDriver internal constructor(
                     failure("SUBSCRIPTION_FAILED", event.status.toString(), true)
                 } else {
                     attempt.phase = GattPhase.AUTHENTICATING
-                    mutableState.value = Gs1DiagnosticGattState.Authenticating
+                    publishState(Gs1GattEngineState.Authenticating)
                     enterDeadline(attempt, Gs1GattDeadlinePhase.HANDSHAKE)
                     execute(attempt, attempt.session.initial(attempt.profile.bluetoothAddress))
                 }
@@ -643,7 +910,7 @@ class Gs1DiagnosticGattDriver internal constructor(
         }
         attempt.writeCharacteristic.set(write)
         attempt.phase = GattPhase.SUBSCRIBING
-        mutableState.value = Gs1DiagnosticGattState.Subscribing
+        publishState(Gs1GattEngineState.Subscribing)
         val started = if (Build.VERSION.SDK_INT >= 33) {
             gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
         } else {
@@ -679,11 +946,40 @@ class Gs1DiagnosticGattDriver internal constructor(
             )
         }
         attempt.terminalFailure.current()?.let { return it }
-        val exactPacket = journaled.encryptedPacketCopy()
+        var packetForCore = journaled
+        when (
+            val duplicate = liveIngressDuplicateGate.resolve(
+                profile = attempt.profile,
+                currentCoreCursor = attempt.session.durableNextIndex,
+                wireProfile = attempt.session.wireProfile,
+                currentIngress = journaled.ingress,
+            )
+        ) {
+            Gs1LiveIngressDuplicateResult.NotDuplicate -> Unit
+            is Gs1LiveIngressDuplicateResult.VerifiedSuffix -> {
+                packetForCore = journaled.withVerifiedCommittedPrefix(duplicate)
+            }
+            Gs1LiveIngressDuplicateResult.Handled -> {
+                if (attempt.phase != GattPhase.STREAMING) {
+                    attempt.phase = GattPhase.STREAMING
+                    attempt.deadlinePolicy = attempt.deadlinePolicy.markStreaming()
+                }
+                reconnectGate.markStable(attempt.reconnectToken)
+                armTransportSilenceWatchdog(attempt)
+                publishState(Gs1GattEngineState.Streaming)
+                return null
+            }
+            is Gs1LiveIngressDuplicateResult.Failed -> return failure(
+                duplicate.code,
+                duplicate.detail,
+                duplicate.retryable,
+            )
+        }
+        val exactPacket = packetForCore.encryptedPacketCopy()
         return when (attempt.session.wireProfile) {
-            Gs1WireProfile.UNRESOLVED -> processUnresolvedNotification(attempt, journaled)
-            Gs1WireProfile.V115 -> processV115Notification(attempt, journaled)
-            Gs1WireProfile.V120 -> processV120Notification(attempt, journaled, exactPacket)
+            Gs1WireProfile.UNRESOLVED -> processUnresolvedNotification(attempt, packetForCore)
+            Gs1WireProfile.V115 -> processV115Notification(attempt, packetForCore)
+            Gs1WireProfile.V120 -> processV120Notification(attempt, packetForCore, exactPacket)
         }
     }
 
@@ -695,38 +991,30 @@ class Gs1DiagnosticGattDriver internal constructor(
     ) {
         Gs1RuntimeAwaitResult.StaleGeneration -> failure("STALE_CORE_GENERATION", null, false)
         Gs1RuntimeAwaitResult.Closed -> failure("CORE_RUNTIME_CLOSED", null, true)
-        is Gs1RuntimeAwaitResult.Processed -> when (val result = awaited.result) {
-            is Gs1PacketProcessingResult.Completed -> {
-                val resolved = result.resolvedWireProfile
-                    ?: return failure(
-                        "PROTOCOL_RESOLUTION_MISSING",
-                        "Unresolved packet completed without a durable wire profile",
-                        false,
+        is Gs1RuntimeAwaitResult.Processed -> when (
+            val settled = unresolvedLiveSettler.settle(
+                generation = attempt.coreGeneration,
+                session = attempt.session,
+                ingress = journaled.ingress,
+                result = awaited.result,
+                settleCommitted = { roomEvent ->
+                    durableCommitGate.dispatch(
+                        event = roomEvent,
+                        confirmDurableCursor = attempt.session::confirmDurablyCommitted,
                     )
-                execute(attempt, attempt.session.confirmWireProfile(resolved))
+                },
+            )
+        ) {
+            is Gs1UnresolvedLiveSettlementResult.Failed -> failure(
+                settled.code,
+                settled.detail,
+                settled.retryable,
+            )
+            is Gs1UnresolvedLiveSettlementResult.Completed -> {
+                settled.presentation?.let { presentation ->
+                    applyCommittedPresentation(attempt, presentation)
+                } ?: execute(attempt, settled.nextProtocolAction)
             }
-            is Gs1PacketProcessingResult.InvalidPacket -> failure(
-                result.error.name,
-                result.detail,
-                false,
-            )
-            is Gs1PacketProcessingResult.Rejected -> failure(result.code, result.message, false)
-            is Gs1PacketProcessingResult.StorageConflict -> failure(
-                "STORAGE_CONFLICT",
-                result.reason,
-                false,
-            )
-            is Gs1PacketProcessingResult.Closed -> failure("CORE_CLOSED", result.reason, false)
-            is Gs1PacketProcessingResult.PersistenceUnavailable -> failure(
-                "CORE_PERSISTENCE_PENDING",
-                result.message,
-                true,
-            )
-            Gs1PacketProcessingResult.NoPendingCommit -> failure(
-                "PENDING_COMMIT_LOST",
-                null,
-                false,
-            )
         }
     }
 
@@ -855,7 +1143,7 @@ class Gs1DiagnosticGattDriver internal constructor(
                         closeAttemptTransport(attempt)
                     }
                     if (active.get() === attempt) {
-                        mutableState.value = Gs1DiagnosticGattState.RetryingIngressPersistence(retry)
+                        publishState(Gs1GattEngineState.RetryingIngressPersistence(retry))
                     }
                     delay(INGRESS_RETRY_DELAY_MS)
                 }
@@ -975,16 +1263,17 @@ class Gs1DiagnosticGattDriver internal constructor(
         return failure(code, detail, retryable)
     }
 
-    private fun onCoreEvent(event: Gs1DiagnosticRuntimeEvent) {
-        val attempt = active.get() ?: return
-        val generation = when (event) {
-            is Gs1DiagnosticRuntimeEvent.Finalized -> event.generation
-            is Gs1DiagnosticRuntimeEvent.Committed -> event.generation
-            is Gs1DiagnosticRuntimeEvent.Failed -> event.generation
-            is Gs1DiagnosticRuntimeEvent.RetryingPersistence -> event.generation
+    private suspend fun onCoreEvent(event: Gs1DiagnosticRuntimeEvent) {
+        val attempt = active.get()
+        deliverGs1CoreEventOrFailCommitted(
+            event = event,
+            activeGeneration = attempt?.coreGeneration,
+            accepting = attempt?.accepting?.get() == true,
+        ) {
+            // Runtime events are already durable and must not compete with
+            // callback trySend capacity. Backpressure keeps their exact order.
+            checkNotNull(attempt).mailbox.send(GattEvent.Core(event))
         }
-        if (attempt.coreGeneration != generation) return
-        offer(attempt, GattEvent.Core(event))
     }
 
     private suspend fun handleCoreEvent(
@@ -994,7 +1283,7 @@ class Gs1DiagnosticGattDriver internal constructor(
         is Gs1DiagnosticRuntimeEvent.Finalized -> persistLiveOutcome(event)
 
         is Gs1DiagnosticRuntimeEvent.RetryingPersistence -> {
-            mutableState.value = Gs1DiagnosticGattState.RetryingPersistence(event.attempt)
+            publishState(Gs1GattEngineState.RetryingPersistence(event.attempt))
             failure(
                 code = "CORE_PERSISTENCE_PENDING",
                 detail = "Native state is waiting for an exact durable commit",
@@ -1003,57 +1292,74 @@ class Gs1DiagnosticGattDriver internal constructor(
         }
 
         is Gs1DiagnosticRuntimeEvent.Committed -> {
-            when (val confirmation = attempt.session.confirmDurablyCommitted(event.samples)) {
-                is SessionAction.Failure -> failure(
-                    "DURABLE_CURSOR_REJECTED",
-                    confirmation.reason,
-                    false,
+            val roomEvent = when (val validated = committedEventValidator.validate(event)) {
+                is Gs1CommittedIngressEventValidation.Accepted -> validated.event
+                is Gs1CommittedIngressEventValidation.Failed -> {
+                    event.rejectSettlement(validated.code, validated.detail)
+                    return failure(validated.code, validated.detail, validated.retryable)
+                }
+            }
+            when (
+                val gated = durableCommitGate.dispatch(
+                    event = roomEvent,
+                    confirmDurableCursor = attempt.session::confirmDurablyCommitted,
                 )
-                else -> {
-                    val assessment = Gs1DiagnosticCommitPolicy.assess(
-                        diagnostics = event.diagnostics,
-                        committedSampleCount = event.samples.size,
-                        issueCount = event.issues.size,
-                        validatedTransportEnvelope = event.validatedTransportEnvelope,
+            ) {
+                is Gs1GattDurableCommitResult.Rejected -> {
+                    event.rejectSettlement(gated.code, gated.detail)
+                    failure(
+                        gated.code,
+                        gated.detail,
+                        gated.retryable,
                     )
-                    val progressPlan = Gs1DiagnosticCommitProgressPolicy.plan(
-                        alreadyStreaming = attempt.phase == GattPhase.STREAMING,
-                        assessment = assessment,
-                    )
-                    if (!assessment.hasTransportProgress) {
-                        null
-                    } else {
-                        if (progressPlan.markStreaming) {
-                            attempt.phase = GattPhase.STREAMING
-                            attempt.deadlinePolicy = attempt.deadlinePolicy.markStreaming()
-                        }
-                        if (progressPlan.armSilenceWatchdog) {
-                            armTransportSilenceWatchdog(attempt)
-                        }
-                        assessment.latest?.let { mutableLatestDiagnostic.value = it }
-                        val issue = event.issues.lastOrNull()
-                        mutableState.value = if (issue != null) {
-                            Gs1DiagnosticGattState.DiagnosticDataRejected(
-                                sequence = issue.sequence,
-                                code = issue.code,
-                                detail = issue.message,
-                            )
-                        } else if (assessment.hasFreshDiagnostic) {
-                            reconnectGate.markStable(attempt.reconnectToken)
-                            Gs1DiagnosticGattState.StreamingDiagnostic
-                        } else {
-                            Gs1DiagnosticGattState.DiagnosticDataNotFresh(
-                                sequence = assessment.latest?.sequence,
-                                quality = assessment.latest?.quality,
-                            )
-                        }
-                        null
-                    }
+                }
+                is Gs1GattDurableCommitResult.Accepted -> {
+                    event.acknowledgeDurablySettled()
+                    applyCommittedPresentation(attempt, gated.presentation)
                 }
             }
         }
 
         is Gs1DiagnosticRuntimeEvent.Failed -> failure(event.code, event.detail, false)
+    }
+
+    private fun applyCommittedPresentation(
+        attempt: Attempt,
+        presentation: Gs1GattCommittedPresentation,
+    ): GattEvent.Failure? {
+        val progressPlan = Gs1DiagnosticCommitProgressPolicy.plan(
+            alreadyStreaming = attempt.phase == GattPhase.STREAMING,
+            assessment = Gs1DiagnosticCommitAssessment(
+                latest = null,
+                hasTransportProgress = presentation.hasTransportProgress,
+                hasFreshDiagnostic = presentation.hasFreshOutput,
+            ),
+        )
+        if (!presentation.hasTransportProgress) return null
+        if (progressPlan.markStreaming) {
+            attempt.phase = GattPhase.STREAMING
+            attempt.deadlinePolicy = attempt.deadlinePolicy.markStreaming()
+        }
+        if (progressPlan.armSilenceWatchdog) {
+            armTransportSilenceWatchdog(attempt)
+        }
+        val issue = presentation.issue
+        publishState(if (issue != null) {
+            Gs1GattEngineState.DataRejected(
+                sequence = issue.sequence,
+                code = issue.code,
+                detail = issue.message,
+            )
+        } else if (presentation.hasFreshOutput) {
+            reconnectGate.markStable(attempt.reconnectToken)
+            Gs1GattEngineState.Streaming
+        } else {
+            Gs1GattEngineState.DataNotFresh(
+                sequence = presentation.latestSequence,
+                quality = presentation.latestQuality,
+            )
+        })
+        return null
     }
 
     private suspend fun persistLiveOutcome(
@@ -1100,6 +1406,9 @@ class Gs1DiagnosticGattDriver internal constructor(
     @SuppressLint("MissingPermission")
     private suspend fun stopAttemptLocked(attempt: Attempt): Boolean {
         attempt.stopRequested.set(true)
+        committedOutput.abortPendingApplications(
+            Gs1ProductLocalEffectsFailureCode.APPLICATION_STOPPED,
+        )
         closeAttemptTransport(attempt)
         val drained = withTimeoutOrNull(ATTEMPT_STOP_TIMEOUT_MS) {
             attempt.job.join()
@@ -1168,12 +1477,12 @@ class Gs1DiagnosticGattDriver internal constructor(
         } else {
             null
         }
-        mutableState.value = if (reconnect == null) {
-            Gs1DiagnosticGattState.Failed(code, detail, retryable)
+        publishState(if (reconnect == null) {
+            Gs1GattEngineState.Failed(code, detail, retryable)
         } else {
             scheduleReconnect(reconnect)
-            Gs1DiagnosticGattState.Reconnecting(reconnect.attempt, reconnect.delayMillis)
-        }
+            Gs1GattEngineState.Reconnecting(reconnect.attempt, reconnect.delayMillis)
+        })
     }
 
     private fun nextSequence(value: Long): Long =
@@ -1211,7 +1520,17 @@ class Gs1DiagnosticGattDriver internal constructor(
         val coreGeneration: Long,
         val session: SibionicsSession,
         val attemptId: String = UUID.randomUUID().toString(),
-        val mailbox: Channel<GattEvent> = Channel(GATT_MAILBOX_CAPACITY),
+        val mailbox: Channel<GattEvent> = Channel(
+            capacity = GATT_MAILBOX_CAPACITY,
+            onUndeliveredElement = { event ->
+                val committed = (event as? GattEvent.Core)?.value
+                    as? Gs1DiagnosticRuntimeEvent.Committed
+                committed?.rejectSettlement(
+                    "APPLICATION_STOPPED",
+                    "GATT mailbox closed before committed output settlement",
+                )
+            },
+        ),
         val accepting: AtomicBoolean = AtomicBoolean(true),
         val stopRequested: AtomicBoolean = AtomicBoolean(false),
         val writeCharacteristic: AtomicReference<BluetoothGattCharacteristic?> = AtomicReference(null),
@@ -1230,6 +1549,7 @@ class Gs1DiagnosticGattDriver internal constructor(
     private data class DesiredConnection(
         val profile: Gs1DiagnosticActivationProfile,
         val reconnectToken: Gs1ReconnectToken,
+        val stopRequested: AtomicBoolean = AtomicBoolean(false),
     )
 
     private enum class GattPhase {

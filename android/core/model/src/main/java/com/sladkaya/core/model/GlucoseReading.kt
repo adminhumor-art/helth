@@ -37,11 +37,11 @@ data class GlucoseReading(
     val glucoseMmolL: Double get() = glucoseMgDl / 18.0
 
     val isEligibleForProductPublication: Boolean
-        get() = sensorFamily != SensorFamily.SIMULATOR
+        get() = sensorFamily != SensorFamily.SIMULATOR && quality == ReadingQuality.VALID
 
     fun requireProductPublication() {
         require(isEligibleForProductPublication) {
-            "Simulated readings cannot enter product persistence or remote publication"
+            "Only VALID physical readings may enter product persistence or remote publication"
         }
     }
 }

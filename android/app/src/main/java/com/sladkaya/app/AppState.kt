@@ -43,6 +43,7 @@ object AppState {
     private val demoLock = Any()
     private var demoGeneration = 0L
     private var diagnosticGeneration = 0L
+    private var productGeneration = 0L
     private var pendingDiagnosticReading: DiagnosticReadingUi? = null
     val state = mutable.asStateFlow()
 
@@ -66,9 +67,14 @@ object AppState {
         true
     }
 
-    fun restoreProductHistory(readings: List<GlucoseReading>) = synchronized(demoLock) {
+    fun restoreProductHistory(readings: List<GlucoseReading>) {
+        onProductStarting(readings)
+    }
+
+    fun onProductStarting(readings: List<GlucoseReading>): Long = synchronized(demoLock) {
         demoGeneration += 1
         diagnosticGeneration += 1
+        productGeneration += 1
         pendingDiagnosticReading = null
         val history = readings.filter(GlucoseReading::isEligibleForProductPublication)
             .distinctBy { it.eventId }
@@ -78,12 +84,60 @@ object AppState {
             current.copy(
                 latest = history.lastOrNull(),
                 history = history,
+                driverState = SensorDriverState.WaitingForData(System.currentTimeMillis()),
                 activeAlarms = emptySet(),
                 simulatorMode = false,
                 diagnostic = DiagnosticUiState(),
             )
         }
+        productGeneration
     }
+
+    fun onProductReading(
+        generation: Long,
+        reading: GlucoseReading,
+        activeAlarms: Set<AlarmKind>,
+    ): Boolean = synchronized(demoLock) {
+        if (generation != productGeneration || mutable.value.simulatorMode ||
+            mutable.value.diagnostic.active || !reading.isEligibleForProductPublication
+        ) {
+            return@synchronized false
+        }
+        mutable.update { current ->
+            val history = (current.history + reading)
+                .distinctBy { it.eventId }
+                .sortedBy { it.sensorTimeEpochMs }
+                .takeLast(288)
+            current.copy(
+                latest = history.lastOrNull(),
+                history = history,
+                activeAlarms = activeAlarms,
+            )
+        }
+        true
+    }
+
+    fun onProductDriverState(generation: Long, state: SensorDriverState): Boolean =
+        synchronized(demoLock) {
+            if (generation != productGeneration || mutable.value.simulatorMode ||
+                mutable.value.diagnostic.active
+            ) {
+                return@synchronized false
+            }
+            mutable.update { it.copy(driverState = state) }
+            true
+        }
+
+    fun onProductAlarmState(generation: Long, activeAlarms: Set<AlarmKind>): Boolean =
+        synchronized(demoLock) {
+            if (generation != productGeneration || mutable.value.simulatorMode ||
+                mutable.value.diagnostic.active
+            ) {
+                return@synchronized false
+            }
+            mutable.update { it.copy(activeAlarms = activeAlarms) }
+            true
+        }
 
     fun onDriverState(state: SensorDriverState) {
         mutable.update { it.copy(driverState = state) }
@@ -114,6 +168,7 @@ object AppState {
     fun onDemoStarting(): Long = synchronized(demoLock) {
         demoGeneration += 1
         diagnosticGeneration += 1
+        productGeneration += 1
         pendingDiagnosticReading = null
         mutable.update {
             it.copy(
@@ -131,6 +186,7 @@ object AppState {
     fun onDiagnosticStarting(): Long = synchronized(demoLock) {
         demoGeneration += 1
         diagnosticGeneration += 1
+        productGeneration += 1
         pendingDiagnosticReading = null
         mutable.update {
             it.copy(
@@ -212,6 +268,7 @@ object AppState {
     fun onSetupRequired(message: String) = synchronized(demoLock) {
         demoGeneration += 1
         diagnosticGeneration += 1
+        productGeneration += 1
         pendingDiagnosticReading = null
         mutable.update {
             it.copy(

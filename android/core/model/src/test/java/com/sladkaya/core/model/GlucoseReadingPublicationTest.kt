@@ -19,6 +19,23 @@ class GlucoseReadingPublicationTest {
         physical.requireProductPublication()
     }
 
+    @Test
+    fun onlyValidatedPhysicalQualityCanEnterProductPublication() {
+        val valid = reading(SensorFamily.SIBIONICS_GS1)
+        val warming = valid.copy(quality = ReadingQuality.WARMING_UP)
+        val degraded = valid.copy(quality = ReadingQuality.DEGRADED)
+
+        assertTrue(valid.isEligibleForProductPublication)
+        assertFalse(warming.isEligibleForProductPublication)
+        assertFalse(degraded.isEligibleForProductPublication)
+        assertThrows(IllegalArgumentException::class.java) {
+            warming.requireProductPublication()
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            degraded.requireProductPublication()
+        }
+    }
+
     private fun reading(family: SensorFamily) = GlucoseReading(
         eventId = "event-${family.wireName}",
         sensorId = "sensor-${family.wireName}",

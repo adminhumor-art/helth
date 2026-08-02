@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -17,12 +16,8 @@ import (
 )
 
 type Config struct {
-	DeviceToken        string
-	FamilySessionToken string
-	PatientID          string
-	FreshAfter         time.Duration
-	Logger             *slog.Logger
-	TelegramRecipients []string
+	FreshAfter time.Duration
+	Logger     *slog.Logger
 }
 
 type Server struct {
@@ -48,20 +43,19 @@ func (s *Server) Handler() http.Handler {
 	return s.securityHeaders(s.mux)
 }
 
-// PrimePatient durably establishes the beginning of monitoring once. Restarts
-// never replace that baseline or rebuild medical state from process memory.
-func (s *Server) PrimePatient(ctx context.Context, patientID string, startupAt time.Time) error {
-	return s.store.PrimePatient(ctx, patientID, startupAt)
-}
-
 // CheckStaleness is called by the process scheduler independently of incoming
 // measurements. This is essential: a lost phone cannot trigger its own alert.
 func (s *Server) CheckStaleness(ctx context.Context, patientID string, at time.Time) {
+	recipients, err := s.store.TelegramRecipients(ctx, patientID)
+	if err != nil {
+		s.config.Logger.Error("load alert recipients", "error", err, "patientId", patientID)
+		return
+	}
 	if err := s.store.ProcessStaleness(
 		ctx,
 		patientID,
 		at,
-		s.config.TelegramRecipients,
+		recipients,
 		s.alerts.PlanStaleness,
 	); err != nil {
 		s.config.Logger.Error("evaluate signal freshness", "error", err, "patientId", patientID)
@@ -81,13 +75,28 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) ingestMeasurement(w http.ResponseWriter, r *http.Request) {
-	if !bearerMatches(r, s.config.DeviceToken) {
+	device, err := s.authenticateDevice(r)
+	if errors.Is(err, store.ErrNotFound) {
 		writeProblem(w, http.StatusUnauthorized, "invalid device token")
+		return
+	}
+	if err != nil {
+		s.config.Logger.Error("authenticate device", "error", err)
+		writeProblem(w, http.StatusInternalServerError, "device could not be authenticated")
 		return
 	}
 	var input measurementInput
 	if err := decodeJSON(w, r, &input); err != nil {
 		writeProblem(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	binding, err := input.deviceBinding()
+	if err != nil {
+		writeProblem(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !device.Matches(binding) {
+		writeProblem(w, http.StatusConflict, "device credential binding conflicts with active provisioning")
 		return
 	}
 	value, err := input.measurement()
@@ -96,20 +105,35 @@ func (s *Server) ingestMeasurement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	value.PatientID = s.config.PatientID
+	value.PatientID = device.PatientID
 	value.ReceivedAt = now
 	if err := value.Validate(now); err != nil {
 		writeProblem(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	duplicate, err := s.store.ProcessMeasurement(
+	recipients, err := s.store.TelegramRecipients(r.Context(), device.PatientID)
+	if err != nil {
+		s.config.Logger.Error("load alert recipients", "error", err, "patientId", device.PatientID)
+		writeProblem(w, http.StatusInternalServerError, "alert recipients could not be loaded")
+		return
+	}
+	_, err = s.store.ProcessDeviceMeasurement(
 		r.Context(),
+		device,
 		value,
-		s.config.TelegramRecipients,
+		recipients,
 		s.alerts.PlanMeasurement,
 	)
 	if errors.Is(err, store.ErrEventConflict) {
 		writeProblem(w, http.StatusConflict, "eventId already belongs to different measurement data")
+		return
+	}
+	if errors.Is(err, store.ErrCredentialConflict) {
+		writeProblem(w, http.StatusConflict, "device credential binding conflicts with active provisioning")
+		return
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		writeProblem(w, http.StatusUnauthorized, "invalid device token")
 		return
 	}
 	if err != nil {
@@ -117,18 +141,32 @@ func (s *Server) ingestMeasurement(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusInternalServerError, "measurement could not be stored")
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"accepted": true, "duplicate": duplicate, "serverTime": now,
-	})
+	writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
 }
 
 func (s *Server) patientSnapshot(w http.ResponseWriter, r *http.Request) {
-	if !s.familyAuthorized(r) {
+	session, err := s.authenticateFamily(r)
+	if errors.Is(err, store.ErrNotFound) {
 		writeProblem(w, http.StatusUnauthorized, "family session is required")
 		return
 	}
-	patientID := r.PathValue("patientId")
-	if patientID != s.config.PatientID {
+	if err != nil {
+		s.config.Logger.Error("authenticate family session", "error", err)
+		writeProblem(w, http.StatusInternalServerError, "family session could not be authenticated")
+		return
+	}
+	patientID, validPatientID := canonicalPathUUID(r.PathValue("patientId"))
+	if !validPatientID {
+		writeProblem(w, http.StatusBadRequest, "patientId must be a UUID")
+		return
+	}
+	allowed, err := s.store.HouseholdCanAccessPatient(r.Context(), session.HouseholdID, patientID)
+	if err != nil {
+		s.config.Logger.Error("authorize patient snapshot", "error", err)
+		writeProblem(w, http.StatusInternalServerError, "patient access could not be checked")
+		return
+	}
+	if !allowed {
 		writeProblem(w, http.StatusNotFound, "patient not found")
 		return
 	}
@@ -152,12 +190,28 @@ func (s *Server) patientSnapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listMeasurements(w http.ResponseWriter, r *http.Request) {
-	if !s.familyAuthorized(r) {
+	session, err := s.authenticateFamily(r)
+	if errors.Is(err, store.ErrNotFound) {
 		writeProblem(w, http.StatusUnauthorized, "family session is required")
 		return
 	}
-	patientID := r.PathValue("patientId")
-	if patientID != s.config.PatientID {
+	if err != nil {
+		s.config.Logger.Error("authenticate family session", "error", err)
+		writeProblem(w, http.StatusInternalServerError, "family session could not be authenticated")
+		return
+	}
+	patientID, validPatientID := canonicalPathUUID(r.PathValue("patientId"))
+	if !validPatientID {
+		writeProblem(w, http.StatusBadRequest, "patientId must be a UUID")
+		return
+	}
+	allowed, err := s.store.HouseholdCanAccessPatient(r.Context(), session.HouseholdID, patientID)
+	if err != nil {
+		s.config.Logger.Error("authorize measurement history", "error", err)
+		writeProblem(w, http.StatusInternalServerError, "patient access could not be checked")
+		return
+	}
+	if !allowed {
 		writeProblem(w, http.StatusNotFound, "patient not found")
 		return
 	}
@@ -180,16 +234,22 @@ func (s *Server) listMeasurements(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) acknowledgeAlert(w http.ResponseWriter, r *http.Request) {
-	if !s.familyAuthorized(r) {
+	session, err := s.authenticateFamily(r)
+	if errors.Is(err, store.ErrNotFound) {
 		writeProblem(w, http.StatusUnauthorized, "family session is required")
 		return
 	}
-	alertID := r.PathValue("alertId")
-	if !domain.IsUUID(alertID) {
+	if err != nil {
+		s.config.Logger.Error("authenticate family session", "error", err)
+		writeProblem(w, http.StatusInternalServerError, "family session could not be authenticated")
+		return
+	}
+	alertID, validAlertID := canonicalPathUUID(r.PathValue("alertId"))
+	if !validAlertID {
 		writeProblem(w, http.StatusBadRequest, "alertId must be a UUID")
 		return
 	}
-	if err := s.store.AcknowledgeAlert(r.Context(), s.config.PatientID, alertID, time.Now().UTC()); errors.Is(err, store.ErrNotFound) {
+	if err := s.store.AcknowledgeAlertForHousehold(r.Context(), session.HouseholdID, alertID, time.Now().UTC()); errors.Is(err, store.ErrNotFound) {
 		writeProblem(w, http.StatusNotFound, "alert not found")
 		return
 	} else if err != nil {
@@ -199,15 +259,36 @@ func (s *Server) acknowledgeAlert(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) familyAuthorized(r *http.Request) bool {
-	cookie, err := r.Cookie("family_session")
-	if err == nil && secretMatches(cookie.Value, s.config.FamilySessionToken) {
-		return true
+func canonicalPathUUID(value string) (string, bool) {
+	if !domain.IsUUID(value) {
+		return "", false
 	}
-	return bearerMatches(r, s.config.FamilySessionToken)
+	return strings.ToLower(value), true
+}
+
+func (s *Server) authenticateDevice(r *http.Request) (store.DeviceAccess, error) {
+	token, ok := bearerToken(r)
+	if !ok {
+		return store.DeviceAccess{}, store.ErrNotFound
+	}
+	return s.store.ResolveActiveDevice(r.Context(), store.HashAccessToken(token), time.Now().UTC())
+}
+
+func (s *Server) authenticateFamily(r *http.Request) (store.FamilySessionAccess, error) {
+	cookie, err := r.Cookie("family_session")
+	if err != nil || cookie.Value == "" || len(cookie.Value) > 4096 {
+		return store.FamilySessionAccess{}, store.ErrNotFound
+	}
+	return s.store.ResolveActiveFamilySession(
+		r.Context(), store.HashAccessToken(cookie.Value), time.Now().UTC(),
+	)
 }
 
 type measurementInput struct {
+	DeviceID           string                    `json:"deviceId"`
+	BackendBindingID   string                    `json:"backendBindingId"`
+	CredentialID       string                    `json:"credentialId"`
+	CredentialRevision *int64                    `json:"credentialRevision"`
 	EventID            string                    `json:"eventId"`
 	SensorID           string                    `json:"sensorId"`
 	SensorFamily       domain.SensorFamily       `json:"sensorFamily"`
@@ -217,6 +298,23 @@ type measurementInput struct {
 	TrendMgDLPerMinute float64                   `json:"trendMgDlPerMinute"`
 	Quality            domain.MeasurementQuality `json:"quality"`
 	Sequence           *uint64                   `json:"sequence"`
+}
+
+func (i measurementInput) deviceBinding() (store.DeviceBinding, error) {
+	if !domain.IsUUID(i.DeviceID) {
+		return store.DeviceBinding{}, errors.New("deviceId must be a UUID")
+	}
+	if i.CredentialRevision == nil {
+		return store.DeviceBinding{}, errors.New("credentialRevision is required")
+	}
+	result := store.DeviceBinding{
+		DeviceID: strings.ToLower(i.DeviceID), BackendBindingID: i.BackendBindingID,
+		CredentialID: i.CredentialID, CredentialRevision: *i.CredentialRevision,
+	}
+	if err := result.Validate(); err != nil {
+		return store.DeviceBinding{}, err
+	}
+	return result, nil
 }
 
 func (i measurementInput) measurement() (domain.Measurement, error) {
@@ -231,19 +329,20 @@ func (i measurementInput) measurement() (domain.Measurement, error) {
 	}, nil
 }
 
-func bearerMatches(r *http.Request, expected string) bool {
-	value := strings.TrimSpace(r.Header.Get("Authorization"))
+func bearerToken(r *http.Request) (string, bool) {
+	values := r.Header.Values("Authorization")
+	if len(values) != 1 {
+		return "", false
+	}
+	value := strings.TrimSpace(values[0])
 	if !strings.HasPrefix(value, "Bearer ") {
-		return false
+		return "", false
 	}
-	return secretMatches(strings.TrimSpace(strings.TrimPrefix(value, "Bearer ")), expected)
-}
-
-func secretMatches(actual, expected string) bool {
-	if actual == "" || expected == "" || len(actual) != len(expected) {
-		return false
+	token := strings.TrimSpace(strings.TrimPrefix(value, "Bearer "))
+	if token == "" || len(token) > 4096 {
+		return "", false
 	}
-	return subtle.ConstantTimeCompare([]byte(actual), []byte(expected)) == 1
+	return token, true
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {

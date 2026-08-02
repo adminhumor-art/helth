@@ -1,0 +1,390 @@
+package store
+
+import (
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"errors"
+	"fmt"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"glucose-monitor/backend/internal/domain"
+)
+
+const AccessTokenHashSize = sha256.Size
+const MaxCredentialRevision int64 = 9_007_199_254_740_991
+
+var ErrCredentialConflict = errors.New("credential conflicts with existing access identity")
+var ErrAccessNotProvisioned = errors.New("production access graph is incomplete")
+
+type DeviceAccess struct {
+	ID                 string
+	PatientID          string
+	BackendBindingID   string
+	CredentialID       string
+	CredentialRevision int64
+}
+
+type DeviceBinding struct {
+	DeviceID           string
+	BackendBindingID   string
+	CredentialID       string
+	CredentialRevision int64
+}
+
+func (b DeviceBinding) Validate() error {
+	if b.DeviceID == "" || !opaqueIdentifier.MatchString(b.BackendBindingID) || !opaqueIdentifier.MatchString(b.CredentialID) {
+		return errors.New("device credential binding is malformed")
+	}
+	if b.CredentialRevision <= 0 || b.CredentialRevision > MaxCredentialRevision {
+		return errors.New("credentialRevision must be within the JSON safe-integer range")
+	}
+	return nil
+}
+
+type FamilySessionAccess struct {
+	ID          string
+	HouseholdID string
+}
+
+// BootstrapIdentity is an explicit provisioning input. It contains only token
+// digests; callers must never pass or persist a raw device or family token.
+type BootstrapIdentity struct {
+	HouseholdID            string
+	HouseholdName          string
+	PatientID              string
+	PatientName            string
+	DeviceID               string
+	DeviceName             string
+	DeviceTokenHash        []byte
+	BackendBindingID       string
+	CredentialID           string
+	CredentialRevision     int64
+	FamilySessionID        string
+	FamilyTokenHash        []byte
+	FamilySessionExpiresAt *time.Time
+	TelegramRecipients     []string
+}
+
+type memoryDeviceAccess struct {
+	DeviceAccess
+	Name       string
+	TokenHash  []byte
+	RevokedAt  *time.Time
+	LastSeenAt *time.Time
+}
+
+type memoryFamilySessionAccess struct {
+	FamilySessionAccess
+	TokenHash []byte
+	ExpiresAt *time.Time
+	RevokedAt *time.Time
+}
+
+func HashAccessToken(raw string) []byte {
+	digest := sha256.Sum256([]byte(raw))
+	return append([]byte(nil), digest[:]...)
+}
+
+func validateBootstrapIdentity(identity BootstrapIdentity) error {
+	if identity.HouseholdID == "" || identity.PatientID == "" || identity.DeviceID == "" || identity.FamilySessionID == "" {
+		return errors.New("household, patient, device and family session IDs are required")
+	}
+	if len(identity.DeviceTokenHash) != AccessTokenHashSize || len(identity.FamilyTokenHash) != AccessTokenHashSize {
+		return fmt.Errorf("access token digests must contain exactly %d bytes", AccessTokenHashSize)
+	}
+	if subtle.ConstantTimeCompare(identity.DeviceTokenHash, identity.FamilyTokenHash) == 1 {
+		return errors.New("device and family credentials must be distinct")
+	}
+	if err := (DeviceBinding{
+		DeviceID: identity.DeviceID, BackendBindingID: identity.BackendBindingID,
+		CredentialID: identity.CredentialID, CredentialRevision: identity.CredentialRevision,
+	}).Validate(); err != nil {
+		return err
+	}
+	return nil
+}
+
+var opaqueIdentifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+
+func (d DeviceAccess) Matches(binding DeviceBinding) bool {
+	return exactText(d.ID, binding.DeviceID) &&
+		exactText(d.BackendBindingID, binding.BackendBindingID) &&
+		exactText(d.CredentialID, binding.CredentialID) &&
+		d.CredentialRevision == binding.CredentialRevision
+}
+
+func exactText(left, right string) bool {
+	return len(left) == len(right) && subtle.ConstantTimeCompare([]byte(left), []byte(right)) == 1
+}
+
+func normalizeBootstrapIdentity(identity BootstrapIdentity) BootstrapIdentity {
+	identity.HouseholdID = canonicalUUID(identity.HouseholdID)
+	identity.PatientID = canonicalUUID(identity.PatientID)
+	identity.DeviceID = canonicalUUID(identity.DeviceID)
+	identity.FamilySessionID = canonicalUUID(identity.FamilySessionID)
+	if identity.HouseholdName == "" {
+		identity.HouseholdName = "Семья"
+	}
+	identity.PatientName = domain.NormalizePatientDisplayName(identity.PatientName)
+	if identity.PatientName == "" {
+		identity.PatientName = "Пациент"
+	}
+	if identity.DeviceName == "" {
+		identity.DeviceName = "Телефон"
+	}
+	identity.DeviceTokenHash = append([]byte(nil), identity.DeviceTokenHash...)
+	identity.FamilyTokenHash = append([]byte(nil), identity.FamilyTokenHash...)
+	identity.FamilySessionExpiresAt = cloneTime(identity.FamilySessionExpiresAt)
+	unique := make(map[string]struct{}, len(identity.TelegramRecipients))
+	recipients := make([]string, 0, len(identity.TelegramRecipients))
+	for _, recipient := range identity.TelegramRecipients {
+		recipient = strings.TrimSpace(recipient)
+		if recipient == "" {
+			continue
+		}
+		if _, exists := unique[recipient]; exists {
+			continue
+		}
+		unique[recipient] = struct{}{}
+		recipients = append(recipients, recipient)
+	}
+	sort.Strings(recipients)
+	identity.TelegramRecipients = recipients
+	return identity
+}
+
+func canonicalUUID(value string) string {
+	if domain.IsUUID(value) {
+		return strings.ToLower(value)
+	}
+	return value
+}
+
+func (m *Memory) BootstrapAccess(_ context.Context, identity BootstrapIdentity) error {
+	identity = normalizeBootstrapIdentity(identity)
+	if err := validateBootstrapIdentity(identity); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for id, device := range m.devices {
+		if subtle.ConstantTimeCompare(device.TokenHash, identity.FamilyTokenHash) == 1 ||
+			(id != identity.DeviceID && (subtle.ConstantTimeCompare(device.TokenHash, identity.DeviceTokenHash) == 1 ||
+				exactText(device.BackendBindingID, identity.BackendBindingID) ||
+				(exactText(device.CredentialID, identity.CredentialID) && device.CredentialRevision == identity.CredentialRevision))) {
+			return ErrCredentialConflict
+		}
+	}
+	for id, session := range m.familySessions {
+		if subtle.ConstantTimeCompare(session.TokenHash, identity.DeviceTokenHash) == 1 ||
+			(subtle.ConstantTimeCompare(session.TokenHash, identity.FamilyTokenHash) == 1 && id != identity.FamilySessionID) {
+			return ErrCredentialConflict
+		}
+	}
+	if name, ok := m.householdNames[identity.HouseholdID]; ok && name != identity.HouseholdName {
+		return ErrCredentialConflict
+	}
+	if householdID, ok := m.patientHouseholds[identity.PatientID]; ok &&
+		(householdID != identity.HouseholdID || m.patientNames[identity.PatientID] != identity.PatientName) {
+		return ErrCredentialConflict
+	}
+	if existing, ok := m.devices[identity.DeviceID]; ok &&
+		(existing.PatientID != identity.PatientID || existing.Name != identity.DeviceName ||
+			!exactText(existing.BackendBindingID, identity.BackendBindingID) ||
+			!exactText(existing.CredentialID, identity.CredentialID) ||
+			existing.CredentialRevision != identity.CredentialRevision ||
+			subtle.ConstantTimeCompare(existing.TokenHash, identity.DeviceTokenHash) != 1) {
+		return ErrCredentialConflict
+	}
+	if existing, ok := m.familySessions[identity.FamilySessionID]; ok &&
+		(existing.HouseholdID != identity.HouseholdID ||
+			subtle.ConstantTimeCompare(existing.TokenHash, identity.FamilyTokenHash) != 1 ||
+			!sameOptionalTime(existing.ExpiresAt, identity.FamilySessionExpiresAt)) {
+		return ErrCredentialConflict
+	}
+	if recipients, ok := m.householdTelegramRecipients[identity.HouseholdID]; ok &&
+		!sameStrings(recipients, identity.TelegramRecipients) {
+		return ErrCredentialConflict
+	}
+
+	m.householdNames[identity.HouseholdID] = identity.HouseholdName
+	m.patientHouseholds[identity.PatientID] = identity.HouseholdID
+	m.patientNames[identity.PatientID] = identity.PatientName
+	if _, exists := m.devices[identity.DeviceID]; !exists {
+		m.devices[identity.DeviceID] = memoryDeviceAccess{
+			DeviceAccess: DeviceAccess{
+				ID: identity.DeviceID, PatientID: identity.PatientID,
+				BackendBindingID: identity.BackendBindingID, CredentialID: identity.CredentialID,
+				CredentialRevision: identity.CredentialRevision,
+			},
+			Name:      identity.DeviceName,
+			TokenHash: append([]byte(nil), identity.DeviceTokenHash...),
+		}
+	}
+	if _, exists := m.familySessions[identity.FamilySessionID]; !exists {
+		m.familySessions[identity.FamilySessionID] = memoryFamilySessionAccess{
+			FamilySessionAccess: FamilySessionAccess{ID: identity.FamilySessionID, HouseholdID: identity.HouseholdID},
+			TokenHash:           append([]byte(nil), identity.FamilyTokenHash...),
+			ExpiresAt:           cloneTime(identity.FamilySessionExpiresAt),
+		}
+	}
+	m.householdTelegramRecipients[identity.HouseholdID] = append([]string(nil), identity.TelegramRecipients...)
+	return nil
+}
+
+func (m *Memory) ResolveActiveDevice(_ context.Context, tokenHash []byte, _ time.Time) (DeviceAccess, error) {
+	if len(tokenHash) != AccessTokenHashSize {
+		return DeviceAccess{}, ErrNotFound
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var match *memoryDeviceAccess
+	for _, candidate := range m.devices {
+		candidateCopy := candidate
+		if subtle.ConstantTimeCompare(candidate.TokenHash, tokenHash) == 1 && candidate.RevokedAt == nil {
+			match = &candidateCopy
+		}
+	}
+	if match == nil {
+		return DeviceAccess{}, ErrNotFound
+	}
+	return match.DeviceAccess, nil
+}
+
+func (m *Memory) TelegramRecipients(_ context.Context, patientID string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	householdID, ok := m.patientHouseholds[patientID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return append([]string(nil), m.householdTelegramRecipients[householdID]...), nil
+}
+
+func (m *Memory) HasTelegramRecipients(_ context.Context) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, recipients := range m.householdTelegramRecipients {
+		if len(recipients) > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (m *Memory) ValidateProductionAccess(_ context.Context, at time.Time) error {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.patientHouseholds) == 0 {
+		return ErrAccessNotProvisioned
+	}
+	for patientID, householdID := range m.patientHouseholds {
+		hasDevice := false
+		for _, device := range m.devices {
+			if device.PatientID == patientID && device.RevokedAt == nil {
+				hasDevice = true
+				break
+			}
+		}
+		hasFamilySession := false
+		for _, session := range m.familySessions {
+			if session.HouseholdID == householdID && session.RevokedAt == nil &&
+				(session.ExpiresAt == nil || session.ExpiresAt.After(at)) {
+				hasFamilySession = true
+				break
+			}
+		}
+		hasTelegramRecipient := len(m.householdTelegramRecipients[householdID]) > 0
+		if !hasDevice || !hasFamilySession || !hasTelegramRecipient {
+			return ErrAccessNotProvisioned
+		}
+	}
+	return nil
+}
+
+func (m *Memory) ResolveActiveFamilySession(_ context.Context, tokenHash []byte, at time.Time) (FamilySessionAccess, error) {
+	if len(tokenHash) != AccessTokenHashSize {
+		return FamilySessionAccess{}, ErrNotFound
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var match *FamilySessionAccess
+	for _, candidate := range m.familySessions {
+		active := candidate.RevokedAt == nil && (candidate.ExpiresAt == nil || candidate.ExpiresAt.After(at))
+		if subtle.ConstantTimeCompare(candidate.TokenHash, tokenHash) == 1 && active {
+			value := candidate.FamilySessionAccess
+			match = &value
+		}
+	}
+	if match == nil {
+		return FamilySessionAccess{}, ErrNotFound
+	}
+	return *match, nil
+}
+
+func (m *Memory) HouseholdCanAccessPatient(_ context.Context, householdID, patientID string) (bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.patientHouseholds[patientID] == householdID, nil
+}
+
+func (m *Memory) RevokeDevice(_ context.Context, deviceID string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	device, ok := m.devices[deviceID]
+	if !ok {
+		return ErrNotFound
+	}
+	if device.RevokedAt == nil {
+		device.RevokedAt = timePointer(at.UTC())
+		m.devices[deviceID] = device
+	}
+	return nil
+}
+
+func cloneTime(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	return timePointer(value.UTC())
+}
+
+func timePointer(value time.Time) *time.Time {
+	return &value
+}
+
+func bootstrapFamilyMemberID(householdID, recipient string) string {
+	digest := sha256.Sum256([]byte("telegram-family-member\x00" + householdID + "\x00" + recipient))
+	digest[6] = (digest[6] & 0x0f) | 0x50
+	digest[8] = (digest[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", digest[0:4], digest[4:6], digest[6:8], digest[8:10], digest[10:16])
+}
+
+func bootstrapFamilyMemberEmail(householdID, recipient string) string {
+	digest := sha256.Sum256([]byte("telegram-family-member-email\x00" + householdID + "\x00" + recipient))
+	return fmt.Sprintf("telegram-%x@bootstrap.invalid", digest[:12])
+}
+
+func sameOptionalTime(left, right *time.Time) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Equal(*right)
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}

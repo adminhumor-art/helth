@@ -1,12 +1,14 @@
 package com.sladkaya.core.data
 
 import com.sladkaya.core.model.GlucoseReading
+import com.sladkaya.core.model.ReadingQuality
 import com.sladkaya.core.model.SensorFamily
 import java.security.MessageDigest
 import kotlin.math.roundToInt
 
 class RawSensorSampleRecord(
     val eventId: String,
+    val sourceIngressId: String,
     val sensorId: String,
     val sensorFamily: SensorFamily,
     val sequence: Int,
@@ -25,6 +27,7 @@ class RawSensorSampleRecord(
 
     init {
         require(eventId.isNotBlank())
+        require(sourceIngressId.isNotBlank() && sourceIngressId.length <= 128)
         require(sensorId.isNotBlank() && sensorId.length <= 128)
         require(sequence >= 0)
         require(sensorTimeEpochMs > 0)
@@ -67,6 +70,7 @@ data class SensorAlgorithmResultRecord(
     val publishable: Boolean,
     val alarmEligible: Boolean = publishable,
     val algorithmErrorCode: String? = null,
+    val publicationApprovalId: String? = null,
 ) {
     init {
         require(eventId.isNotBlank())
@@ -85,6 +89,7 @@ data class SensorAlgorithmResultRecord(
         require(initializationMode in INITIALIZATION_MODES)
         require(!alarmEligible || publishable)
         require(algorithmErrorCode == null || algorithmErrorCode.isNotBlank() && !publishable)
+        require(publicationApprovalId == null || SHA256.matches(publicationApprovalId))
     }
 }
 
@@ -97,6 +102,7 @@ class SensorAlgorithmCheckpointRecord(
     val transportCodecId: String,
     val sequence: Int,
     val sensorTimeEpochMs: Long,
+    val sensorStartTimeEpochMs: Long,
     val algorithmProfile: String,
     val algorithmVersion: String,
     val binarySetId: String,
@@ -109,6 +115,7 @@ class SensorAlgorithmCheckpointRecord(
     val stateSha256: String,
     val displayOffsetMmolL: Double,
     val schemaVersion: Int,
+    val publicationApprovalId: String? = null,
 ) {
     private val state = state.copyOf()
 
@@ -121,7 +128,15 @@ class SensorAlgorithmCheckpointRecord(
         require(transportCodecId.isNotBlank())
         require(sequence >= 0)
         require(sensorTimeEpochMs > 0)
+        require(sensorStartTimeEpochMs > 0)
+        require(sensorStartTimeEpochMs <= sensorTimeEpochMs)
         require(algorithmProfile.isNotBlank())
+        if (algorithmProfile == "V116A") {
+            require(
+                sensorTimeEpochMs - sensorStartTimeEpochMs ==
+                    sequence.toLong() * MILLIS_PER_SENSOR_SAMPLE,
+            ) { "V116A checkpoint time does not match its durable sensor start" }
+        }
         require(algorithmVersion.isNotBlank())
         require(binarySetId.isNotBlank())
         requireSensitivityToken(sensitivityToken)
@@ -135,6 +150,7 @@ class SensorAlgorithmCheckpointRecord(
         require(stateSha256 == this.state.sha256())
         require(displayOffsetMmolL.isFinite())
         require(schemaVersion == CHECKPOINT_SCHEMA_VERSION)
+        require(publicationApprovalId == null || SHA256.matches(publicationApprovalId))
     }
 
     fun stateCopy(): ByteArray = state.copyOf()
@@ -148,6 +164,7 @@ class SensorAlgorithmCheckpointRecord(
         transportCodecId: String = this.transportCodecId,
         sequence: Int = this.sequence,
         sensorTimeEpochMs: Long = this.sensorTimeEpochMs,
+        sensorStartTimeEpochMs: Long = this.sensorStartTimeEpochMs,
         algorithmProfile: String = this.algorithmProfile,
         algorithmVersion: String = this.algorithmVersion,
         binarySetId: String = this.binarySetId,
@@ -160,6 +177,7 @@ class SensorAlgorithmCheckpointRecord(
         stateSha256: String = this.stateSha256,
         displayOffsetMmolL: Double = this.displayOffsetMmolL,
         schemaVersion: Int = this.schemaVersion,
+        publicationApprovalId: String? = this.publicationApprovalId,
     ) = SensorAlgorithmCheckpointRecord(
         sensorId = sensorId,
         bluetoothAddress = bluetoothAddress,
@@ -169,6 +187,7 @@ class SensorAlgorithmCheckpointRecord(
         transportCodecId = transportCodecId,
         sequence = sequence,
         sensorTimeEpochMs = sensorTimeEpochMs,
+        sensorStartTimeEpochMs = sensorStartTimeEpochMs,
         algorithmProfile = algorithmProfile,
         algorithmVersion = algorithmVersion,
         binarySetId = binarySetId,
@@ -181,7 +200,12 @@ class SensorAlgorithmCheckpointRecord(
         stateSha256 = stateSha256,
         displayOffsetMmolL = displayOffsetMmolL,
         schemaVersion = schemaVersion,
+        publicationApprovalId = publicationApprovalId,
     )
+
+    private companion object {
+        const val MILLIS_PER_SENSOR_SAMPLE = 60_000L
+    }
 }
 
 data class AtomicSensorCoreRecord(
@@ -189,6 +213,9 @@ data class AtomicSensorCoreRecord(
     val result: SensorAlgorithmResultRecord,
     val checkpoint: SensorAlgorithmCheckpointRecord,
     val measurement: GlucoseReading?,
+    val publicationContext: ProductPublicationContext? = null,
+    val approvedCheckpointContext: ApprovedCheckpointContext? =
+        publicationContext?.approvedCheckpointContext(),
 ) {
     init {
         require(result.eventId == raw.eventId)
@@ -211,6 +238,21 @@ data class AtomicSensorCoreRecord(
         require(checkpoint.initializationMode == result.initializationMode)
 
         require(result.publishable == (measurement != null))
+        require((measurement != null) == (publicationContext != null))
+        require(measurement == null || measurement.quality == ReadingQuality.VALID)
+        require(!result.alarmEligible || measurement != null)
+        if (approvedCheckpointContext == null) {
+            require(publicationContext == null)
+            require(result.publicationApprovalId == null)
+            require(checkpoint.publicationApprovalId == null)
+        } else {
+            require(result.publicationApprovalId == approvedCheckpointContext.approvalId)
+            require(checkpoint.publicationApprovalId == approvedCheckpointContext.approvalId)
+            require(
+                publicationContext == null ||
+                    publicationContext.approvedCheckpointContext() == approvedCheckpointContext,
+            )
+        }
         measurement?.let {
             require(it.eventId == raw.eventId)
             require(it.sensorId == raw.sensorId)
@@ -224,9 +266,11 @@ data class AtomicSensorCoreRecord(
 
     internal fun toEntityBundle() = SensorCoreEntityBundle(
         raw = raw.toEntity(),
-        result = result.toEntity(),
-        checkpoint = checkpoint.toEntity(),
-        measurement = measurement?.toEntity(),
+        result = result.toEntity(approvedCheckpointContext),
+        checkpoint = checkpoint.toEntity(approvedCheckpointContext),
+        measurement = measurement?.toEntity(checkNotNull(publicationContext)),
+        publicationContext = publicationContext,
+        approvedCheckpointContext = approvedCheckpointContext,
     )
 
     private companion object {
@@ -238,6 +282,7 @@ private val TOKEN_SOURCES = setOf("PACKAGE_CODE")
 private val SENSITIVITY_ENCODINGS = setOf("NORMAL", "FACTION")
 private val INITIALIZATION_MODES = setOf("STANDARD", "FACTION")
 private val CANONICAL_BLUETOOTH_ADDRESS = Regex("^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$")
+private val SHA256 = Regex("^[0-9a-f]{64}$")
 private val ALGORITHM_STATE_SIZES = mapOf("V116A" to 2_480, "V115G" to 2_336)
 private const val CHECKPOINT_SCHEMA_VERSION = 1
 private const val MIN_SENSITIVITY = 0.8

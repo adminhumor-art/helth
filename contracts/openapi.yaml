@@ -34,7 +34,7 @@ paths:
         "401":
           description: Invalid device token
         "409":
-          description: The event identifier already belongs to different measurement data
+          description: Device binding mismatch or conflicting event identity
   /v1/patients/{patientId}/snapshot:
     get:
       operationId: getPatientSnapshot
@@ -49,6 +49,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PatientSnapshot"
+        "401":
+          description: Family session cookie is missing or invalid
         "404":
           description: Patient or measurement not found
   /v1/patients/{patientId}/measurements:
@@ -79,6 +81,8 @@ paths:
                 type: array
                 items:
                   $ref: "#/components/schemas/Measurement"
+        "401":
+          description: Family session cookie is missing or invalid
   /v1/alerts/{alertId}/acknowledge:
     post:
       operationId: acknowledgeAlert
@@ -109,6 +113,7 @@ components:
       type: apiKey
       in: cookie
       name: family_session
+      description: Server-issued session cookie; must use HttpOnly, Secure and SameSite=Strict attributes. Authorization Bearer is not accepted.
   parameters:
     PatientId:
       in: path
@@ -120,7 +125,30 @@ components:
   schemas:
     MeasurementInput:
       type: object
-      additionalProperties: false
+      unevaluatedProperties: false
+      required:
+        - deviceId
+        - backendBindingId
+        - credentialId
+        - credentialRevision
+      properties:
+        deviceId:
+          type: string
+          format: uuid
+        backendBindingId:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        credentialId:
+          type: string
+          pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        credentialRevision:
+          type: integer
+          minimum: 1
+          maximum: 9007199254740991
+      allOf:
+        - $ref: "#/components/schemas/MeasurementFields"
+    MeasurementFields:
+      type: object
       required:
         - eventId
         - sensorId
@@ -167,8 +195,9 @@ components:
           minimum: 0
           maximum: 9007199254740991
     Measurement:
+      unevaluatedProperties: false
       allOf:
-        - $ref: "#/components/schemas/MeasurementInput"
+        - $ref: "#/components/schemas/MeasurementFields"
         - type: object
           required: [patientId, receivedAt]
           properties:
@@ -180,15 +209,12 @@ components:
               format: date-time
     IngestResult:
       type: object
-      required: [accepted, duplicate, serverTime]
+      additionalProperties: false
+      required: [accepted]
       properties:
         accepted:
           type: boolean
-        duplicate:
-          type: boolean
-        serverTime:
-          type: string
-          format: date-time
+          const: true
     PatientSnapshot:
       type: object
       required: [patientId, freshness, latest, openAlerts]

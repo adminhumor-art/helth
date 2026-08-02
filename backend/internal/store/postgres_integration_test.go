@@ -1,12 +1,15 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +17,104 @@ import (
 	"glucose-monitor/backend/internal/alerts"
 	"glucose-monitor/backend/internal/domain"
 )
+
+func TestPostgresFreshSchemaIsCurrentAndIdempotent(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	admin, err := NewPostgres(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	schemaName := "fresh_" + strings.ReplaceAll(testUUID(t), "-", "")
+	if _, err := admin.pool.Exec(ctx, `CREATE SCHEMA "`+schemaName+`"`); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_, _ = admin.pool.Exec(cleanupCtx, `DROP SCHEMA "`+schemaName+`" CASCADE`)
+	}()
+	parsedURL, err := url.Parse(databaseURL)
+	if err != nil || parsedURL.Scheme == "" {
+		t.Fatalf("TEST_DATABASE_URL must be a PostgreSQL URL for isolated schema test: %v", err)
+	}
+	query := parsedURL.Query()
+	query.Set("search_path", schemaName)
+	parsedURL.RawQuery = query.Encode()
+	values, err := NewPostgres(ctx, parsedURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer values.Close()
+	if err := values.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := values.InitializeSchema(ctx); err != nil {
+		t.Fatalf("fresh schema initialization is not idempotent: %v", err)
+	}
+
+	var requiredColumns int
+	if err := values.pool.QueryRow(ctx, `
+		SELECT count(*) FROM information_schema.columns
+		WHERE table_schema=$1 AND table_name='devices'
+		  AND column_name IN ('token_hash','backend_binding_id','credential_id','credential_revision')
+		  AND is_nullable='NO'`, schemaName).Scan(&requiredColumns); err != nil {
+		t.Fatal(err)
+	}
+	if requiredColumns != 4 {
+		t.Fatalf("fresh devices schema has %d required identity columns, want 4", requiredColumns)
+	}
+	var hasFamilySessions bool
+	if err := values.pool.QueryRow(ctx, `SELECT to_regclass('family_sessions') IS NOT NULL`).Scan(&hasFamilySessions); err != nil {
+		t.Fatal(err)
+	}
+	if !hasFamilySessions {
+		t.Fatal("fresh v1 schema is missing family_sessions")
+	}
+	hasRecipients, err := values.HasTelegramRecipients(ctx)
+	if err != nil || hasRecipients {
+		t.Fatalf("fresh database recipients: configured=%v err=%v", hasRecipients, err)
+	}
+
+	householdID, patientID := testUUID(t), testUUID(t)
+	if _, err := values.pool.Exec(ctx, `INSERT INTO households (id,name) VALUES ($1,'fresh-family')`, householdID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := values.pool.Exec(ctx, `
+		INSERT INTO patients (id,household_id,display_name) VALUES ($1,$2,'fresh-patient')`, patientID, householdID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := values.pool.Exec(ctx, `
+		INSERT INTO family_members (id,household_id,email,display_name,role,telegram_chat_id)
+		VALUES ($1,$2,'fresh@example.invalid','Fresh relative','relative','123456789')`, testUUID(t), householdID); err != nil {
+		t.Fatal(err)
+	}
+	hasRecipients, err = values.HasTelegramRecipients(ctx)
+	if err != nil || !hasRecipients {
+		t.Fatalf("database Telegram recipient was not detected: configured=%v err=%v", hasRecipients, err)
+	}
+	insertDevice := func(deviceID string, revision int64) error {
+		_, insertErr := values.pool.Exec(ctx, `
+			INSERT INTO devices (
+				id,patient_id,name,token_hash,backend_binding_id,credential_id,credential_revision
+			) VALUES ($1,$2,'fresh-device',$3,$4,$5,$6)`,
+			deviceID, patientID, HashAccessToken("device-token-"+deviceID),
+			"binding-"+deviceID, "credential-"+deviceID, revision,
+		)
+		return insertErr
+	}
+	if err := insertDevice(testUUID(t), MaxCredentialRevision); err != nil {
+		t.Fatalf("fresh schema rejected maximum JSON-safe credential revision: %v", err)
+	}
+	if err := insertDevice(testUUID(t), MaxCredentialRevision+1); err == nil {
+		t.Fatal("fresh schema accepted credential revision outside JSON safe-integer range")
+	}
+}
 
 func TestPostgresAtomicAlertTransactions(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
@@ -36,11 +137,11 @@ func TestPostgresAtomicAlertTransactions(t *testing.T) {
 	if _, err := values.pool.Exec(ctx, `INSERT INTO households (id,name) VALUES ($1,'atomic-test')`, householdID); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
+	defer func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
 		_, _ = values.pool.Exec(cleanupCtx, `DELETE FROM households WHERE id=$1`, householdID)
-	})
+	}()
 	if _, err := values.pool.Exec(ctx, `
 		INSERT INTO patients (id,household_id,display_name) VALUES ($1,$2,'atomic-patient')`,
 		patientID, householdID,
@@ -49,9 +150,7 @@ func TestPostgresAtomicAlertTransactions(t *testing.T) {
 	}
 
 	base := time.Now().UTC().Truncate(time.Millisecond)
-	if err := values.PrimePatient(ctx, patientID, base.Add(-time.Minute)); err != nil {
-		t.Fatal(err)
-	}
+	activatePostgresMonitoring(t, ctx, values, patientID, base.Add(-time.Minute), fmt.Sprintf("%064x", 99_001))
 	engine := alerts.NewEngine(alerts.DefaultThresholds())
 	measurement := postgresMeasurement(patientID, fmt.Sprintf("%064x", 1), base, 55, 1)
 	duplicate, err := values.ProcessMeasurement(ctx, measurement, []string{"family-chat"}, engine.PlanMeasurement)
@@ -75,6 +174,9 @@ func TestPostgresAtomicAlertTransactions(t *testing.T) {
 	claimed, err := values.ClaimDueAlertDeliveries(ctx, claimAt, 10, "lease-one", claimAt.Add(time.Minute))
 	if err != nil || len(claimed) != 1 || claimed[0].ID != deliveryID {
 		t.Fatalf("first delivery claim: deliveries=%#v err=%v", claimed, err)
+	}
+	if claimed[0].PatientDisplayName != "atomic-patient" {
+		t.Fatalf("PostgreSQL delivery lost patients.display_name: %#v", claimed[0])
 	}
 	claimedAgain, err := values.ClaimDueAlertDeliveries(ctx, claimAt, 10, "lease-two", claimAt.Add(time.Minute))
 	if err != nil || len(claimedAgain) != 0 {
@@ -184,11 +286,11 @@ func TestPostgresSerializesConcurrentAlertEvaluation(t *testing.T) {
 	if _, err := values.pool.Exec(ctx, `INSERT INTO households (id,name) VALUES ($1,'concurrency-test')`, householdID); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
+	defer func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
 		_, _ = values.pool.Exec(cleanupCtx, `DELETE FROM households WHERE id=$1`, householdID)
-	})
+	}()
 	if _, err := values.pool.Exec(ctx, `
 		INSERT INTO patients (id,household_id,display_name) VALUES ($1,$2,'concurrent-patient')`,
 		patientID, householdID,
@@ -196,9 +298,7 @@ func TestPostgresSerializesConcurrentAlertEvaluation(t *testing.T) {
 		t.Fatal(err)
 	}
 	base := time.Now().UTC().Truncate(time.Millisecond).Add(-time.Minute)
-	if err := values.PrimePatient(ctx, patientID, base); err != nil {
-		t.Fatal(err)
-	}
+	activatePostgresMonitoring(t, ctx, values, patientID, base, fmt.Sprintf("%064x", 99_002))
 	engine := alerts.NewEngine(alerts.DefaultThresholds())
 
 	const count = 32
@@ -265,11 +365,11 @@ func TestPostgresSignalLossBaselineSurvivesRestart(t *testing.T) {
 	if _, err := values.pool.Exec(ctx, `INSERT INTO households (id,name) VALUES ($1,'restart-test')`, householdID); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
+	defer func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cleanupCancel()
 		_, _ = values.pool.Exec(cleanupCtx, `DELETE FROM households WHERE id=$1`, householdID)
-	})
+	}()
 	if _, err := values.pool.Exec(ctx, `
 		INSERT INTO patients (id,household_id,display_name) VALUES ($1,$2,'restart-patient')`,
 		patientID, householdID,
@@ -279,9 +379,7 @@ func TestPostgresSignalLossBaselineSurvivesRestart(t *testing.T) {
 
 	base := time.Now().UTC().Truncate(time.Millisecond)
 	engine := alerts.NewEngine(alerts.DefaultThresholds())
-	if err := values.PrimePatient(ctx, patientID, base); err != nil {
-		t.Fatal(err)
-	}
+	activatePostgresMonitoring(t, ctx, values, patientID, base, fmt.Sprintf("%064x", 99_003))
 	if err := values.ProcessStaleness(ctx, patientID, base.Add(11*time.Minute), []string{"family-chat"}, engine.PlanStaleness); err != nil {
 		t.Fatal(err)
 	}
@@ -290,11 +388,8 @@ func TestPostgresSignalLossBaselineSurvivesRestart(t *testing.T) {
 		t.Fatalf("signal loss did not open: alerts=%#v err=%v", before, err)
 	}
 
-	// A later PrimePatient models a process restart. The original durable
-	// baseline and the existing signal-loss alert must both survive it.
-	if err := values.PrimePatient(ctx, patientID, base.Add(12*time.Minute)); err != nil {
-		t.Fatal(err)
-	}
+	// A process restart performs no activation write. The original durable
+	// baseline and the existing signal-loss alert must both survive unchanged.
 	if err := values.ProcessStaleness(ctx, patientID, base.Add(13*time.Minute), []string{"family-chat"}, engine.PlanStaleness); err != nil {
 		t.Fatal(err)
 	}
@@ -307,6 +402,381 @@ func TestPostgresSignalLossBaselineSurvivesRestart(t *testing.T) {
 	}
 }
 
+func TestPostgresAccessTokensResolveMultipleFamiliesWithoutStoringPlaintext(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	values, err := NewPostgres(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer values.Close()
+	if err := values.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	first := BootstrapIdentity{
+		HouseholdID: testUUID(t), PatientID: testUUID(t), DeviceID: testUUID(t),
+		DeviceTokenHash:  HashAccessToken("first-device-token-0123456789abcdef"),
+		BackendBindingID: "backend-binding-first", CredentialID: "credential-first", CredentialRevision: 1,
+		FamilySessionID: testUUID(t), FamilyTokenHash: HashAccessToken("first-family-token-0123456789abcdef"),
+		TelegramRecipients: []string{"first-family-chat"},
+	}
+	expiresAt := now.Add(time.Minute)
+	second := BootstrapIdentity{
+		HouseholdID: testUUID(t), PatientID: testUUID(t), DeviceID: testUUID(t),
+		DeviceTokenHash:  HashAccessToken("second-device-token-0123456789abcdef"),
+		BackendBindingID: "backend-binding-second", CredentialID: "credential-second", CredentialRevision: 2,
+		FamilySessionID: testUUID(t), FamilyTokenHash: HashAccessToken("second-family-token-0123456789abcdef"),
+		FamilySessionExpiresAt: &expiresAt,
+		TelegramRecipients:     []string{"second-family-chat"},
+	}
+	for _, identity := range []BootstrapIdentity{first, second} {
+		if err := values.BootstrapAccess(ctx, identity); err != nil {
+			t.Fatal(err)
+		}
+		identity := identity
+		defer func() {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cleanupCancel()
+			_, _ = values.pool.Exec(cleanupCtx, `DELETE FROM households WHERE id=$1`, identity.HouseholdID)
+		}()
+	}
+	if err := values.ValidateProductionAccess(ctx, now); err != nil {
+		rows, queryErr := values.pool.Query(ctx, `
+			SELECT p.id,
+			       EXISTS (SELECT 1 FROM devices d WHERE d.patient_id=p.id AND d.revoked_at IS NULL),
+			       EXISTS (SELECT 1 FROM family_sessions fs WHERE fs.household_id=p.household_id
+			               AND fs.revoked_at IS NULL AND (fs.expires_at IS NULL OR fs.expires_at > $1))
+			FROM patients p ORDER BY p.id`, now)
+		if queryErr != nil {
+			t.Fatalf("complete PostgreSQL access graph failed readiness: %v; inspect=%v", err, queryErr)
+		}
+		defer rows.Close()
+		var states []string
+		for rows.Next() {
+			var id string
+			var hasDevice, hasSession bool
+			if scanErr := rows.Scan(&id, &hasDevice, &hasSession); scanErr != nil {
+				t.Fatal(scanErr)
+			}
+			states = append(states, fmt.Sprintf("%s:device=%v:session=%v", id, hasDevice, hasSession))
+		}
+		t.Fatalf("complete PostgreSQL access graph failed readiness: %v states=%v", err, states)
+	}
+	if err := values.ProcessStaleness(
+		ctx, second.PatientID, now.Add(24*time.Hour), []string{"second-family-chat"},
+		alerts.NewEngine(alerts.DefaultThresholds()).PlanStaleness,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var inactiveStateCount, inactiveAlertCount int
+	if err := values.pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM patient_monitoring_state WHERE patient_id=$1),
+			(SELECT count(*) FROM alerts WHERE patient_id=$1)`, second.PatientID).Scan(&inactiveStateCount, &inactiveAlertCount); err != nil {
+		t.Fatal(err)
+	}
+	if inactiveStateCount != 0 || inactiveAlertCount != 0 {
+		t.Fatalf("provisioning implicitly started PostgreSQL monitoring: state=%d alerts=%d", inactiveStateCount, inactiveAlertCount)
+	}
+
+	device, err := values.ResolveActiveDevice(ctx, second.DeviceTokenHash, now)
+	if err != nil || device.ID != second.DeviceID || device.PatientID != second.PatientID ||
+		device.BackendBindingID != second.BackendBindingID || device.CredentialID != second.CredentialID ||
+		device.CredentialRevision != second.CredentialRevision {
+		t.Fatalf("second device resolved incorrectly: access=%#v err=%v", device, err)
+	}
+	var lastSeenAt *time.Time
+	if err := values.pool.QueryRow(ctx, `SELECT last_seen_at FROM devices WHERE id=$1`, second.DeviceID).Scan(&lastSeenAt); err != nil {
+		t.Fatal(err)
+	}
+	if lastSeenAt != nil {
+		t.Fatalf("read-only PostgreSQL auth changed last_seen_at: %v", lastSeenAt)
+	}
+	measurement := postgresMeasurement(second.PatientID, fmt.Sprintf("%064x", 88_001), now, 110, 1)
+	staleDevice := device
+	staleDevice.CredentialRevision++
+	if _, err := values.ProcessDeviceMeasurement(
+		ctx, staleDevice, measurement, nil, alerts.NewEngine(alerts.DefaultThresholds()).PlanMeasurement,
+	); !errors.Is(err, ErrCredentialConflict) {
+		t.Fatalf("stale PostgreSQL credential tuple was not blocked: %v", err)
+	}
+	if err := values.pool.QueryRow(ctx, `SELECT last_seen_at FROM devices WHERE id=$1`, second.DeviceID).Scan(&lastSeenAt); err != nil {
+		t.Fatal(err)
+	}
+	if lastSeenAt != nil {
+		t.Fatalf("stale PostgreSQL credential tuple changed last_seen_at: %v", lastSeenAt)
+	}
+	if _, err := values.ProcessDeviceMeasurement(ctx, device, measurement, nil, func(alerts.State, domain.Measurement) []alerts.Change {
+		return []alerts.Change{{Type: alerts.Opened, Alert: domain.Alert{}}}
+	}); err == nil {
+		t.Fatal("invalid PostgreSQL ingest unexpectedly succeeded")
+	}
+	if err := values.pool.QueryRow(ctx, `SELECT last_seen_at FROM devices WHERE id=$1`, second.DeviceID).Scan(&lastSeenAt); err != nil {
+		t.Fatal(err)
+	}
+	if lastSeenAt != nil {
+		t.Fatalf("failed PostgreSQL ingest changed last_seen_at: %v", lastSeenAt)
+	}
+	if duplicate, err := values.ProcessDeviceMeasurement(ctx, device, measurement, nil, alerts.NewEngine(alerts.DefaultThresholds()).PlanMeasurement); err != nil || duplicate {
+		t.Fatalf("successful PostgreSQL device ingest: duplicate=%v err=%v", duplicate, err)
+	}
+	if err := values.pool.QueryRow(ctx, `SELECT last_seen_at FROM devices WHERE id=$1`, second.DeviceID).Scan(&lastSeenAt); err != nil {
+		t.Fatal(err)
+	}
+	if lastSeenAt == nil || !lastSeenAt.Equal(measurement.ReceivedAt) {
+		t.Fatalf("successful PostgreSQL ingest did not update last_seen_at: %v", lastSeenAt)
+	}
+	if allowed, err := values.HouseholdCanAccessPatient(ctx, first.HouseholdID, second.PatientID); err != nil || allowed {
+		t.Fatalf("first household accessed second patient: allowed=%v err=%v", allowed, err)
+	}
+	for identity, expectedRecipient := range map[*BootstrapIdentity]string{
+		&first: "first-family-chat", &second: "second-family-chat",
+	} {
+		recipients, err := values.TelegramRecipients(ctx, identity.PatientID)
+		if err != nil || len(recipients) != 1 || recipients[0] != expectedRecipient {
+			t.Fatalf("patient %s recipients=%#v err=%v", identity.PatientID, recipients, err)
+		}
+	}
+	session, err := values.ResolveActiveFamilySession(ctx, second.FamilyTokenHash, now)
+	if err != nil || session.HouseholdID != second.HouseholdID {
+		t.Fatalf("second family session resolved incorrectly: access=%#v err=%v", session, err)
+	}
+	if _, err := values.ResolveActiveFamilySession(ctx, second.FamilyTokenHash, expiresAt); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired family session remained active: %v", err)
+	}
+	if err := values.RevokeDevice(ctx, second.DeviceID, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := values.ResolveActiveDevice(ctx, second.DeviceTokenHash, now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("revoked PostgreSQL device remained active: %v", err)
+	}
+	if err := values.ValidateProductionAccess(ctx, now); !errors.Is(err, ErrAccessNotProvisioned) {
+		t.Fatalf("incomplete PostgreSQL access graph passed readiness: %v", err)
+	}
+
+	var storedDeviceHash, storedFamilyHash []byte
+	if err := values.pool.QueryRow(ctx, `SELECT token_hash FROM devices WHERE id=$1`, first.DeviceID).Scan(&storedDeviceHash); err != nil {
+		t.Fatal(err)
+	}
+	if err := values.pool.QueryRow(ctx, `SELECT token_hash FROM family_sessions WHERE id=$1`, first.FamilySessionID).Scan(&storedFamilyHash); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(storedDeviceHash, first.DeviceTokenHash) || !bytes.Equal(storedFamilyHash, first.FamilyTokenHash) {
+		t.Fatal("PostgreSQL did not persist the expected one-way token digests")
+	}
+	if bytes.Contains(storedDeviceHash, []byte("first-device-token")) || bytes.Contains(storedFamilyHash, []byte("first-family-token")) {
+		t.Fatal("PostgreSQL persisted a plaintext access token")
+	}
+	if err := values.BootstrapAccess(ctx, first); err != nil {
+		t.Fatalf("exact PostgreSQL bootstrap retry failed: %v", err)
+	}
+	changed := first
+	changed.DeviceName = "Другой телефон"
+	if err := values.BootstrapAccess(ctx, changed); !errors.Is(err, ErrCredentialConflict) {
+		t.Fatalf("PostgreSQL bootstrap changed an insert-only device: %v", err)
+	}
+	changed = first
+	changedExpiry := now.Add(time.Hour)
+	changed.FamilySessionExpiresAt = &changedExpiry
+	if err := values.BootstrapAccess(ctx, changed); !errors.Is(err, ErrCredentialConflict) {
+		t.Fatalf("PostgreSQL bootstrap changed an insert-only expiry: %v", err)
+	}
+	crossRole := BootstrapIdentity{
+		HouseholdID: testUUID(t), PatientID: testUUID(t), DeviceID: testUUID(t),
+		DeviceTokenHash:  first.FamilyTokenHash,
+		BackendBindingID: "backend-binding-third", CredentialID: "credential-third", CredentialRevision: 1,
+		FamilySessionID: testUUID(t), FamilyTokenHash: HashAccessToken("third-family-token-0123456789abcdef"),
+	}
+	if err := values.BootstrapAccess(ctx, crossRole); !errors.Is(err, ErrCredentialConflict) {
+		t.Fatalf("PostgreSQL reused a family digest for a device: %v", err)
+	}
+	uppercase := BootstrapIdentity{
+		HouseholdID: strings.ToUpper(testUUID(t)), PatientID: strings.ToUpper(testUUID(t)),
+		DeviceID: strings.ToUpper(testUUID(t)), DeviceTokenHash: HashAccessToken("uppercase-device-token-0123456789abcdef"),
+		BackendBindingID: "backend-binding-uppercase", CredentialID: "credential-uppercase", CredentialRevision: 1,
+		FamilySessionID: strings.ToUpper(testUUID(t)), FamilyTokenHash: HashAccessToken("uppercase-family-token-0123456789abcdef"),
+	}
+	if err := values.BootstrapAccess(ctx, uppercase); err != nil {
+		t.Fatalf("PostgreSQL uppercase provisioning input: %v", err)
+	}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_, _ = values.pool.Exec(cleanupCtx, `DELETE FROM households WHERE id=$1`, strings.ToLower(uppercase.HouseholdID))
+	}()
+	uppercaseDevice, err := values.ResolveActiveDevice(ctx, uppercase.DeviceTokenHash, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uppercaseSession, err := values.ResolveActiveFamilySession(ctx, uppercase.FamilyTokenHash, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uppercaseDevice.ID != strings.ToLower(uppercase.DeviceID) ||
+		uppercaseDevice.PatientID != strings.ToLower(uppercase.PatientID) ||
+		uppercaseSession.ID != strings.ToLower(uppercase.FamilySessionID) ||
+		uppercaseSession.HouseholdID != strings.ToLower(uppercase.HouseholdID) {
+		t.Fatalf("PostgreSQL UUID canonicalization mismatch: device=%#v session=%#v", uppercaseDevice, uppercaseSession)
+	}
+}
+
+func TestPostgresProductionReadinessRequiresRecipientForEveryPatientHousehold(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	values, err := NewPostgres(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer values.Close()
+	if err := values.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	identity := BootstrapIdentity{
+		HouseholdID: testUUID(t), PatientID: testUUID(t), DeviceID: testUUID(t),
+		DeviceTokenHash:  HashAccessToken("recipient-readiness-device-token-0123456789"),
+		BackendBindingID: "recipient-readiness-binding", CredentialID: "recipient-readiness-credential", CredentialRevision: 1,
+		FamilySessionID: testUUID(t), FamilyTokenHash: HashAccessToken("recipient-readiness-family-token-0123456789"),
+	}
+	if err := values.BootstrapAccess(ctx, identity); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_, _ = values.pool.Exec(cleanupCtx, `DELETE FROM households WHERE id=$1`, identity.HouseholdID)
+	}()
+	now := time.Now().UTC()
+	if err := values.ValidateProductionAccess(ctx, now); !errors.Is(err, ErrAccessNotProvisioned) {
+		t.Fatalf("PostgreSQL patient without Telegram recipient passed readiness: %v", err)
+	}
+	if _, err := values.pool.Exec(ctx, `
+		INSERT INTO family_members (id,household_id,email,display_name,role,telegram_chat_id)
+		VALUES ($1,$2,'recipient-readiness@example.invalid','Родственник','relative','123456789')`,
+		testUUID(t), identity.HouseholdID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := values.ValidateProductionAccess(ctx, now); err != nil {
+		t.Fatalf("complete PostgreSQL delivery graph failed readiness: %v", err)
+	}
+}
+
+func TestPostgresIngestWaitsForPatientBeforeLockingDevice(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	values, err := NewPostgres(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer values.Close()
+	if err := values.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	identity := BootstrapIdentity{
+		HouseholdID: testUUID(t), PatientID: testUUID(t), DeviceID: testUUID(t),
+		DeviceTokenHash:  HashAccessToken("lock-order-device-token-0123456789abcdef"),
+		BackendBindingID: "lock-order-binding", CredentialID: "lock-order-credential", CredentialRevision: 1,
+		FamilySessionID: testUUID(t), FamilyTokenHash: HashAccessToken("lock-order-family-token-0123456789abcdef"),
+	}
+	if err := values.BootstrapAccess(ctx, identity); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_, _ = values.pool.Exec(cleanupCtx, `DELETE FROM households WHERE id=$1`, identity.HouseholdID)
+	}()
+	device, err := values.ResolveActiveDevice(ctx, identity.DeviceTokenHash, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	guard, err := values.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guard.Rollback(context.Background())
+	if _, err := guard.Exec(ctx, `SELECT id FROM patients WHERE id=$1 FOR UPDATE`, identity.PatientID); err != nil {
+		t.Fatal(err)
+	}
+
+	ingestDone := make(chan error, 1)
+	go func() {
+		measurement := postgresMeasurement(
+			identity.PatientID,
+			fmt.Sprintf("%064x", 91_001),
+			time.Now().UTC().Truncate(time.Millisecond),
+			110,
+			1,
+		)
+		_, processErr := values.ProcessDeviceMeasurement(
+			ctx,
+			device,
+			measurement,
+			nil,
+			func(alerts.State, domain.Measurement) []alerts.Change { return nil },
+		)
+		ingestDone <- processErr
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		err := values.pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_stat_activity
+				WHERE pid <> pg_backend_pid()
+				  AND wait_event_type='Lock'
+				  AND query LIKE '%FROM patients%'
+				  AND query LIKE '%FOR UPDATE%'
+			)`).Scan(&waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ingest did not wait on the patient lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if _, err := guard.Exec(ctx, `SET LOCAL lock_timeout='250ms'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := guard.Exec(ctx, `SELECT id FROM devices WHERE id=$1 FOR UPDATE`, identity.DeviceID); err != nil {
+		t.Fatalf("ingest locked device before patient, enabling provisioning deadlock: %v", err)
+	}
+	if err := guard.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-ingestDone:
+		if err != nil {
+			t.Fatalf("ingest failed after lock-order check: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("ingest did not finish after patient lock release: %v", ctx.Err())
+	}
+}
+
 func postgresMeasurement(patientID, eventID string, at time.Time, glucose int, sequence uint64) domain.Measurement {
 	return domain.Measurement{
 		EventID: eventID, PatientID: patientID, SensorID: "sensor-atomic",
@@ -314,6 +784,24 @@ func postgresMeasurement(patientID, eventID string, at time.Time, glucose int, s
 		ReceivedAt: at.Add(time.Minute), GlucoseMgDL: glucose,
 		TrendMgDLPerMinute: -0.2, Quality: domain.QualityValid,
 		Sequence: sequence,
+	}
+}
+
+func activatePostgresMonitoring(
+	t *testing.T,
+	ctx context.Context,
+	values *Postgres,
+	patientID string,
+	at time.Time,
+	eventID string,
+) {
+	t.Helper()
+	value := postgresMeasurement(patientID, eventID, at, 110, 0)
+	value.SensorID = "activation-" + eventID
+	value.ReceivedAt = at
+	duplicate, err := values.ProcessMeasurement(ctx, value, nil, func(alerts.State, domain.Measurement) []alerts.Change { return nil })
+	if err != nil || duplicate {
+		t.Fatalf("activate monitoring: duplicate=%v err=%v", duplicate, err)
 	}
 }
 

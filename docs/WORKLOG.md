@@ -335,3 +335,150 @@ Android, backend, сайтом и Telegram продолжается. После 
 5. Проверка звука ночью: громкость, DND, канал, повтор и подтверждение.
 6. Только после успешных ворот — отдельное решение владельца о допуске
    реальных значений к экрану, тревогам, backend и Telegram.
+
+## TDD разрешённого ядра, общего GATT и семейного backend
+
+2 августа 2026 года после повторного аудита продуктового пути закрыта следующая
+программная итерация до появления телефона и датчика.
+
+Сначала тестами воспроизведены, затем исправлены:
+
+- сравнение `ByteArray` из двух независимых Room-query по ссылке, которое на
+  устройстве отклоняло бы корректный checkpoint физического допуска;
+- выдуманный общий прогрев: `V116A` теперь использует сохранённый start и
+  строгую границу 45 минут, а `V115G` не получает синтетический warmup;
+- потеря терминальности нативной ошибки после успешного checkpoint-commit;
+  runtime немедленно закрывается, сохраняя уже подтверждённый префикс batch;
+- отсутствие product-фасада над реальным GATT: один внутренний Bluetooth-engine
+  теперь обслуживает раздельные diagnostic и approved product API, а product
+  batch выходит только после durable cursor confirmation;
+- риск потери следующего WorkManager wake-up во время активного drain;
+  одноразовые работы используют последовательную `APPEND_OR_REPLACE`-цепочку;
+- отсутствие явного шага разблокировки outbox после выдачи credential;
+  добавлен проверенный порядок `persist → requeue → drain`. Production-адаптер
+  массового requeue в Room пока не подставлен и не имитируется пустой операцией;
+- запоздалый callback продуктовой сессии Android, который мог бы переписать
+  состояние другого режима; product UI получил отдельный generation gate;
+- `null`-перезапуск foreground service, который забывал подтверждённый product
+  режим;
+- backend readiness без получателя Telegram, неоднозначные сообщения нескольких
+  пациентов, неограниченные scheduler-context и различие регистра UUID в URL.
+
+Все реальные значения по-прежнему остаются за физическим выпускным барьером.
+Новый product-фасад не подключён к `SensorForegroundService`, а текущую модель
+допуска ещё требуется разделить на повторно используемый проверенный профиль и
+активацию конкретного одноразового сенсора. Это зафиксировано как следующий P0,
+а не скрыто за «готовым» маркером.
+
+## Общий GATT engine и product facade
+
+- TDD-тестами закреплено: cursor reject не выпускает значения; успешное durable
+  подтверждение сохраняет полный batch и порядок; два batch не схлопываются;
+  diagnostic output не превращается в product publication.
+- Бывшая Android diagnostic-оболочка разделена на один внутренний Bluetooth
+  engine и два фасада. Diagnostic API сохранён. Product facade использует
+  approved opener вместе с durable publication repository и не имеет
+  `latestDiagnostic`.
+- Product batch проходит ограниченный `SUSPEND`-буфер. При заполнении producer
+  ждёт collector вместо drop или неограниченного роста памяти. Runtime core
+  events входят в GATT actor через backpressure, а не через callback `trySend`.
+- Exact pending-ingress replay отдаёт восстановленный publication batch после
+  проверки диапазона и до `markHandled`.
+- Проверки: полный `:sensor:sibionics:testDebugUnitTest` и
+  `:app:compileDebugKotlin` — успешно.
+
+## Финальный preflight итерации
+
+- Android: 680 Gradle-задач, 650 JVM-тестов без пропусков и ошибок, Room
+  instrumentation APK, lint app/sensor, debug APK, Android-test APK и
+  minified release/R8 — успешно.
+- Backend: unit, race, vet, govulncheck, чистая PostgreSQL 18 integration-среда
+  и `docker compose config` — успешно.
+- Проверки репозитория не нашли секретов, случайных migration/legacy-механизмов
+  или упоминаний исследовательского приложения в продуктовом коде.
+- Реальные показания не разблокированы: первый телефон и отдельный датчик всё
+  ещё нужны для ARM/JNI, BLE, прогрева, reboot/Doze и звукового испытания.
+
+## TDD семейной HTTP-границы
+
+- Красный тест показал, что family-session Bearer открывал snapshot, history и
+  acknowledge, хотя OpenAPI документировал только cookie.
+- Bearer fallback удалён. Все семейные маршруты принимают token только из
+  `family_session`; неизвестная cookie не может откатиться к валидному Bearer.
+- Device ingest не изменён и по-прежнему использует отдельный Bearer token.
+- OpenAPI закрепляет cookie-only схему и обязательные для будущего issuer
+  атрибуты `HttpOnly`, `Secure`, `SameSite=Strict`.
+- Backend `go test ./...`, `go test -race ./...` и `go vet ./...` проходят.
+- Rate limit и ограниченная пагинация/лимит history честно остаются P1 до
+  публичного deploy.
+
+## Честная граница Android provisioning
+
+- Красная compile-проверка закрепила удаление вводящего в заблуждение типа
+  `VerifiedRemoteProvisioningPayload`, который можно было создать из
+  произвольных metadata и bytes.
+- Контейнер переименован в внутренний `RemoteProvisioningPayload`; он по-прежнему
+  одноразово владеет секретом, стирает исходный массив и не раскрывает данные в
+  `toString`, но больше не заявляет о проверке identity.
+- До пользовательского onboarding остаётся обязательным отдельный
+  authenticated/signed parser provisioning-конверта.
+- Целевой `RemoteSyncLifecycleTest` после изменения проходит.
+
+## TDD окна commit → локальные эффекты
+
+2 августа 2026 года повторный crash-window аудит обнаружил, что runtime сначала
+эмитировал `Finalized`, а затем `Committed`, а buffered channel подтверждал лишь
+RAM-enqueue. При смерти процесса это позволяло отметить BLE ingress обработанным
+до фактического применения результата.
+
+Сначала добавлены падающие тесты порядка, failure/cancellation, terminal prefix,
+covered/partial recovery, missing rows, suffix output и закрытого generation.
+После них реализовано:
+
+- live `Committed → Finalized`; недоставленный commit не создаёт outcome;
+- recovery-await не отправляет live events и возвращает результат единственному
+  caller для exact validation;
+- `sourceIngressId` проходит от journaled packet до raw sample, закреплён Room
+  FK и проверяется до атомарной core-записи по полному ingress evidence;
+- read-only Room reader восстанавливает publication только из канонически
+  проверенных result/measurement/outbox/approval/binding, никогда из повторно
+  декодированного пакета;
+- `ALREADY_COVERED` и покрытый prefix `PARTIAL_OVERLAP` требуют exact-size
+  contiguous Room proof; suffix не публикуется, partial остаётся pending;
+- committed prefix терминальных `Rejected`, `Closed` и `StorageConflict`
+  доставляется до terminal failure и не закрывает ingress;
+- product batch требует typed `acknowledgeDurablyApplied`; reject имеет только
+  ограниченный enum-код. RAM-enqueue не считается локальным эффектом.
+
+Открытая fail-closed граница: новый duplicate ingress с тем же packet, но без
+собственных linked raw rows, пока не дедуплицируется по одному checkpoint. Для
+безопасного пропуска нужен exact earlier ingress с durable outcome и реальный
+BLE duplicate/reconnect test. Также production local-effects cursor/outbox и
+его consumer ещё не подключены, поэтому product facade нельзя считать готовой
+ночной тревогой только из-за наличия ack API.
+
+Целевые проверки итерации: `core:data` — 68 JVM-тестов; `sensor:sibionics` —
+326 JVM-тестов; ошибок и пропусков нет. Android instrumentation sources для
+`core:data` компилируются, `git diff --check` чист. Физический Android-прогон не
+подменяется этой проверкой.
+
+## Контрольный срез перед полным вертикальным циклом — 2 августа 2026
+
+После замечания владельца порядок работ возвращён к продуктовому результату:
+следующая итерация обязана связать уже проверенный сенсорный тракт с экраном,
+локальной тревогой, виджетом, сервером и семейным сайтом. Дополнительные редкие
+сценарии ядра не считаются основанием бесконечно откладывать эту связку.
+
+Перед фиксацией среза выполнен единый Android preflight: 680 Gradle-задач,
+723/723 JVM-теста без ошибок и пропусков, lint приложения и сенсорных модулей,
+Room instrumentation APK, debug APK, Android-test APK и minified release/R8 —
+успешно. Web: typecheck, lint, production build и 23/23 теста — успешно;
+production audit не нашёл уязвимостей высокого уровня. Backend: 132/132 теста
+на временной чистой PostgreSQL 18, тот же набор под race detector, vet,
+govulncheck, проверка модулей, compose и CI-конфигурации — успешно.
+
+На этом срезе честная граница остаётся такой: onboarding и диагностический BLE
+тракт существуют, но foreground service ещё не запускает product GATT facade,
+а экран, тревога, виджет и uploader ещё не получают подтверждённое измерение из
+одного долговечного Room-конвейера. Это и есть следующий P0, а не новая серия
+изолированных защитных доработок.

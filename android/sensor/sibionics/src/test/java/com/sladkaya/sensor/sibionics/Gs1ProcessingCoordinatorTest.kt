@@ -1,6 +1,7 @@
 package com.sladkaya.sensor.sibionics
 
 import com.sladkaya.core.data.AtomicSensorCoreRecord
+import com.sladkaya.core.data.ProductPublicationContext
 import com.sladkaya.core.data.SensorAlgorithmCheckpointRecord
 import com.sladkaya.core.data.SensorCoreCommitResult
 import com.sladkaya.core.data.SensorCoreStore
@@ -31,6 +32,102 @@ import org.junit.Test
 
 class Gs1ProcessingCoordinatorTest {
     @Test
+    fun approvedFreshValidStepCreatesTheOnlyPublishableMeasurementWithExactLineage() = runBlocking {
+        val native = FakeNative().apply {
+            results += NativeAlgorithmSnapshot(5.8, trend = -2)
+        }
+        val store = FakeStore()
+        val context = productContext()
+        val current = sample(index = 65, reindex = 0)
+        val coordinator = coordinator(
+            native = native,
+            store = store,
+            firstIndex = 65,
+            phoneClock = { current.sensorTimeEpochSeconds * 1_000L + 1_000L },
+            productContext = context,
+        )
+
+        val result = coordinator.process(byteArrayOf(1, 2, 3), current)
+            as Gs1ProcessingResult.ProductPublicationReady
+
+        assertEquals(104, result.publication.reading.glucoseMgDl)
+        assertEquals(ReadingQuality.VALID, result.publication.reading.quality)
+        assertEquals(context.approvalId, result.publication.approvalId)
+        assertEquals(context.publicationBindingId, result.publication.publicationBindingId)
+        val committed = store.records.single()
+        assertTrue(committed.result.publishable)
+        assertTrue(committed.result.alarmEligible)
+        assertEquals(ReadingQuality.VALID, committed.measurement?.quality)
+        assertEquals(context, committed.publicationContext)
+        assertEquals(context.approvedCheckpointContext(), committed.approvedCheckpointContext)
+        assertEquals(context.approvalId, committed.checkpoint.publicationApprovalId)
+        assertEquals(context.approvalId, committed.result.publicationApprovalId)
+    }
+
+    @Test
+    fun approvedHistoryAdvancesCheckpointWithoutMeasurementAlarmOrPublication() = runBlocking {
+        val native = FakeNative().apply {
+            results += NativeAlgorithmSnapshot(5.8, trend = 0)
+        }
+        val store = FakeStore()
+        val context = productContext()
+        val history = sample(index = 65, reindex = 3)
+        val coordinator = coordinator(
+            native = native,
+            store = store,
+            firstIndex = 65,
+            productContext = context,
+        )
+
+        val result = coordinator.process(byteArrayOf(4, 5, 6), history)
+            as Gs1ProcessingResult.ApprovedCheckpointOnly
+
+        assertEquals(65L, result.sequence)
+        assertEquals(ReadingQuality.DEGRADED, result.quality)
+        val committed = store.records.single()
+        assertFalse(committed.result.publishable)
+        assertFalse(committed.result.alarmEligible)
+        assertNull(committed.measurement)
+        assertNull(committed.publicationContext)
+        assertEquals(context.approvedCheckpointContext(), committed.approvedCheckpointContext)
+        assertEquals(context.approvalId, committed.checkpoint.publicationApprovalId)
+        assertEquals(context.approvalId, committed.result.publicationApprovalId)
+    }
+
+    @Test
+    fun approvedAlgorithmCheckpointFailureIsPersistedWithoutPublicationAndClosesSession() = runBlocking {
+        val native = FakeNative().apply {
+            results += NativeAlgorithmSnapshot(40.0, trend = 0)
+            results += NativeAlgorithmSnapshot(5.8, trend = 0)
+        }
+        val store = FakeStore()
+        val context = productContext()
+        val coordinator = coordinator(
+            native = native,
+            store = store,
+            firstIndex = 65,
+            productContext = context,
+        )
+
+        val failure = coordinator.process(byteArrayOf(7), sample(index = 65))
+            as Gs1ProcessingResult.Rejected
+        val repeated = coordinator.process(byteArrayOf(8), sample(index = 66))
+
+        assertEquals("INVALID_GLUCOSE", failure.code)
+        assertTrue(failure.checkpointCommitted)
+        assertTrue(failure.terminalAfterCommit)
+        assertTrue(repeated is Gs1ProcessingResult.Closed)
+        val committed = store.records.single()
+        assertFalse(committed.result.publishable)
+        assertFalse(committed.result.alarmEligible)
+        assertNull(committed.measurement)
+        assertNull(committed.publicationContext)
+        assertEquals(context.approvedCheckpointContext(), committed.approvedCheckpointContext)
+        assertEquals("INVALID_GLUCOSE", committed.result.algorithmErrorCode)
+        assertEquals(1, native.releaseCount)
+    }
+
+    @Test
     fun commitsRawDiagnosticResultAndCheckpointBeforeAdvancingSession() = runBlocking {
         val native = FakeNative().apply {
             results += NativeAlgorithmSnapshot(6.0, trend = -2, glucoseWarning = 1)
@@ -57,30 +154,148 @@ class Gs1ProcessingCoordinatorTest {
         assertFalse(saved.result.alarmEligible)
         assertNull(saved.measurement)
         assertEquals(65, saved.checkpoint.sequence)
+        assertEquals(1_700_000_000_000L, saved.checkpoint.sensorStartTimeEpochMs)
         assertArrayEquals(native.exportedState, saved.checkpoint.stateCopy())
     }
 
     @Test
-    fun warmupAndHistoryRemainExplicitDiagnosticQualities() = runBlocking {
+    fun freshV116aDerivesAndPersistsStartFromTheFirstSensorIndex() = runBlocking {
+        val native = FakeNative().apply {
+            results += NativeAlgorithmSnapshot(5.8, trend = 0)
+        }
+        val store = FakeStore()
+        val first = sample(index = 1)
+        val coordinator = coordinator(
+            native = native,
+            store = store,
+            firstIndex = 1,
+            phoneClock = { first.sensorTimeEpochSeconds * 1_000L + 1_000L },
+        )
+
+        val result = coordinator.process(byteArrayOf(1), first)
+
+        assertTrue(result is Gs1ProcessingResult.Diagnostic)
+        assertEquals(
+            first.sensorTimeEpochSeconds * 1_000L - 60_000L,
+            store.records.single().checkpoint.sensorStartTimeEpochMs,
+        )
+    }
+
+    @Test
+    fun v116aKeepsCurrentValuesInWarmupThroughMinute45AndHistoryDegraded() = runBlocking {
         val native = FakeNative().apply {
             results += NativeAlgorithmSnapshot(5.5, trend = 0)
             results += NativeAlgorithmSnapshot(5.6, trend = 0)
+            results += NativeAlgorithmSnapshot(5.7, trend = 0)
         }
         val store = FakeStore()
-        val coordinator = coordinator(native, store, firstIndex = 60)
+        val first = sample(index = 45, reindex = 0)
+        val coordinator = coordinator(
+            native,
+            store,
+            firstIndex = 45,
+            phoneClock = { first.sensorTimeEpochSeconds * 1_000L + 100_000L },
+        )
 
-        val warmup = coordinator.process(byteArrayOf(1), sample(index = 60, reindex = 0))
-        val history = coordinator.process(byteArrayOf(2), sample(index = 61, reindex = 3))
+        val warming = coordinator.process(byteArrayOf(1), first)
+        val current = coordinator.process(byteArrayOf(2), sample(index = 46, reindex = 0))
+        val history = coordinator.process(byteArrayOf(3), sample(index = 47, reindex = 3))
 
         assertEquals(
             ReadingQuality.WARMING_UP,
-            (warmup as Gs1ProcessingResult.Diagnostic).candidate.quality,
+            (warming as Gs1ProcessingResult.Diagnostic).candidate.quality,
+        )
+        assertEquals(
+            ReadingQuality.VALID,
+            (current as Gs1ProcessingResult.Diagnostic).candidate.quality,
         )
         assertEquals(
             ReadingQuality.DEGRADED,
             (history as Gs1ProcessingResult.Diagnostic).candidate.quality,
         )
-        assertEquals(listOf(false, false), store.records.map { it.result.alarmEligible })
+        assertEquals(listOf(false, false, false), store.records.map { it.result.alarmEligible })
+    }
+
+    @Test
+    fun v115gHasNoSyntheticWarmupAndCanUseItsFirstFreshCurrentValue() = runBlocking {
+        val native = FakeNative(profile = AlgorithmProfile.V115G).apply {
+            results += NativeAlgorithmSnapshot(5.5, trend = 0)
+        }
+        val store = FakeStore()
+        val first = sample(index = 1, reindex = 0)
+        val result = coordinator(
+            native = native,
+            store = store,
+            firstIndex = 1,
+            phoneClock = { first.sensorTimeEpochSeconds * 1_000L + 100_000L },
+            profile = AlgorithmProfile.V115G,
+        ).process(byteArrayOf(1), first) as Gs1ProcessingResult.Diagnostic
+
+        assertEquals(ReadingQuality.VALID, result.candidate.quality)
+    }
+
+    @Test
+    fun approvedV116aWarmupAdvancesStateWithoutMeasurementOrOutbox() = runBlocking {
+        val native = FakeNative().apply {
+            results += NativeAlgorithmSnapshot(5.5, trend = 0)
+            results += NativeAlgorithmSnapshot(5.6, trend = 0)
+        }
+        val store = FakeStore()
+        val context = productContext()
+        val minute45 = sample(index = 45, reindex = 0)
+        val coordinator = coordinator(
+            native = native,
+            store = store,
+            firstIndex = 45,
+            phoneClock = { minute45.sensorTimeEpochSeconds * 1_000L + 100_000L },
+            productContext = context,
+        )
+
+        val warming = coordinator.process(byteArrayOf(1), minute45)
+            as Gs1ProcessingResult.ApprovedCheckpointOnly
+        val ready = coordinator.process(byteArrayOf(2), sample(index = 46, reindex = 0))
+            as Gs1ProcessingResult.ProductPublicationReady
+
+        assertEquals(ReadingQuality.WARMING_UP, warming.quality)
+        assertNull(store.records.first().measurement)
+        assertFalse(store.records.first().result.alarmEligible)
+        assertEquals(ReadingQuality.VALID, ready.publication.reading.quality)
+        assertEquals(ReadingQuality.VALID, store.records.last().measurement?.quality)
+    }
+
+    @Test
+    fun v116aReopenRejectsTamperedSensorStartBeforeNativeWork() = runBlocking {
+        val first = sample(index = 46)
+        val exactStart = first.sensorTimeEpochSeconds * 1_000L - 46L * 60_000L
+        val validNative = FakeNative().apply {
+            results += NativeAlgorithmSnapshot(5.8, trend = 0)
+        }
+        val valid = coordinator(
+            native = validNative,
+            store = FakeStore(),
+            firstIndex = 46,
+            phoneClock = { first.sensorTimeEpochSeconds * 1_000L + 1_000L },
+            initialSensorStartTimeEpochMs = exactStart,
+        ).process(byteArrayOf(1), first) as Gs1ProcessingResult.Diagnostic
+
+        val tamperedNative = FakeNative().apply {
+            results += NativeAlgorithmSnapshot(5.8, trend = 0)
+        }
+        val tamperedStore = FakeStore()
+        val rejected = coordinator(
+            native = tamperedNative,
+            store = tamperedStore,
+            firstIndex = 46,
+            phoneClock = { first.sensorTimeEpochSeconds * 1_000L + 1_000L },
+            initialSensorStartTimeEpochMs = exactStart + 60_000L,
+        ).process(byteArrayOf(2), first) as Gs1ProcessingResult.Rejected
+
+        assertEquals(ReadingQuality.VALID, valid.candidate.quality)
+        assertEquals("SENSOR_START_TIME_MISMATCH", rejected.code)
+        assertTrue(tamperedNative.processedIndices.isEmpty())
+        assertTrue(tamperedStore.records.isEmpty())
+        assertEquals("SENSOR_START_TIME_MISMATCH", tamperedStore.failures.single().failureCode)
+        assertFalse(tamperedStore.failures.single().nativeStateMayHaveChanged)
     }
 
     @Test
@@ -370,13 +585,20 @@ class Gs1ProcessingCoordinatorTest {
         store: FakeStore,
         firstIndex: Int,
         phoneClock: () -> Long = { sample(65).sensorTimeEpochSeconds * 1_000L + 100_000L },
+        productContext: ProductPublicationContext? = null,
+        profile: AlgorithmProfile = native.profile,
+        initialSensorStartTimeEpochMs: Long? = if (firstIndex == 1) {
+            null
+        } else {
+            sample(firstIndex).sensorTimeEpochSeconds * 1_000L - firstIndex.toLong() * 60_000L
+        },
     ): Gs1ProcessingCoordinator {
         val first = sample(firstIndex)
         val checkpoint = if (firstIndex == 1) {
             null
         } else {
             AlgorithmCheckpoint(
-                profile = AlgorithmProfile.V116A,
+                profile = profile,
                 binarySetId = native.binarySetId,
                 sensitivityToken = SensitivityToken.packageCode("ABCDEFGH"),
                 initializationMode = AlgorithmInitializationMode.STANDARD,
@@ -390,7 +612,7 @@ class Gs1ProcessingCoordinatorTest {
             )
         }
         val opened = SibionicsAlgorithmSession.open(
-            profile = AlgorithmProfile.V116A,
+            profile = profile,
             sensitivityToken = SensitivityToken.packageCode("ABCDEFGH"),
             initializationMode = AlgorithmInitializationMode.STANDARD,
             checkpoint = checkpoint,
@@ -408,11 +630,30 @@ class Gs1ProcessingCoordinatorTest {
                 encoding = SensitivityEncoding.NORMAL,
             ),
             store = store,
-            transportProtocol = "GS1_V120",
+            transportProtocol = when (profile) {
+                AlgorithmProfile.V116A -> "GS1_V120"
+                AlgorithmProfile.V115G -> "GS1_V115"
+            },
             transportCodecId = "transport-codec-test",
+            algorithmProfile = profile,
+            initialSensorStartTimeEpochMs = initialSensorStartTimeEpochMs,
+            productContext = productContext,
             phoneClock = phoneClock,
         )
     }
+
+    private fun productContext() = ProductPublicationContext(
+        approvalId = "ab".repeat(32),
+        publicationBindingId = "cd".repeat(32),
+        httpsOrigin = "https://family.example",
+        backendBindingId = "binding-1",
+        credentialId = "credential-1",
+        credentialRevision = 1,
+        expectedPatientId = "11111111-1111-4111-8111-111111111111",
+        expectedDeviceId = "22222222-2222-4222-8222-222222222222",
+        nativeBinarySetSha256 = "12".repeat(32),
+        nativeDatahandleBinarySetSha256 = "34".repeat(32),
+    )
 
     private fun sample(
         index: Int,
@@ -489,10 +730,11 @@ private class FakeStore(
     }
 }
 
-private class FakeNative : NativeAlgorithmApi {
-    override val profile = AlgorithmProfile.V116A
-    override val binarySetId = "v116a-test"
-    override val algorithmVersion = "1.1.6A-test"
+private class FakeNative(
+    override val profile: AlgorithmProfile = AlgorithmProfile.V116A,
+) : NativeAlgorithmApi {
+    override val binarySetId = "${profile.name.lowercase()}-test"
+    override val algorithmVersion = "${profile.name}-test"
     val results = ArrayDeque<NativeAlgorithmSnapshot>()
     val processedIndices = mutableListOf<Int>()
     val exportedState = ByteArray(profile.stateSize) { (it * 13).toByte() }
