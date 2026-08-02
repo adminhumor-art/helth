@@ -1,18 +1,26 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { buildDemoSamples, formatHours, splitChartSegments } from "./glucose-data.mjs";
+import { useRouter } from "next/navigation";
+import type { FamilyDashboardResult } from "./family-api.mjs";
+import { createDashboardViewModel } from "./dashboard-data.mjs";
+import { formatHours } from "./glucose-data.mjs";
 
 const ranges = [3, 6, 24] as const;
 
-function GlucoseChart({ hours }: { hours: number }) {
+type Props = {
+  initialView: FamilyDashboardResult;
+  patientLabel?: string;
+};
+
+function GlucoseChart({ view, hours }: { view: FamilyDashboardResult; hours: number }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const samples = useMemo(() => buildDemoSamples(hours), [hours]);
-  const segments = useMemo(() => splitChartSegments(samples), [samples]);
+  const segments = view.chartSegments;
+  const samples = useMemo(() => segments.flat(), [segments]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!canvas || samples.length === 0) return;
 
     const render = () => {
       const rect = canvas.getBoundingClientRect();
@@ -75,7 +83,8 @@ function GlucoseChart({ hours }: { hours: number }) {
         context.fill();
       });
 
-      const last = samples[samples.length - 1];
+      const last = samples.at(-1);
+      if (!last) return;
       context.fillStyle = last.value <= 70 ? "#d34949" : "#176b57";
       context.beginPath();
       context.arc(x(last.minute), y(last.value), 5, 0, Math.PI * 2);
@@ -94,35 +103,91 @@ function GlucoseChart({ hours }: { hours: number }) {
   return <canvas ref={canvasRef} role="img" aria-label={`График глюкозы за ${formatHours(hours)}`} />;
 }
 
-export default function Dashboard() {
+export default function Dashboard({ initialView, patientLabel = "Мама" }: Props) {
+  const router = useRouter();
   const [range, setRange] = useState<(typeof ranges)[number]>(6);
-  const [acknowledged, setAcknowledged] = useState(false);
+  const [view, setView] = useState(initialView);
+  const [acknowledgedAlerts, setAcknowledgedAlerts] = useState<Set<string>>(new Set());
+  const [acknowledging, setAcknowledging] = useState(false);
+  const [acknowledgeError, setAcknowledgeError] = useState(false);
+
+  useEffect(() => setView(initialView), [initialView]);
+
+  const ready = view.state === "ready" ? view : null;
+  const latest = ready?.latest ?? null;
+  const currentAlert = ready?.openAlerts.find((alert) =>
+    alert.acknowledgedAtEpochMs === null && !acknowledgedAlerts.has(alert.id)
+  ) ?? null;
+  const isDemo = view.source === "demo";
+  const demoAttention = isDemo && latest !== null && (latest.glucoseMgDl <= 70 || latest.glucoseMgDl >= 250);
+  const needsAttention = currentAlert !== null || demoAttention;
+  const trend = latest === null ? 0 : latest.trendMgDlPerMinute || demoTrend(view);
+  const status = latest === null
+    ? "Нет свежих данных"
+    : latest.glucoseMgDl <= 70
+      ? "Низкое значение"
+      : latest.glucoseMgDl >= 250
+        ? "Высокое значение"
+        : "В диапазоне";
+
+  const selectRange = (hours: (typeof ranges)[number]) => {
+    setRange(hours);
+    if (isDemo) setView(createDashboardViewModel({ mode: "demo", hours }));
+  };
+
+  const acknowledge = async () => {
+    if (isDemo) {
+      setAcknowledgedAlerts(new Set(["demo"]));
+      return;
+    }
+    if (!currentAlert || acknowledging) return;
+    setAcknowledging(true);
+    setAcknowledgeError(false);
+    try {
+      const response = await fetch(`/api/alerts/${currentAlert.id}/acknowledge`, {
+        method: "POST",
+        headers: { accept: "application/json" },
+      });
+      if (!response.ok) throw new Error("acknowledge failed");
+      setAcknowledgedAlerts((current) => new Set(current).add(currentAlert.id));
+      router.refresh();
+    } catch {
+      setAcknowledgeError(true);
+    } finally {
+      setAcknowledging(false);
+    }
+  };
+
+  const demoAcknowledged = acknowledgedAlerts.has("demo");
+  const alertAcknowledged = demoAcknowledged || (!isDemo && currentAlert === null && ready?.openAlerts.length !== 0);
 
   return (
     <main className="shell">
       <header className="topbar">
         <div className="brand"><span className="brand-mark" aria-hidden="true" />Сладкая</div>
         <div className="top-status">
-          <span className="online-dot" aria-hidden="true" />
-          <span>Демо-экран активен</span>
+          <span className={ready ? "online-dot" : "offline-dot"} aria-hidden="true" />
+          <span>{isDemo ? "Демо-экран активен" : ready ? "Данные с телефона получены" : "Свежих данных нет"}</span>
           <span className="avatar" aria-label="Профиль владельца">Я</span>
         </div>
       </header>
 
-      <section className="demo-banner" aria-label="Режим демонстрации">
-        <strong>ДЕМО · СИМУЛЯЦИЯ</strong>
-        <span>Все значения, тревоги, люди и статусы на этом экране — тестовые.</span>
+      <section className={isDemo ? "demo-banner" : "live-banner"} aria-label={isDemo ? "Режим демонстрации" : "Живые данные"}>
+        <strong>{isDemo ? "ДЕМО · СИМУЛЯЦИЯ" : "СЕМЕЙНЫЙ ДОСТУП"}</strong>
+        <span>{isDemo
+          ? "Все значения, тревоги, люди и статусы на этом экране — тестовые."
+          : "Показаны последние проверенные сервером данные; при потере свежести число скрывается."}</span>
       </section>
 
       <section className="dashboard-head" aria-labelledby="page-title">
         <div>
           <p className="eyebrow">Семейное наблюдение</p>
-          <h1 id="page-title">Добрый вечер</h1>
+          <h1 id="page-title">{patientLabel}</h1>
         </div>
         <label>
           <span className="sr-only">Выберите человека</span>
-          <select className="patient-select" defaultValue="mother">
-            <option value="mother">Мама · SiBionics GS1Sb</option>
+          <select className="patient-select" defaultValue="current" disabled>
+            <option value="current">{patientLabel}{isDemo ? " · GS1Sb" : ""}</option>
           </select>
         </label>
       </section>
@@ -131,69 +196,141 @@ export default function Dashboard() {
         <section className="card glucose-card" aria-label="Состояние глюкозы">
           <div className="glucose-summary">
             <div>
-              <span className="status-pill">Низкое значение</span>
-              <div className="glucose-value">
-                <strong>3,2</strong><span>ммоль/л<br />58 мг/дл</span>
-                <span className="trend-arrow" aria-label="снижается">↓</span>
-              </div>
-              <p className="trend-copy">Снижается · −0,3 ммоль/л за 5 минут</p>
+              <span className={needsAttention ? "status-pill" : "status-pill normal"}>{status}</span>
+              {latest ? (
+                <>
+                  <div className="glucose-value">
+                    <strong>{formatMmol(latest.glucoseMgDl)}</strong><span>ммоль/л<br />{latest.glucoseMgDl} мг/дл</span>
+                    <span className="trend-arrow" aria-label={trendLabel(trend)}>{trendArrow(trend)}</span>
+                  </div>
+                  <p className={needsAttention ? "trend-copy" : "trend-copy normal"}>{trendDescription(trend)}</p>
+                </>
+              ) : (
+                <div className="unavailable-value" role="status"><strong>—</strong><p>{unavailableMessage(view.reason)}</p></div>
+              )}
             </div>
-            <aside className="alert-panel" aria-live="polite">
-              <h2>{acknowledged ? "Тревога подтверждена" : "Требуется внимание"}</h2>
-              <p>{acknowledged ? "В демо-режиме тревога отмечена как просмотренная." : "Симуляция: Telegram отмечен как отправленный двум родственникам."}</p>
-              <button
-                className={`acknowledge${acknowledged ? " done" : ""}`}
-                onClick={() => setAcknowledged(true)}
-                disabled={acknowledged}
-              >
-                {acknowledged ? "Уведомление принято" : "Я увидел тревогу"}
-              </button>
-            </aside>
+            {needsAttention || alertAcknowledged ? (
+              <aside className="alert-panel" aria-live="polite">
+                <h2>{alertAcknowledged ? "Тревога подтверждена" : "Требуется внимание"}</h2>
+                <p>{alertAcknowledged
+                  ? "Семья отметила, что увидела эту тревогу."
+                  : isDemo
+                    ? "Симуляция: серверная и Telegram-тревога показаны только для проверки интерфейса."
+                    : "Открытая тревога получена с семейного сервера."}</p>
+                {!alertAcknowledged && (
+                  <button className="acknowledge" onClick={acknowledge} disabled={acknowledging}>
+                    {acknowledging ? "Подтверждаем…" : "Я увидел тревогу"}
+                  </button>
+                )}
+                {acknowledgeError && <p className="inline-error">Не удалось подтвердить. Повторите ещё раз.</p>}
+              </aside>
+            ) : null}
           </div>
 
           <div className="chart-section">
             <div className="chart-head">
-              <div><h2>История глюкозы</h2><p>Демо-диапазон тревог 3,9–10,0 ммоль/л · разрыв не соединяется линией</p></div>
-              <div className="range-tabs" role="group" aria-label="Период графика">
-                {ranges.map((hours) => (
-                  <button key={hours} className={range === hours ? "active" : ""} onClick={() => setRange(hours)} aria-pressed={range === hours}>
-                    {hours} ч
-                  </button>
-                ))}
-              </div>
+              <div><h2>История глюкозы</h2><p>{isDemo ? "Демо-диапазон тревог 3,9–10,0 ммоль/л · разрыв не соединяется линией" : "Пропуски данных не соединяются ложной линией"}</p></div>
+              {isDemo ? (
+                <div className="range-tabs" role="group" aria-label="Период графика">
+                  {ranges.map((hours) => (
+                    <button key={hours} className={range === hours ? "active" : ""} onClick={() => selectRange(hours)} aria-pressed={range === hours}>
+                      {hours} ч
+                    </button>
+                  ))}
+                </div>
+              ) : <span className="range-label">6 ч</span>}
             </div>
-            <div className="chart-wrap"><GlucoseChart hours={range} /></div>
-            <div className="chart-legend"><span>{formatHours(range)} назад</span><span>Сейчас · обновлено минуту назад</span></div>
+            {ready && view.chartSegments.length > 0 ? (
+              <>
+                <div className="chart-wrap"><GlucoseChart view={view} hours={range} /></div>
+                <div className="chart-legend"><span>{formatHours(range)} назад</span><span>Сейчас</span></div>
+              </>
+            ) : <div className="empty-chart">График появится после получения свежей истории.</div>}
           </div>
         </section>
 
         <aside className="side-column">
           <section className="card side-card">
-            <h2>Связь и устройства</h2>
+            <h2>Связь и данные</h2>
             <div className="metric-list">
-              <div className="metric"><span className="metric-icon" aria-hidden="true">◉</span><div><strong>Датчик</strong><span>GS1Sb · осталось 11 дней</span></div><span className="metric-state">На связи</span></div>
-              <div className="metric"><span className="metric-icon" aria-hidden="true">▯</span><div><strong>Телефон мамы</strong><span>Заряд 64% · интернет есть</span></div><span className="metric-state">Онлайн</span></div>
-              <div className="metric"><span className="metric-icon" aria-hidden="true">✦</span><div><strong>Telegram</strong><span>Два получателя</span></div><span className="metric-state">Готов</span></div>
+              <div className="metric"><span className="metric-icon" aria-hidden="true">◉</span><div><strong>Измерение</strong><span>{ready ? "Проверено и принято" : "Ожидается"}</span></div><span className={ready ? "metric-state" : "metric-state muted"}>{ready ? "Есть" : "Нет"}</span></div>
+              <div className="metric"><span className="metric-icon" aria-hidden="true">▯</span><div><strong>Телефон</strong><span>{isDemo ? "Тестовый статус" : "Источник семейных данных"}</span></div><span className="metric-state">{isDemo ? "Демо" : ready ? "На связи" : "Нет данных"}</span></div>
+              <div className="metric"><span className="metric-icon" aria-hidden="true">!</span><div><strong>Открытые тревоги</strong><span>На семейном сервере</span></div><span className={ready?.openAlerts.length ? "metric-state danger" : "metric-state"}>{ready?.openAlerts.length ?? 0}</span></div>
             </div>
           </section>
 
           <section className="card side-card">
-            <h2>Семья</h2>
-            <div className="family-list">
-              <div className="family-member"><div className="member-profile"><span className="member-avatar">РМ</span><div><strong>Ринат</strong><span>Владелец группы</span></div></div><time>онлайн</time></div>
-              <div className="family-member"><div className="member-profile"><span className="member-avatar">АК</span><div><strong>Анна</strong><span>Родственник</span></div></div><time>5 мин</time></div>
-            </div>
-          </section>
-
-          <section className="card side-card">
-            <h2>Последние события</h2>
-            <div className="event-row critical"><strong>Низкая глюкоза · 3,2</strong><p>Сейчас · Telegram отправлен</p></div>
-            <div className="event-row"><strong>Связь восстановлена</strong><p>Сегодня, 21:44 · перерыв 2 минуты</p></div>
-            <div className="event-row"><strong>Значение вернулось в диапазон</strong><p>Сегодня, 18:17</p></div>
+            <h2>Последнее событие</h2>
+            {latest ? (
+              <div className={needsAttention ? "event-row critical" : "event-row"}>
+                <strong>{status} · {formatMmol(latest.glucoseMgDl)}</strong>
+                <p>{isDemo ? "Симулированное измерение" : formatUpdateTime(latest.sensorTimeEpochMs)}</p>
+              </div>
+            ) : <p className="side-empty">Без свежего показания. Старое число намеренно не показывается.</p>}
           </section>
         </aside>
       </div>
-      <p className="demo-note">Сейчас показаны симулированные данные. Экран не выдаёт медицинских рекомендаций.</p>
+      <p className="demo-note">{isDemo
+        ? "Сейчас показаны симулированные данные. Экран не выдаёт медицинских рекомендаций."
+        : "Сервис помогает семье заметить тревогу, но не заменяет экстренную помощь или медицинское решение."}</p>
     </main>
   );
+}
+
+function demoTrend(view: FamilyDashboardResult): number {
+  if (view.source !== "demo" || view.state !== "ready") return 0;
+  const points = view.chartSegments.flat();
+  const last = points.at(-1);
+  const previous = points.at(-2);
+  return last && previous ? (last.value - previous.value) / Math.max(last.minute - previous.minute, 1) : 0;
+}
+
+function formatMmol(mgDl: number): string {
+  return (mgDl / 18).toFixed(1).replace(".", ",");
+}
+
+function trendArrow(trend: number): string {
+  if (trend <= -2) return "↓";
+  if (trend < -0.5) return "↘";
+  if (trend >= 2) return "↑";
+  if (trend > 0.5) return "↗";
+  return "→";
+}
+
+function trendLabel(trend: number): string {
+  if (trend <= -2) return "быстро снижается";
+  if (trend < -0.5) return "снижается";
+  if (trend >= 2) return "быстро растёт";
+  if (trend > 0.5) return "растёт";
+  return "стабильно";
+}
+
+function trendDescription(trend: number): string {
+  const label = trendLabel(trend);
+  if (Math.abs(trend) <= 0.5) return "Стабильно";
+  const deltaMmol = Math.abs(trend * 5 / 18).toFixed(1).replace(".", ",");
+  return `${label[0].toUpperCase()}${label.slice(1)} · ${trend < 0 ? "−" : "+"}${deltaMmol} ммоль/л за 5 минут`;
+}
+
+function unavailableMessage(reason: string | null): string {
+  switch (reason) {
+    case "unauthorized": return "Нужно войти в семейный доступ.";
+    case "stale": return "Последнее измерение устарело.";
+    case "missing": return "Телефон ещё не передал измерение.";
+    case "not-ready": return "Датчик ещё не готов к показу значения.";
+    case "clock-mismatch": return "Время телефона требует проверки.";
+    case "offline":
+    case "temporarily-unavailable": return "Сервер временно недоступен.";
+    default: return "Достоверное текущее значение недоступно.";
+  }
+}
+
+function formatUpdateTime(sensorTimeEpochMs: number): string {
+  return new Intl.DateTimeFormat("ru-RU", {
+    hour: "2-digit",
+    minute: "2-digit",
+    day: "2-digit",
+    month: "2-digit",
+    timeZone: "Europe/Minsk",
+  }).format(new Date(sensorTimeEpochMs));
 }

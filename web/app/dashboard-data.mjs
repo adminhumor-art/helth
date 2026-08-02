@@ -10,6 +10,7 @@ const SENSOR_FAMILIES = new Set([
   "sibionics_gs3",
 ]);
 const QUALITIES = new Set(["valid", "warming_up", "degraded"]);
+const ALERT_KINDS = new Set(["low", "high", "rapid_fall", "rapid_rise", "signal_loss"]);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const CONTENT_EVENT_ID = /^[0-9a-f]{64}$/;
 const RFC3339 = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/;
@@ -65,6 +66,7 @@ function createDemoViewModel(input) {
       ? { glucoseMgDl: latest.value, trendMgDlPerMinute: 0, sensorTimeEpochMs: 0 }
       : null,
     chartSegments: splitChartSegments(samples, MAX_CONNECTED_GAP_MINUTES),
+    openAlerts: [],
   };
 }
 
@@ -81,6 +83,8 @@ function createLiveViewModel(input, expectedPatientId, nowEpochMs, staleAfterMs)
   if (!sameUuid(snapshot.patientId, expectedPatientId) || !Array.isArray(snapshot.openAlerts)) {
     return unavailable("invalid");
   }
+  const openAlerts = parseOpenAlerts(snapshot.openAlerts, expectedPatientId, nowEpochMs);
+  if (openAlerts === null) return unavailable("invalid");
   if (snapshot.freshness === "missing" || snapshot.latest === null) {
     return unavailable("missing");
   }
@@ -114,7 +118,44 @@ function createLiveViewModel(input, expectedPatientId, nowEpochMs, staleAfterMs)
       hours,
       nowEpochMs,
     ),
+    openAlerts,
   };
+}
+
+/**
+ * @param {unknown[]} input
+ * @param {string} patientId
+ * @param {number} nowEpochMs
+ */
+function parseOpenAlerts(input, patientId, nowEpochMs) {
+  const parsed = [];
+  const identities = new Set();
+  for (const value of input) {
+    if (!isRecord(value) || !isUuid(value.id) || !sameUuid(value.patientId, patientId) ||
+        typeof value.kind !== "string" || !ALERT_KINDS.has(value.kind)) return null;
+    const openedAtEpochMs = parseRfc3339(value.openedAt);
+    if (openedAtEpochMs === null || openedAtEpochMs > nowEpochMs + MAX_SERVER_CLOCK_SKEW_MS) return null;
+    if (value.closedAt !== undefined && value.closedAt !== null) return null;
+    const acknowledgedAtEpochMs = value.acknowledgedAt === undefined || value.acknowledgedAt === null
+      ? null
+      : parseRfc3339(value.acknowledgedAt);
+    if (value.acknowledgedAt !== undefined && value.acknowledgedAt !== null &&
+        (acknowledgedAtEpochMs === null || acknowledgedAtEpochMs < openedAtEpochMs ||
+          acknowledgedAtEpochMs > nowEpochMs + MAX_SERVER_CLOCK_SKEW_MS)) return null;
+    if (value.glucoseMgDl !== undefined && value.glucoseMgDl !== null &&
+        (!Number.isInteger(value.glucoseMgDl) || value.glucoseMgDl < 20 || value.glucoseMgDl > 600)) return null;
+    const identity = value.id.toLowerCase();
+    if (identities.has(identity)) return null;
+    identities.add(identity);
+    parsed.push({
+      id: identity,
+      kind: value.kind,
+      openedAtEpochMs,
+      acknowledgedAtEpochMs,
+      glucoseMgDl: value.glucoseMgDl ?? null,
+    });
+  }
+  return parsed.sort((left, right) => left.openedAtEpochMs - right.openedAtEpochMs);
 }
 
 /**
@@ -331,6 +372,7 @@ function unavailable(reason) {
     reason,
     latest: null,
     chartSegments: [],
+    openAlerts: [],
   };
 }
 

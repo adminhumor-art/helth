@@ -9,12 +9,21 @@ export type LatestGlucoseView = {
   sensorTimeEpochMs: number;
 };
 
+export type OpenAlertView = {
+  id: string;
+  kind: "low" | "high" | "rapid_fall" | "rapid_rise" | "signal_loss";
+  openedAtEpochMs: number;
+  acknowledgedAtEpochMs: number | null;
+  glucoseMgDl: number | null;
+};
+
 export type ReadyDashboardViewModel = {
   source: DataSource;
   state: "ready";
   reason: null;
   latest: LatestGlucoseView;
   chartSegments: Sample[][];
+  openAlerts: OpenAlertView[];
 };
 
 export type UnavailableDashboardViewModel = {
@@ -23,6 +32,7 @@ export type UnavailableDashboardViewModel = {
   reason: UnavailableReason;
   latest: null;
   chartSegments: Sample[][];
+  openAlerts: [];
 };
 
 export type DashboardViewModel = ReadyDashboardViewModel | UnavailableDashboardViewModel;

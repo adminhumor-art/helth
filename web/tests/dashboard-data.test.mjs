@@ -100,6 +100,39 @@ test("fresh valid backend data becomes a typed live view model", () => {
   });
   assert.equal(result.chartSegments.length, 2);
   assert.deepEqual(result.chartSegments.map((segment) => segment.map((point) => point.value)), [[101, 93], [58]]);
+  assert.deepEqual(result.openAlerts, []);
+});
+
+test("only validated open alerts in the same patient scope reach the dashboard", () => {
+  const alert = {
+    id: "00000000-0000-4000-8000-000000000090",
+    patientId: PATIENT_ID,
+    kind: "low",
+    openedAt: "2026-08-01T11:59:10Z",
+    measurementId: "00000000-0000-4000-8000-000000000001",
+    glucoseMgDl: 58,
+  };
+  const result = live(snapshot(measurement(), { openAlerts: [alert] }));
+
+  assert.equal(result.state, "ready");
+  assert.deepEqual(result.openAlerts, [{
+    id: alert.id,
+    kind: "low",
+    openedAtEpochMs: Date.parse(alert.openedAt),
+    acknowledgedAtEpochMs: null,
+    glucoseMgDl: 58,
+  }]);
+
+  for (const invalid of [
+    { ...alert, patientId: ANOTHER_PATIENT_ID },
+    { ...alert, id: "not-a-uuid" },
+    { ...alert, kind: "medical_advice" },
+    { ...alert, acknowledgedAt: "not-a-time" },
+  ]) {
+    const rejected = live(snapshot(measurement(), { openAlerts: [invalid] }));
+    assert.equal(rejected.state, "unavailable");
+    assert.equal(rejected.reason, "invalid");
+  }
 });
 
 test("maximum JSON-safe sequence remains representable in live data", () => {

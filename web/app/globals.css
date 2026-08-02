@@ -122,6 +122,34 @@ select:focus-visible {
   box-shadow: 0 0 0 5px rgba(41, 169, 120, 0.12);
 }
 
+.offline-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #a9b4b0;
+  box-shadow: 0 0 0 5px rgba(99, 118, 114, 0.1);
+}
+
+.live-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: -8px 0 24px;
+  padding: 11px 14px;
+  border: 1px solid #c8ddd4;
+  border-radius: 14px;
+  color: #31564d;
+  background: rgba(220, 238, 231, 0.7);
+  font-size: 12px;
+}
+
+.live-banner strong {
+  flex: 0 0 auto;
+  color: var(--green);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+
 .avatar {
   display: grid;
   width: 38px;
@@ -224,6 +252,15 @@ h1 {
   background: var(--danger);
 }
 
+.status-pill.normal {
+  color: var(--green);
+  background: var(--green-soft);
+}
+
+.status-pill.normal::before {
+  background: var(--green);
+}
+
 .glucose-value {
   display: flex;
   align-items: baseline;
@@ -249,6 +286,10 @@ h1 {
   color: var(--danger);
   font-size: 15px;
   font-weight: 720;
+}
+
+.trend-copy.normal {
+  color: var(--green);
 }
 
 .trend-arrow {
@@ -277,6 +318,12 @@ h1 {
   color: #76504c;
   font-size: 13px;
   line-height: 1.45;
+}
+
+.alert-panel .inline-error {
+  margin: 10px 0 0;
+  color: #a3242b;
+  font-weight: 700;
 }
 
 .acknowledge {
@@ -352,6 +399,16 @@ h1 {
   box-shadow: 0 2px 8px rgba(36, 63, 56, 0.08);
 }
 
+.range-label {
+  padding: 7px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--muted);
+  background: #f7f9f7;
+  font-size: 12px;
+  font-weight: 720;
+}
+
 .chart-wrap {
   height: 280px;
   position: relative;
@@ -360,6 +417,33 @@ h1 {
 .chart-wrap canvas {
   width: 100%;
   height: 100%;
+}
+
+.empty-chart {
+  display: grid;
+  min-height: 220px;
+  place-items: center;
+  border: 1px dashed var(--line);
+  border-radius: 16px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.unavailable-value {
+  min-height: 120px;
+}
+
+.unavailable-value strong {
+  display: block;
+  font-size: clamp(64px, 10vw, 104px);
+  line-height: 0.85;
+}
+
+.unavailable-value p,
+.side-empty {
+  margin: 14px 0 0;
+  color: var(--muted);
+  line-height: 1.5;
 }
 
 .chart-legend {
