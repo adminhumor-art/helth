@@ -119,6 +119,7 @@ class Gs1ApprovedCheckpointAtomicContractTest {
     private fun productContext(approvalId: String) = ProductPublicationContext(
         approvalId = approvalId,
         publicationBindingId = "cd".repeat(32),
+        remotePublicationBindingId = "de".repeat(32),
         httpsOrigin = "https://family.example",
         backendBindingId = "binding-1",
         credentialId = "credential-1",

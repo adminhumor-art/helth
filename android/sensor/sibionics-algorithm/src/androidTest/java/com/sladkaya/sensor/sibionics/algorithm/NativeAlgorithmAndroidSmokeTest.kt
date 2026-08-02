@@ -30,17 +30,23 @@ class NativeAlgorithmAndroidSmokeTest {
     }
 
     @Test
-    fun v116aFactionBranchUsesRealJniAndReleasesContext() {
+    fun v116aProductContractExposesOnlyTheOfficialStandardInitialization() {
         requireSupportedArmRuntime()
 
-        factionSmoke(V116ANativeAlgorithmApi())
+        assertEquals(
+            setOf(AlgorithmInitializationMode.STANDARD),
+            V116ANativeAlgorithmApi().supportedInitializationModes,
+        )
     }
 
     @Test
-    fun v115gFactionBranchUsesRealJniAndReleasesContext() {
+    fun v115gProductContractExposesOnlyTheProvenStandardInitialization() {
         requireSupportedArmRuntime()
 
-        factionSmoke(V115GNativeAlgorithmApi())
+        assertEquals(
+            setOf(AlgorithmInitializationMode.STANDARD),
+            V115GNativeAlgorithmApi().supportedInitializationModes,
+        )
     }
 
     private fun smoke(
@@ -56,24 +62,6 @@ class NativeAlgorithmAndroidSmokeTest {
 
         val context = api.createContext()
         assertEquals(1, api.release(context))
-    }
-
-    private fun factionSmoke(api: NativeAlgorithmApi) {
-        assertTrue(AlgorithmInitializationMode.FACTION in api.supportedInitializationModes)
-        val context = api.createContext()
-        try {
-            assertEquals(
-                "The pinned library must accept the exact faction entry point",
-                1,
-                api.initialize(
-                    context = context,
-                    sensitivityToken = "ABCDEFGH",
-                    mode = AlgorithmInitializationMode.FACTION,
-                ),
-            )
-        } finally {
-            assertEquals(1, api.release(context))
-        }
     }
 
     private fun requireSupportedArmRuntime() {

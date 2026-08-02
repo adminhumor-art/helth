@@ -18,7 +18,14 @@ import androidx.room.RoomDatabase
         PhysicalSensorApprovalEntity::class,
         ProductPublicationBindingEntity::class,
         ActiveSensorPublicationBindingEntity::class,
+        ActiveRemotePublicationBindingEntity::class,
         UploadOutboxEntity::class,
+        LocalReadingEffectEntity::class,
+        LocalAlarmMonitoringStartEntity::class,
+        LocalAlarmStateEntity::class,
+        LocalAlarmApplicationEntity::class,
+        LocalAlarmWatchdogApplicationEntity::class,
+        LocalAlarmDeliveryEntity::class,
     ],
     version = 1,
     exportSchema = true,
@@ -28,6 +35,9 @@ internal abstract class SladkayaDatabase : RoomDatabase() {
     abstract fun sensorCore(): SensorCoreDao
     abstract fun sensorPacketIngress(): SensorPacketIngressDao
     abstract fun committedSensorIngress(): CommittedSensorIngressDao
+    abstract fun localReadingEffects(): LocalReadingEffectDao
+    abstract fun localAlarms(): LocalAlarmDao
+    abstract fun localAlarmDeliveries(): LocalAlarmDeliveryDao
 
     companion object {
         @Volatile private var instance: SladkayaDatabase? = null

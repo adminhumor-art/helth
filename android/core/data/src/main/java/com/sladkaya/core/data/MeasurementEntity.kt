@@ -19,6 +19,7 @@ data class MeasurementEntity(
     val sequence: Long,
     val publicationApprovalId: String? = null,
     val publicationBindingId: String? = null,
+    val remotePublicationBindingId: String? = null,
     val httpsOrigin: String? = null,
     val backendBindingId: String? = null,
     val credentialId: String? = null,
@@ -51,12 +52,37 @@ internal fun GlucoseReading.toEntity(context: ProductPublicationContext) = Measu
     sequence = sequence,
     publicationApprovalId = context.approvalId,
     publicationBindingId = context.publicationBindingId,
+    remotePublicationBindingId = context.remotePublicationBindingId,
     httpsOrigin = context.httpsOrigin,
     backendBindingId = context.backendBindingId,
     credentialId = context.credentialId,
     credentialRevision = context.credentialRevision,
     expectedPatientId = context.expectedPatientId,
     expectedDeviceId = context.expectedDeviceId,
+)
+
+internal fun GlucoseReading.toEntity(
+    approvedContext: ApprovedCheckpointContext,
+    publicationContext: ProductPublicationContext?,
+) = MeasurementEntity(
+    eventId = eventId,
+    sensorId = sensorId,
+    sensorFamily = sensorFamily.wireName,
+    sensorTimeEpochMs = sensorTimeEpochMs,
+    phoneTimeEpochMs = phoneTimeEpochMs,
+    glucoseMgDl = glucoseMgDl,
+    trendMgDlPerMinute = trendMgDlPerMinute,
+    quality = quality.wireName,
+    sequence = sequence,
+    publicationApprovalId = approvedContext.approvalId,
+    publicationBindingId = approvedContext.publicationBindingId,
+    remotePublicationBindingId = publicationContext?.remotePublicationBindingId,
+    httpsOrigin = publicationContext?.httpsOrigin,
+    backendBindingId = publicationContext?.backendBindingId,
+    credentialId = publicationContext?.credentialId,
+    credentialRevision = publicationContext?.credentialRevision,
+    expectedPatientId = publicationContext?.expectedPatientId,
+    expectedDeviceId = publicationContext?.expectedDeviceId,
 )
 
 internal fun MeasurementEntity.toModel() = GlucoseReading(

@@ -85,6 +85,15 @@ class GlucosePresentationPolicyTest {
     }
 
     @Test
+    fun largeCurrentNumberIsHiddenWhenReadingIsStaleOrClockIsInvalid() {
+        assertTrue(CurrentGlucoseNumberPolicy.show(ReadingFreshness.FRESH))
+        assertTrue(!CurrentGlucoseNumberPolicy.show(ReadingFreshness.NOT_READY))
+        assertTrue(!CurrentGlucoseNumberPolicy.show(ReadingFreshness.MISSING))
+        assertTrue(!CurrentGlucoseNumberPolicy.show(ReadingFreshness.STALE))
+        assertTrue(!CurrentGlucoseNumberPolicy.show(ReadingFreshness.CLOCK_MISMATCH))
+    }
+
+    @Test
     fun chartDoesNotConnectAcrossMissingMeasurements() {
         val series = GlucoseChartPolicy.build(
             listOf(

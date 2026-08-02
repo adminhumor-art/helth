@@ -36,6 +36,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -57,8 +58,17 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.sladkaya.app.service.AlarmNotifier
+import com.sladkaya.app.service.DiagnosticSensorActivationStartResult
+import com.sladkaya.app.service.DiagnosticResumeIdentity
+import com.sladkaya.app.service.DiagnosticSessionPreferenceStore
+import com.sladkaya.app.service.LocalProductSensorConfigurationSource
+import com.sladkaya.app.service.ProductAutomaticStartPolicy
+import com.sladkaya.app.service.SensorLaunchDecision
+import com.sladkaya.app.service.SensorLaunchPolicy
 import com.sladkaya.app.service.SensorForegroundService
 import com.sladkaya.app.service.PendingDiagnosticGs1OnboardingStateStore
+import com.sladkaya.app.familyaccess.FamilyAccessRoute
+import com.sladkaya.app.familyaccess.ProductionFamilyAccessFactory
 import com.sladkaya.app.onboarding.DataMatrixScannerActivity
 import com.sladkaya.app.onboarding.DataMatrixManualReason
 import com.sladkaya.app.onboarding.DataMatrixPackageCodeResolution
@@ -94,13 +104,18 @@ private val WarningSoft = Color(0xFFFFF3CF)
 
 private enum class RequestedServiceStart {
     Sensor,
+    SensorEnsure,
     Diagnostic,
+    DiagnosticActivation,
     Demo,
     Search,
 }
 
 private val RequestedServiceStart.alarmMonitoring: Boolean
-    get() = this == RequestedServiceStart.Sensor || this == RequestedServiceStart.Demo
+    get() = this == RequestedServiceStart.Sensor ||
+        this == RequestedServiceStart.SensorEnsure ||
+        this == RequestedServiceStart.DiagnosticActivation ||
+        this == RequestedServiceStart.Demo
 
 class MainActivity : ComponentActivity() {
     private var lifecycleRevision by mutableIntStateOf(0)
@@ -128,6 +143,9 @@ class MainActivity : ComponentActivity() {
                 }
                 val setupState by setupCoordinator.state.collectAsStateWithLifecycle()
                 val appState by AppState.state.collectAsStateWithLifecycle()
+                val productConfigurationSource = remember {
+                    LocalProductSensorConfigurationSource(this@MainActivity)
+                }
                 DisposableEffect(setupCoordinator) {
                     onDispose { setupCoordinator.cancelSearch() }
                 }
@@ -138,11 +156,50 @@ class MainActivity : ComponentActivity() {
                 var setupOpen by rememberSaveable { mutableStateOf(false) }
                 var scannerMessage by rememberSaveable { mutableStateOf<String?>(null) }
                 var scannerSuggestedCode by rememberSaveable { mutableStateOf<String?>(null) }
+                var sensorActivationInProgress by rememberSaveable { mutableStateOf(false) }
+                var sensorActivationMessage by rememberSaveable { mutableStateOf<String?>(null) }
+                var pendingDiagnosticActivationEventId by rememberSaveable {
+                    mutableStateOf<String?>(null)
+                }
+                fun activateDiagnosticEvent(diagnosticEventId: String) {
+                    val accepted = SensorForegroundService.activateDiagnosticSensor(
+                        diagnosticEventId,
+                    ) { result ->
+                        sensorActivationInProgress = false
+                        when (result) {
+                            DiagnosticSensorActivationStartResult.Started -> {
+                                sensorActivationMessage = null
+                                setupOpen = false
+                            }
+                            is DiagnosticSensorActivationStartResult.Failed -> {
+                                sensorActivationMessage = result.message
+                            }
+                        }
+                    }
+                    if (!accepted) {
+                        sensorActivationInProgress = false
+                        sensorActivationMessage =
+                            "Диагностика уже остановлена. Запустите её ещё раз."
+                    }
+                }
                 fun startPermitted(mode: RequestedServiceStart) {
                     when (mode) {
                         RequestedServiceStart.Sensor -> SensorForegroundService.start(this@MainActivity)
+                        RequestedServiceStart.SensorEnsure ->
+                            SensorForegroundService.ensureStarted(this@MainActivity)
                         RequestedServiceStart.Diagnostic ->
                             SensorForegroundService.startDiagnostic(this@MainActivity)
+                        RequestedServiceStart.DiagnosticActivation -> {
+                            val eventId = pendingDiagnosticActivationEventId
+                            pendingDiagnosticActivationEventId = null
+                            if (eventId == null) {
+                                sensorActivationInProgress = false
+                                sensorActivationMessage =
+                                    "Точка проверки изменилась. Запустите диагностику ещё раз."
+                            } else {
+                                activateDiagnosticEvent(eventId)
+                            }
+                        }
                         RequestedServiceStart.Demo -> SensorForegroundService.startDemo(this@MainActivity)
                         RequestedServiceStart.Search -> scope.launch {
                             setupCoordinator.search()
@@ -150,12 +207,16 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 fun showPermissionRequired(mode: RequestedServiceStart) {
-                    AppState.onSetupRequired(
-                        RequiredPermissionPolicy.denialMessage(
-                            this@MainActivity,
-                            mode.alarmMonitoring,
-                        ),
+                    val message = RequiredPermissionPolicy.denialMessage(
+                        this@MainActivity,
+                        mode.alarmMonitoring,
                     )
+                    if (mode == RequestedServiceStart.DiagnosticActivation) {
+                        pendingDiagnosticActivationEventId = null
+                        sensorActivationInProgress = false
+                        sensorActivationMessage = message
+                    }
+                    AppState.onSetupRequired(message)
                     com.sladkaya.app.widget.GlucoseWidgetProvider.showSetupRequired(this@MainActivity)
                 }
                 val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -185,6 +246,59 @@ class MainActivity : ComponentActivity() {
                     } else {
                         pendingStart = mode
                         launcher.launch(missing.toTypedArray())
+                    }
+                }
+                fun presentSensorConfigurationFailure(message: String) {
+                    AppState.onSetupRequired(message)
+                    com.sladkaya.app.widget.GlucoseWidgetProvider.showSetupRequired(
+                        this@MainActivity,
+                    )
+                }
+                fun requestSensorOrSetup() {
+                    scope.launch {
+                        when (
+                            val decision = SensorLaunchPolicy.decide(
+                                productConfigurationSource.active(),
+                            )
+                        ) {
+                            SensorLaunchDecision.StartProduct -> {
+                                setupOpen = false
+                                requestStart(RequestedServiceStart.Sensor)
+                            }
+                            SensorLaunchDecision.OpenSetup -> setupOpen = true
+                            is SensorLaunchDecision.FailClosed ->
+                                presentSensorConfigurationFailure(decision.message)
+                        }
+                    }
+                }
+                LaunchedEffect(productConfigurationSource) {
+                    val diagnosticResumeActive = runCatching {
+                        onboardingStore.loadPendingDiagnosticProfile()?.let { profile ->
+                            DiagnosticSessionPreferenceStore(this@MainActivity).matches(
+                                DiagnosticResumeIdentity.fingerprint(profile),
+                            )
+                        } == true
+                    }.getOrElse { true }
+                    if (!ProductAutomaticStartPolicy.shouldEnsure(
+                            setupOpen = setupOpen,
+                            diagnosticResumeActive = diagnosticResumeActive,
+                        )
+                    ) {
+                        if (diagnosticResumeActive) setupOpen = true
+                        return@LaunchedEffect
+                    }
+                    when (
+                        val decision = SensorLaunchPolicy.decide(
+                            productConfigurationSource.active(),
+                        )
+                    ) {
+                        SensorLaunchDecision.StartProduct -> {
+                            setupOpen = false
+                            requestStart(RequestedServiceStart.SensorEnsure)
+                        }
+                        SensorLaunchDecision.OpenSetup -> Unit
+                        is SensorLaunchDecision.FailClosed ->
+                            presentSensorConfigurationFailure(decision.message)
                     }
                 }
                 val dataMatrixLauncher = rememberLauncherForActivityResult(
@@ -228,6 +342,8 @@ class MainActivity : ComponentActivity() {
                         diagnostic = appState.diagnostic,
                         scannerMessage = scannerMessage,
                         scannerSuggestedCode = scannerSuggestedCode,
+                        activationInProgress = sensorActivationInProgress,
+                        activationMessage = sensorActivationMessage,
                         onBack = {
                             setupCoordinator.cancelSearch()
                             setupOpen = false
@@ -266,6 +382,12 @@ class MainActivity : ComponentActivity() {
                                 AppState.onSetupRequired("Диагностика остановлена")
                             }
                         },
+                        onUseSensor = { diagnosticEventId ->
+                            sensorActivationInProgress = true
+                            sensorActivationMessage = null
+                            pendingDiagnosticActivationEventId = diagnosticEventId
+                            requestStart(RequestedServiceStart.DiagnosticActivation)
+                        },
                         onReset = {
                             if (SensorForegroundService.stop(this@MainActivity)) {
                                 scannerMessage = null
@@ -277,7 +399,11 @@ class MainActivity : ComponentActivity() {
                     )
                 } else {
                     SladkayaScreen(
-                        onStart = { setupOpen = true },
+                        onStart = {
+                            sensorActivationInProgress = false
+                            sensorActivationMessage = null
+                            requestSensorOrSetup()
+                        },
                         onStartDemo = { requestStart(RequestedServiceStart.Demo) },
                         capabilityRevision = permissionRevision + lifecycleRevision,
                     )
@@ -312,8 +438,11 @@ private fun SladkayaScreen(
     val state by AppState.state.collectAsStateWithLifecycle()
     val settingsStore = remember { AlarmSettingsStore(context) }
     val alarmNotifier = remember { AlarmNotifier(context).also(AlarmNotifier::createChannels) }
+    val familyAccessCoordinator = remember(context) {
+        ProductionFamilyAccessFactory.createCoordinator(context)
+    }
     var loadedSettings by remember { mutableStateOf(settingsStore.load()) }
-    var settingsOpen by remember { mutableStateOf(false) }
+    var destination by rememberSaveable { mutableStateOf(SladkayaDestination.Dashboard) }
     val nowEpochMs by produceState(System.currentTimeMillis()) {
         while (true) {
             delay(30_000L)
@@ -337,10 +466,22 @@ private fun SladkayaScreen(
     val batteryOptimizationNeedsAction = remember(context, capabilityRevision, nowEpochMs) {
         BatteryOptimizationAccess.needsUserAction(context)
     }
-    if (settingsOpen) {
+    if (destination == SladkayaDestination.FamilyAccess) {
+        FamilyAccessRoute(
+            coordinator = familyAccessCoordinator,
+            onBack = {
+                destination = SladkayaNavigation.backFrom(destination)
+            },
+        )
+        return
+    }
+    if (destination == SladkayaDestination.AlarmSettings) {
         AlarmSettingsScreen(
             initial = loadedSettings,
-            onBack = { settingsOpen = false },
+            onBack = {
+                destination = SladkayaNavigation.backFrom(destination)
+            },
+            onOpenFamilyAccess = { destination = SladkayaDestination.FamilyAccess },
             onSave = { thresholds ->
                 if (!settingsStore.save(thresholds)) {
                     false
@@ -351,7 +492,7 @@ private fun SladkayaScreen(
                     )
                     com.sladkaya.app.widget.GlucoseWidgetProvider.refreshAll(context)
                     SensorForegroundService.reloadAlarmSettings()
-                    settingsOpen = false
+                    destination = SladkayaDestination.Dashboard
                     true
                 }
             },
@@ -365,7 +506,11 @@ private fun SladkayaScreen(
             modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp, vertical = 16.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            Header(state, freshness, onSettings = { settingsOpen = true })
+            Header(
+                state,
+                freshness,
+                onSettings = { destination = SladkayaDestination.AlarmSettings },
+            )
             BlePermissionWarning(blePermissionsGranted)
             AlarmNotificationWarning(notificationCapability)
             BatteryOptimizationWarning(batteryOptimizationNeedsAction)
@@ -619,7 +764,6 @@ private fun CurrentGlucoseCard(
 ) {
     val reading = state.latest
     val critical = state.activeAlarms.any { it == AlarmKind.LOW || it == AlarmKind.HIGH }
-    var alarmAcknowledged by remember(state.activeAlarms) { mutableStateOf(false) }
     Card(
         shape = RoundedCornerShape(26.dp),
         colors = CardDefaults.cardColors(containerColor = Color.White),
@@ -632,9 +776,26 @@ private fun CurrentGlucoseCard(
                 Text(sourceBadge(state), color = Forest, fontSize = 9.sp, fontWeight = FontWeight.Bold,
                     modifier = Modifier.background(MintSoft, RoundedCornerShape(20.dp)).padding(horizontal = 9.dp, vertical = 5.dp))
             }
-            if (reading == null) {
+            if (reading == null || !CurrentGlucoseNumberPolicy.show(freshness)) {
                 Text("—", color = Ink, fontSize = 72.sp, fontWeight = FontWeight.SemiBold)
-                Text("Ожидание первого измерения", color = Muted, fontSize = 13.sp)
+                Text(
+                    freshnessMessage(freshness) ?: "Ожидание первого измерения",
+                    color = when (freshness) {
+                        ReadingFreshness.NOT_READY -> Warning
+                        ReadingFreshness.STALE,
+                        ReadingFreshness.CLOCK_MISMATCH,
+                        -> Danger
+                        ReadingFreshness.MISSING,
+                        ReadingFreshness.FRESH,
+                        -> Muted
+                    },
+                    fontSize = 13.sp,
+                    fontWeight = if (freshness == ReadingFreshness.MISSING) {
+                        FontWeight.Normal
+                    } else {
+                        FontWeight.Bold
+                    },
+                )
             } else {
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(formatMmol(reading), color = if (critical) Danger else Ink, fontSize = 74.sp, lineHeight = 74.sp, fontWeight = FontWeight.SemiBold)
@@ -678,18 +839,10 @@ private fun CurrentGlucoseCard(
                         }
                     }
                     OutlinedButton(
-                        onClick = { alarmAcknowledged = onAcknowledgeAlarm() },
-                        enabled = !alarmAcknowledged,
+                        onClick = { onAcknowledgeAlarm() },
                         shape = RoundedCornerShape(12.dp),
                     ) {
-                        Text(
-                            if (alarmAcknowledged) {
-                                "Повтор звука остановлен"
-                            } else {
-                                "Остановить повтор звука"
-                            },
-                            fontSize = 11.sp,
-                        )
+                        Text("Остановить повтор звука", fontSize = 11.sp)
                     }
                 }
             }

@@ -173,9 +173,8 @@ class RemoteUploadEndpoint private constructor(
 
         private fun isAllowedHost(host: String, rawAuthority: String?): Boolean {
             if (host.any(Char::isISOControl) || rawAuthority == null || '%' in rawAuthority) return false
-            if (':' in host) {
-                return rawAuthority.startsWith('[') && rawAuthority.substringBefore(']').length > 2
-            }
+            // ProductPublicationBindingRecord uses the same DNS/IPv4 origin contract.
+            if (':' in host) return false
             if (host.length > 253 || host.endsWith('.') || '.' !in host) return false
             return host.lowercase().split('.').all { label ->
                 label.length in 1..63 &&

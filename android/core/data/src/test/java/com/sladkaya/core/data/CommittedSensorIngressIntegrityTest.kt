@@ -180,6 +180,7 @@ private fun publicationFixture(): PublicationIntegrityFixture {
     )
     val bindingRecord = ProductPublicationBindingRecord(
         approvalId = approvalRecord.approvalId,
+        publicationBindingId = "56".repeat(32),
         httpsOrigin = "https://api.sladkaya.test",
         backendBindingId = "backend-binding-a",
         credentialId = "credential-a",
@@ -253,6 +254,7 @@ private fun publicationFixture(): PublicationIntegrityFixture {
         sequence = raw.sequence.toLong(),
         publicationApprovalId = approvalRecord.approvalId,
         publicationBindingId = bindingRecord.publicationBindingId,
+        remotePublicationBindingId = bindingRecord.remotePublicationBindingId,
         httpsOrigin = bindingRecord.httpsOrigin,
         backendBindingId = bindingRecord.backendBindingId,
         credentialId = bindingRecord.credentialId,
@@ -264,6 +266,7 @@ private fun publicationFixture(): PublicationIntegrityFixture {
         eventId = raw.eventId,
         approvalId = approvalRecord.approvalId,
         publicationBindingId = bindingRecord.publicationBindingId,
+        remotePublicationBindingId = bindingRecord.remotePublicationBindingId,
         httpsOrigin = bindingRecord.httpsOrigin,
         backendBindingId = bindingRecord.backendBindingId,
         credentialId = bindingRecord.credentialId,
@@ -326,6 +329,12 @@ private class IntegrityCommittedIngressDao(
     override suspend fun physicalApproval(approvalId: String) =
         approval.takeIf { it.approvalId == approvalId }
 
-    override suspend fun publicationBinding(publicationBindingId: String) =
-        binding.takeIf { it.publicationBindingId == publicationBindingId }
+    override suspend fun publicationBinding(remotePublicationBindingId: String) =
+        binding.takeIf { it.remotePublicationBindingId == remotePublicationBindingId }
+
+    override suspend fun activeSensorBinding() = ActiveSensorPublicationBindingEntity(
+        activeSlot = ACTIVE_PUBLICATION_BINDING_SLOT,
+        publicationBindingId = binding.publicationBindingId,
+        approvalId = approval.approvalId,
+    )
 }

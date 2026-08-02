@@ -3,7 +3,7 @@ package com.sladkaya.sensor.sibionics
 import android.os.Build
 import com.sladkaya.sensor.sibionics.algorithm.AlgorithmProfile
 import com.sladkaya.sensor.sibionics.algorithm.NativeBinarySets
-import com.sladkaya.sensor.sibionics.datahandle.SibionicsDataHandle
+import com.sladkaya.sensor.sibionics.datahandle.DataHandleBundles
 import java.security.MessageDigest
 
 internal data class Gs1NativeArtifactIdentity(
@@ -18,21 +18,31 @@ internal data class Gs1NativeArtifactIdentity(
 
 /** Shared by product opening and the future physical-approval coordinator. */
 internal fun interface Gs1NativeArtifactIdentityProvider {
-    fun resolve(profile: AlgorithmProfile): Gs1NativeArtifactIdentity
+    fun resolve(
+        profile: AlgorithmProfile,
+        transportVariant: Int,
+    ): Gs1NativeArtifactIdentity
 }
 
 internal object Gs1InstalledNativeArtifactIdentityProvider : Gs1NativeArtifactIdentityProvider {
-    override fun resolve(profile: AlgorithmProfile): Gs1NativeArtifactIdentity =
-        resolve(profile, Build.SUPPORTED_ABIS.toList())
+    override fun resolve(
+        profile: AlgorithmProfile,
+        transportVariant: Int,
+    ): Gs1NativeArtifactIdentity = resolve(
+        profile,
+        transportVariant,
+        Build.SUPPORTED_ABIS.toList(),
+    )
 
     internal fun resolve(
         profile: AlgorithmProfile,
+        transportVariant: Int,
         supportedAbis: List<String>,
     ): Gs1NativeArtifactIdentity {
         val algorithmSet = NativeBinarySets.resolve(profile, supportedAbis)
         val algorithmManifest = algorithmSet.files.toSortedMap().entries
             .joinToString("\n") { (name, hash) -> "$name=$hash" }
-        val datahandleId = SibionicsDataHandle.BINARY_SET_ID
+        val datahandleId = DataHandleBundles.require(transportVariant).binarySetId
         val datahandleHash = datahandleId.removePrefix(DATAHANDLE_SHA256_PREFIX)
         require(
             datahandleId == "$DATAHANDLE_SHA256_PREFIX$datahandleHash" &&

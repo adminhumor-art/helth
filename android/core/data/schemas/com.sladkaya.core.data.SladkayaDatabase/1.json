@@ -2,11 +2,11 @@
   "formatVersion": 1,
   "database": {
     "version": 1,
-    "identityHash": "b79f6509a3350adba6184cd3ede4c0fa",
+    "identityHash": "045e881e664f7881fc31defaa35baeca",
     "entities": [
       {
         "tableName": "measurements",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`eventId` TEXT NOT NULL, `sensorId` TEXT NOT NULL, `sensorFamily` TEXT NOT NULL, `sensorTimeEpochMs` INTEGER NOT NULL, `phoneTimeEpochMs` INTEGER NOT NULL, `glucoseMgDl` INTEGER NOT NULL, `trendMgDlPerMinute` REAL NOT NULL, `quality` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `publicationApprovalId` TEXT, `publicationBindingId` TEXT, `httpsOrigin` TEXT, `backendBindingId` TEXT, `credentialId` TEXT, `credentialRevision` INTEGER, `expectedPatientId` TEXT, `expectedDeviceId` TEXT, PRIMARY KEY(`eventId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`eventId` TEXT NOT NULL, `sensorId` TEXT NOT NULL, `sensorFamily` TEXT NOT NULL, `sensorTimeEpochMs` INTEGER NOT NULL, `phoneTimeEpochMs` INTEGER NOT NULL, `glucoseMgDl` INTEGER NOT NULL, `trendMgDlPerMinute` REAL NOT NULL, `quality` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `publicationApprovalId` TEXT, `publicationBindingId` TEXT, `remotePublicationBindingId` TEXT, `httpsOrigin` TEXT, `backendBindingId` TEXT, `credentialId` TEXT, `credentialRevision` INTEGER, `expectedPatientId` TEXT, `expectedDeviceId` TEXT, PRIMARY KEY(`eventId`))",
         "fields": [
           {
             "fieldPath": "eventId",
@@ -70,6 +70,11 @@
           {
             "fieldPath": "publicationBindingId",
             "columnName": "publicationBindingId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "remotePublicationBindingId",
+            "columnName": "remotePublicationBindingId",
             "affinity": "TEXT"
           },
           {
@@ -1079,8 +1084,14 @@
       },
       {
         "tableName": "product_publication_bindings",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`publicationBindingId` TEXT NOT NULL, `approvalId` TEXT NOT NULL, `httpsOrigin` TEXT NOT NULL, `backendBindingId` TEXT NOT NULL, `credentialId` TEXT NOT NULL, `credentialRevision` INTEGER NOT NULL, `expectedPatientId` TEXT NOT NULL, `expectedDeviceId` TEXT NOT NULL, `createdAtEpochMs` INTEGER NOT NULL, `schemaVersion` INTEGER NOT NULL, PRIMARY KEY(`publicationBindingId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`remotePublicationBindingId` TEXT NOT NULL, `publicationBindingId` TEXT NOT NULL, `approvalId` TEXT NOT NULL, `httpsOrigin` TEXT NOT NULL, `backendBindingId` TEXT NOT NULL, `credentialId` TEXT NOT NULL, `credentialRevision` INTEGER NOT NULL, `expectedPatientId` TEXT NOT NULL, `expectedDeviceId` TEXT NOT NULL, `createdAtEpochMs` INTEGER NOT NULL, `schemaVersion` INTEGER NOT NULL, PRIMARY KEY(`remotePublicationBindingId`))",
         "fields": [
+          {
+            "fieldPath": "remotePublicationBindingId",
+            "columnName": "remotePublicationBindingId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
           {
             "fieldPath": "publicationBindingId",
             "columnName": "publicationBindingId",
@@ -1145,13 +1156,24 @@
         "primaryKey": {
           "autoGenerate": false,
           "columnNames": [
-            "publicationBindingId"
+            "remotePublicationBindingId"
           ]
-        }
+        },
+        "indices": [
+          {
+            "name": "index_product_publication_bindings_publicationBindingId",
+            "unique": false,
+            "columnNames": [
+              "publicationBindingId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_product_publication_bindings_publicationBindingId` ON `${TABLE_NAME}` (`publicationBindingId`)"
+          }
+        ]
       },
       {
         "tableName": "active_sensor_publication_binding",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`activeSlot` INTEGER NOT NULL, `publicationBindingId` TEXT NOT NULL, PRIMARY KEY(`activeSlot`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`activeSlot` INTEGER NOT NULL, `publicationBindingId` TEXT NOT NULL, `approvalId` TEXT NOT NULL, PRIMARY KEY(`activeSlot`))",
         "fields": [
           {
             "fieldPath": "activeSlot",
@@ -1164,6 +1186,12 @@
             "columnName": "publicationBindingId",
             "affinity": "TEXT",
             "notNull": true
+          },
+          {
+            "fieldPath": "approvalId",
+            "columnName": "approvalId",
+            "affinity": "TEXT",
+            "notNull": true
           }
         ],
         "primaryKey": {
@@ -1174,8 +1202,38 @@
         }
       },
       {
+        "tableName": "active_remote_publication_binding",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`publicationBindingId` TEXT NOT NULL, `approvalId` TEXT NOT NULL, `remotePublicationBindingId` TEXT NOT NULL, PRIMARY KEY(`publicationBindingId`))",
+        "fields": [
+          {
+            "fieldPath": "publicationBindingId",
+            "columnName": "publicationBindingId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "approvalId",
+            "columnName": "approvalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "remotePublicationBindingId",
+            "columnName": "remotePublicationBindingId",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "publicationBindingId"
+          ]
+        }
+      },
+      {
         "tableName": "measurement_upload_outbox",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`outboxId` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `eventId` TEXT NOT NULL, `approvalId` TEXT NOT NULL, `publicationBindingId` TEXT NOT NULL, `httpsOrigin` TEXT NOT NULL, `backendBindingId` TEXT NOT NULL, `credentialId` TEXT NOT NULL, `credentialRevision` INTEGER NOT NULL, `expectedPatientId` TEXT NOT NULL, `expectedDeviceId` TEXT NOT NULL, `state` TEXT NOT NULL, `attempts` INTEGER NOT NULL, `enqueuedAtEpochMs` INTEGER NOT NULL, `nextAttemptEpochMs` INTEGER NOT NULL, `leaseToken` TEXT, `leaseExpiresAtEpochMs` INTEGER, `lastTransitionToken` TEXT, `sanitizedStatus` TEXT, `sanitizedDetail` TEXT)",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`outboxId` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `eventId` TEXT NOT NULL, `approvalId` TEXT NOT NULL, `publicationBindingId` TEXT NOT NULL, `remotePublicationBindingId` TEXT NOT NULL, `httpsOrigin` TEXT NOT NULL, `backendBindingId` TEXT NOT NULL, `credentialId` TEXT NOT NULL, `credentialRevision` INTEGER NOT NULL, `expectedPatientId` TEXT NOT NULL, `expectedDeviceId` TEXT NOT NULL, `state` TEXT NOT NULL, `attempts` INTEGER NOT NULL, `enqueuedAtEpochMs` INTEGER NOT NULL, `nextAttemptEpochMs` INTEGER NOT NULL, `leaseToken` TEXT, `leaseExpiresAtEpochMs` INTEGER, `lastTransitionToken` TEXT, `sanitizedStatus` TEXT, `sanitizedDetail` TEXT)",
         "fields": [
           {
             "fieldPath": "outboxId",
@@ -1198,6 +1256,12 @@
           {
             "fieldPath": "publicationBindingId",
             "columnName": "publicationBindingId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "remotePublicationBindingId",
+            "columnName": "remotePublicationBindingId",
             "affinity": "TEXT",
             "notNull": true
           },
@@ -1324,11 +1388,897 @@
             "createSql": "CREATE INDEX IF NOT EXISTS `index_measurement_upload_outbox_state_nextAttemptEpochMs_outboxId` ON `${TABLE_NAME}` (`state`, `nextAttemptEpochMs`, `outboxId`)"
           }
         ]
+      },
+      {
+        "tableName": "local_reading_effects",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`effectId` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `eventId` TEXT NOT NULL, `approvalId` TEXT NOT NULL, `publicationBindingId` TEXT NOT NULL, `state` TEXT NOT NULL, `attempts` INTEGER NOT NULL, `enqueuedAtEpochMs` INTEGER NOT NULL, `leaseToken` TEXT, `leaseExpiresAtEpochMs` INTEGER, `lastTransitionToken` TEXT, `acknowledgedAtEpochMs` INTEGER, FOREIGN KEY(`eventId`) REFERENCES `measurements`(`eventId`) ON UPDATE NO ACTION ON DELETE RESTRICT )",
+        "fields": [
+          {
+            "fieldPath": "effectId",
+            "columnName": "effectId",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "eventId",
+            "columnName": "eventId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "approvalId",
+            "columnName": "approvalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "publicationBindingId",
+            "columnName": "publicationBindingId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "state",
+            "columnName": "state",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "attempts",
+            "columnName": "attempts",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "enqueuedAtEpochMs",
+            "columnName": "enqueuedAtEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "leaseToken",
+            "columnName": "leaseToken",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "leaseExpiresAtEpochMs",
+            "columnName": "leaseExpiresAtEpochMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "lastTransitionToken",
+            "columnName": "lastTransitionToken",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "acknowledgedAtEpochMs",
+            "columnName": "acknowledgedAtEpochMs",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "effectId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_local_reading_effects_eventId",
+            "unique": true,
+            "columnNames": [
+              "eventId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_local_reading_effects_eventId` ON `${TABLE_NAME}` (`eventId`)"
+          },
+          {
+            "name": "index_local_reading_effects_leaseToken",
+            "unique": false,
+            "columnNames": [
+              "leaseToken"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_local_reading_effects_leaseToken` ON `${TABLE_NAME}` (`leaseToken`)"
+          },
+          {
+            "name": "index_local_reading_effects_lastTransitionToken",
+            "unique": false,
+            "columnNames": [
+              "lastTransitionToken"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_local_reading_effects_lastTransitionToken` ON `${TABLE_NAME}` (`lastTransitionToken`)"
+          },
+          {
+            "name": "index_local_reading_effects_state_effectId",
+            "unique": false,
+            "columnNames": [
+              "state",
+              "effectId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_local_reading_effects_state_effectId` ON `${TABLE_NAME}` (`state`, `effectId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "measurements",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "eventId"
+            ],
+            "referencedColumns": [
+              "eventId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "local_alarm_monitoring_starts",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`startId` TEXT NOT NULL, `publicationBindingId` TEXT NOT NULL, `approvalId` TEXT NOT NULL, `monitoringStartedAtEpochMs` INTEGER NOT NULL, `approvedSequence` INTEGER NOT NULL, `thresholdLowMgDl` INTEGER NOT NULL, `thresholdHighMgDl` INTEGER NOT NULL, `thresholdRapidFallMgDlPerMinute` REAL NOT NULL, `thresholdRapidRiseMgDlPerMinute` REAL NOT NULL, `thresholdRecoveryHysteresisMgDl` INTEGER NOT NULL, `thresholdStaleAfterMs` INTEGER NOT NULL, `thresholdFingerprint` TEXT NOT NULL, `initialStateSha256` TEXT NOT NULL, `watchdogDeliveryId` TEXT NOT NULL, `watchdogDeadlineEpochMs` INTEGER NOT NULL, PRIMARY KEY(`startId`), FOREIGN KEY(`approvalId`) REFERENCES `physical_sensor_approvals`(`approvalId`) ON UPDATE NO ACTION ON DELETE RESTRICT )",
+        "fields": [
+          {
+            "fieldPath": "startId",
+            "columnName": "startId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "publicationBindingId",
+            "columnName": "publicationBindingId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "approvalId",
+            "columnName": "approvalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "monitoringStartedAtEpochMs",
+            "columnName": "monitoringStartedAtEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "approvedSequence",
+            "columnName": "approvedSequence",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "thresholdLowMgDl",
+            "columnName": "thresholdLowMgDl",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "thresholdHighMgDl",
+            "columnName": "thresholdHighMgDl",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "thresholdRapidFallMgDlPerMinute",
+            "columnName": "thresholdRapidFallMgDlPerMinute",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "thresholdRapidRiseMgDlPerMinute",
+            "columnName": "thresholdRapidRiseMgDlPerMinute",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "thresholdRecoveryHysteresisMgDl",
+            "columnName": "thresholdRecoveryHysteresisMgDl",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "thresholdStaleAfterMs",
+            "columnName": "thresholdStaleAfterMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "thresholdFingerprint",
+            "columnName": "thresholdFingerprint",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "initialStateSha256",
+            "columnName": "initialStateSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "watchdogDeliveryId",
+            "columnName": "watchdogDeliveryId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "watchdogDeadlineEpochMs",
+            "columnName": "watchdogDeadlineEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "startId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_local_alarm_monitoring_starts_publicationBindingId",
+            "unique": true,
+            "columnNames": [
+              "publicationBindingId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_local_alarm_monitoring_starts_publicationBindingId` ON `${TABLE_NAME}` (`publicationBindingId`)"
+          },
+          {
+            "name": "index_local_alarm_monitoring_starts_approvalId",
+            "unique": false,
+            "columnNames": [
+              "approvalId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_local_alarm_monitoring_starts_approvalId` ON `${TABLE_NAME}` (`approvalId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "physical_sensor_approvals",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "approvalId"
+            ],
+            "referencedColumns": [
+              "approvalId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "local_alarm_states",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`publicationBindingId` TEXT NOT NULL, `approvalId` TEXT NOT NULL, `monitoringStartedAtEpochMs` INTEGER NOT NULL, `activeKinds` TEXT NOT NULL, `latestFreshSensorTimeEpochMs` INTEGER NOT NULL, `latestFreshPhoneTimeEpochMs` INTEGER NOT NULL, `phoneClockMovedBackwards` INTEGER NOT NULL, `lastEffectId` INTEGER NOT NULL, `lastEventId` TEXT NOT NULL, `lastSequence` INTEGER NOT NULL, `thresholdLowMgDl` INTEGER NOT NULL, `thresholdHighMgDl` INTEGER NOT NULL, `thresholdRapidFallMgDlPerMinute` REAL NOT NULL, `thresholdRapidRiseMgDlPerMinute` REAL NOT NULL, `thresholdRecoveryHysteresisMgDl` INTEGER NOT NULL, `thresholdStaleAfterMs` INTEGER NOT NULL, `thresholdFingerprint` TEXT NOT NULL, `episodeGeneration` INTEGER NOT NULL, `episodeAcknowledged` INTEGER NOT NULL, `episodeAcknowledgedAtEpochMs` INTEGER, `episodeOpenedAtEpochMs` INTEGER, `updatedAtEpochMs` INTEGER NOT NULL, `stateSha256` TEXT NOT NULL, PRIMARY KEY(`publicationBindingId`), FOREIGN KEY(`approvalId`) REFERENCES `physical_sensor_approvals`(`approvalId`) ON UPDATE NO ACTION ON DELETE RESTRICT )",
+        "fields": [
+          {
+            "fieldPath": "publicationBindingId",
+            "columnName": "publicationBindingId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "approvalId",
+            "columnName": "approvalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "monitoringStartedAtEpochMs",
+            "columnName": "monitoringStartedAtEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "activeKinds",
+            "columnName": "activeKinds",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "latestFreshSensorTimeEpochMs",
+            "columnName": "latestFreshSensorTimeEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "latestFreshPhoneTimeEpochMs",
+            "columnName": "latestFreshPhoneTimeEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "phoneClockMovedBackwards",
+            "columnName": "phoneClockMovedBackwards",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastEffectId",
+            "columnName": "lastEffectId",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastEventId",
+            "columnName": "lastEventId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lastSequence",
+            "columnName": "lastSequence",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "thresholdLowMgDl",
+            "columnName": "thresholdLowMgDl",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "thresholdHighMgDl",
+            "columnName": "thresholdHighMgDl",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "thresholdRapidFallMgDlPerMinute",
+            "columnName": "thresholdRapidFallMgDlPerMinute",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "thresholdRapidRiseMgDlPerMinute",
+            "columnName": "thresholdRapidRiseMgDlPerMinute",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "thresholdRecoveryHysteresisMgDl",
+            "columnName": "thresholdRecoveryHysteresisMgDl",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "thresholdStaleAfterMs",
+            "columnName": "thresholdStaleAfterMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "thresholdFingerprint",
+            "columnName": "thresholdFingerprint",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "episodeGeneration",
+            "columnName": "episodeGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "episodeAcknowledged",
+            "columnName": "episodeAcknowledged",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "episodeAcknowledgedAtEpochMs",
+            "columnName": "episodeAcknowledgedAtEpochMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "episodeOpenedAtEpochMs",
+            "columnName": "episodeOpenedAtEpochMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "updatedAtEpochMs",
+            "columnName": "updatedAtEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "stateSha256",
+            "columnName": "stateSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "publicationBindingId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_local_alarm_states_approvalId",
+            "unique": false,
+            "columnNames": [
+              "approvalId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_local_alarm_states_approvalId` ON `${TABLE_NAME}` (`approvalId`)"
+          },
+          {
+            "name": "index_local_alarm_states_lastEffectId",
+            "unique": false,
+            "columnNames": [
+              "lastEffectId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_local_alarm_states_lastEffectId` ON `${TABLE_NAME}` (`lastEffectId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "physical_sensor_approvals",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "approvalId"
+            ],
+            "referencedColumns": [
+              "approvalId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "local_alarm_applications",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`effectId` INTEGER NOT NULL, `eventId` TEXT NOT NULL, `approvalId` TEXT NOT NULL, `publicationBindingId` TEXT NOT NULL, `previousEffectId` INTEGER, `leaseToken` TEXT NOT NULL, `appliedAtEpochMs` INTEGER NOT NULL, `monitoringStartedAtEpochMs` INTEGER NOT NULL, `thresholdFingerprint` TEXT NOT NULL, `expectedPreviousThresholdFingerprint` TEXT, `repeatIntervalMs` INTEGER NOT NULL, `resultingStateSha256` TEXT NOT NULL, `activeKinds` TEXT NOT NULL, `episodeGeneration` INTEGER NOT NULL, `episodeAcknowledged` INTEGER NOT NULL, `deliverySetSha256` TEXT NOT NULL, `deliveryCount` INTEGER NOT NULL, PRIMARY KEY(`effectId`), FOREIGN KEY(`effectId`) REFERENCES `local_reading_effects`(`effectId`) ON UPDATE NO ACTION ON DELETE RESTRICT )",
+        "fields": [
+          {
+            "fieldPath": "effectId",
+            "columnName": "effectId",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "eventId",
+            "columnName": "eventId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "approvalId",
+            "columnName": "approvalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "publicationBindingId",
+            "columnName": "publicationBindingId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "previousEffectId",
+            "columnName": "previousEffectId",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "leaseToken",
+            "columnName": "leaseToken",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "appliedAtEpochMs",
+            "columnName": "appliedAtEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "monitoringStartedAtEpochMs",
+            "columnName": "monitoringStartedAtEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "thresholdFingerprint",
+            "columnName": "thresholdFingerprint",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "expectedPreviousThresholdFingerprint",
+            "columnName": "expectedPreviousThresholdFingerprint",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "repeatIntervalMs",
+            "columnName": "repeatIntervalMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "resultingStateSha256",
+            "columnName": "resultingStateSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "activeKinds",
+            "columnName": "activeKinds",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "episodeGeneration",
+            "columnName": "episodeGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "episodeAcknowledged",
+            "columnName": "episodeAcknowledged",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deliverySetSha256",
+            "columnName": "deliverySetSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deliveryCount",
+            "columnName": "deliveryCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "effectId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_local_alarm_applications_eventId",
+            "unique": true,
+            "columnNames": [
+              "eventId"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_local_alarm_applications_eventId` ON `${TABLE_NAME}` (`eventId`)"
+          },
+          {
+            "name": "index_local_alarm_applications_publicationBindingId_effectId",
+            "unique": false,
+            "columnNames": [
+              "publicationBindingId",
+              "effectId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_local_alarm_applications_publicationBindingId_effectId` ON `${TABLE_NAME}` (`publicationBindingId`, `effectId`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "local_reading_effects",
+            "onDelete": "RESTRICT",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "effectId"
+            ],
+            "referencedColumns": [
+              "effectId"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "local_alarm_watchdog_applications",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`watchdogId` TEXT NOT NULL, `publicationBindingId` TEXT NOT NULL, `approvalId` TEXT NOT NULL, `sourceEffectId` INTEGER NOT NULL, `sourceEventId` TEXT NOT NULL, `expectedStateSha256` TEXT NOT NULL, `appliedAtEpochMs` INTEGER NOT NULL, `resultingStateSha256` TEXT NOT NULL, `activeKinds` TEXT NOT NULL, `episodeGeneration` INTEGER NOT NULL, `episodeAcknowledged` INTEGER NOT NULL, `stateChanged` INTEGER NOT NULL, `deliveryKinds` TEXT NOT NULL, `deliverySetSha256` TEXT NOT NULL, `deliveryCount` INTEGER NOT NULL, PRIMARY KEY(`watchdogId`))",
+        "fields": [
+          {
+            "fieldPath": "watchdogId",
+            "columnName": "watchdogId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "publicationBindingId",
+            "columnName": "publicationBindingId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "approvalId",
+            "columnName": "approvalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceEffectId",
+            "columnName": "sourceEffectId",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceEventId",
+            "columnName": "sourceEventId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "expectedStateSha256",
+            "columnName": "expectedStateSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "appliedAtEpochMs",
+            "columnName": "appliedAtEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "resultingStateSha256",
+            "columnName": "resultingStateSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "activeKinds",
+            "columnName": "activeKinds",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "episodeGeneration",
+            "columnName": "episodeGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "episodeAcknowledged",
+            "columnName": "episodeAcknowledged",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "stateChanged",
+            "columnName": "stateChanged",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deliveryKinds",
+            "columnName": "deliveryKinds",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deliverySetSha256",
+            "columnName": "deliverySetSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deliveryCount",
+            "columnName": "deliveryCount",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "watchdogId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_local_alarm_watchdog_applications_publicationBindingId_expectedStateSha256_appliedAtEpochMs",
+            "unique": true,
+            "columnNames": [
+              "publicationBindingId",
+              "expectedStateSha256",
+              "appliedAtEpochMs"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_local_alarm_watchdog_applications_publicationBindingId_expectedStateSha256_appliedAtEpochMs` ON `${TABLE_NAME}` (`publicationBindingId`, `expectedStateSha256`, `appliedAtEpochMs`)"
+          },
+          {
+            "name": "index_local_alarm_watchdog_applications_sourceEffectId",
+            "unique": false,
+            "columnNames": [
+              "sourceEffectId"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_local_alarm_watchdog_applications_sourceEffectId` ON `${TABLE_NAME}` (`sourceEffectId`)"
+          }
+        ]
+      },
+      {
+        "tableName": "local_alarm_deliveries",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`deliveryId` TEXT NOT NULL, `sourceEffectId` INTEGER NOT NULL, `sourceEventId` TEXT NOT NULL, `approvalId` TEXT NOT NULL, `publicationBindingId` TEXT NOT NULL, `kind` TEXT NOT NULL, `kindOrder` INTEGER NOT NULL, `activeKinds` TEXT NOT NULL, `episodeGeneration` INTEGER NOT NULL, `episodeAcknowledged` INTEGER NOT NULL, `resultingStateSha256` TEXT NOT NULL, `createdAtEpochMs` INTEGER NOT NULL, `notBeforeEpochMs` INTEGER NOT NULL, `state` TEXT NOT NULL, `attempts` INTEGER NOT NULL, `leaseToken` TEXT, `leaseExpiresAtEpochMs` INTEGER, `lastTransitionToken` TEXT, `lastTransitionKind` TEXT, `lastTransitionAtEpochMs` INTEGER, `deliveredAtEpochMs` INTEGER, PRIMARY KEY(`deliveryId`))",
+        "fields": [
+          {
+            "fieldPath": "deliveryId",
+            "columnName": "deliveryId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceEffectId",
+            "columnName": "sourceEffectId",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sourceEventId",
+            "columnName": "sourceEventId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "approvalId",
+            "columnName": "approvalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "publicationBindingId",
+            "columnName": "publicationBindingId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "kind",
+            "columnName": "kind",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "kindOrder",
+            "columnName": "kindOrder",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "activeKinds",
+            "columnName": "activeKinds",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "episodeGeneration",
+            "columnName": "episodeGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "episodeAcknowledged",
+            "columnName": "episodeAcknowledged",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "resultingStateSha256",
+            "columnName": "resultingStateSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtEpochMs",
+            "columnName": "createdAtEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "notBeforeEpochMs",
+            "columnName": "notBeforeEpochMs",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "state",
+            "columnName": "state",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "attempts",
+            "columnName": "attempts",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "leaseToken",
+            "columnName": "leaseToken",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "leaseExpiresAtEpochMs",
+            "columnName": "leaseExpiresAtEpochMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "lastTransitionToken",
+            "columnName": "lastTransitionToken",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "lastTransitionKind",
+            "columnName": "lastTransitionKind",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "lastTransitionAtEpochMs",
+            "columnName": "lastTransitionAtEpochMs",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "deliveredAtEpochMs",
+            "columnName": "deliveredAtEpochMs",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "deliveryId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_local_alarm_deliveries_sourceEffectId_kind",
+            "unique": false,
+            "columnNames": [
+              "sourceEffectId",
+              "kind"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_local_alarm_deliveries_sourceEffectId_kind` ON `${TABLE_NAME}` (`sourceEffectId`, `kind`)"
+          },
+          {
+            "name": "index_local_alarm_deliveries_state_notBeforeEpochMs_sourceEffectId_kindOrder",
+            "unique": false,
+            "columnNames": [
+              "state",
+              "notBeforeEpochMs",
+              "sourceEffectId",
+              "kindOrder"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_local_alarm_deliveries_state_notBeforeEpochMs_sourceEffectId_kindOrder` ON `${TABLE_NAME}` (`state`, `notBeforeEpochMs`, `sourceEffectId`, `kindOrder`)"
+          },
+          {
+            "name": "index_local_alarm_deliveries_leaseToken",
+            "unique": false,
+            "columnNames": [
+              "leaseToken"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_local_alarm_deliveries_leaseToken` ON `${TABLE_NAME}` (`leaseToken`)"
+          },
+          {
+            "name": "index_local_alarm_deliveries_lastTransitionToken",
+            "unique": false,
+            "columnNames": [
+              "lastTransitionToken"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_local_alarm_deliveries_lastTransitionToken` ON `${TABLE_NAME}` (`lastTransitionToken`)"
+          }
+        ]
       }
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'b79f6509a3350adba6184cd3ede4c0fa')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '045e881e664f7881fc31defaa35baeca')"
     ]
   }
 }

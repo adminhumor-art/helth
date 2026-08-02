@@ -78,7 +78,7 @@ internal sealed interface Gs1PacketProcessingResult {
  */
 internal class Gs1PacketProcessor(
     private val core: Gs1SampleProcessor,
-    private val decoder: Gs1PacketVerifier = Gs1VerifiedPacketDecoder(),
+    private val decoder: Gs1PacketVerifier,
     initialExpectedIndex: Int = FIRST_SENSOR_INDEX,
     private val wireProfile: Gs1WireProfile,
 ) {

@@ -3,9 +3,13 @@ package com.sladkaya.core.data
 import java.security.MessageDigest
 import java.net.URI
 
-/** Immutable routing/credential identity. Rotation creates a new record, never a new physical approval. */
+/**
+ * Immutable remote routing identity attached to one stable local publication binding.
+ * Credential rotation creates a new remote identity without changing local history/alarm identity.
+ */
 data class ProductPublicationBindingRecord(
     val approvalId: String,
+    val publicationBindingId: String,
     val httpsOrigin: String,
     val backendBindingId: String,
     val credentialId: String,
@@ -15,10 +19,11 @@ data class ProductPublicationBindingRecord(
     val createdAtEpochMs: Long,
     val schemaVersion: Int = SCHEMA_VERSION,
 ) {
-    val publicationBindingId: String = canonicalId()
+    val remotePublicationBindingId: String = canonicalRemoteId()
 
     init {
         require(SHA256.matches(approvalId))
+        require(SHA256.matches(publicationBindingId))
         requireCanonicalHttpsOrigin(httpsOrigin)
         require(OPAQUE_IDENTIFIER.matches(backendBindingId))
         require(OPAQUE_IDENTIFIER.matches(credentialId))
@@ -29,9 +34,10 @@ data class ProductPublicationBindingRecord(
         require(schemaVersion == SCHEMA_VERSION)
     }
 
-    private fun canonicalId(): String {
+    private fun canonicalRemoteId(): String {
         val fields = listOf(
             approvalId,
+            publicationBindingId,
             httpsOrigin,
             backendBindingId,
             credentialId,

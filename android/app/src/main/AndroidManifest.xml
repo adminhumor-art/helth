@@ -66,11 +66,30 @@
         </receiver>
 
         <receiver
+            android:name=".service.DirectBootRecoveryReceiver"
+            android:directBootAware="true"
+            android:enabled="true"
+            android:exported="true"
+            android:process=":direct_boot_warning">
+            <intent-filter>
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
             android:name=".service.AlarmAcknowledgeReceiver"
             android:exported="false" />
 
         <receiver
             android:name=".service.AlarmRepeatReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".service.ProductLocalDeliveryWakeReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".service.ProductAlarmAcknowledgeReceiver"
             android:exported="false" />
 
         <receiver

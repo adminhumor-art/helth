@@ -190,6 +190,45 @@ class AlarmPolicyTest {
         )
     }
 
+    @Test
+    fun processRestartPreservesClockRollbackBarrierAndOpenAlarmState() {
+        val original = policy(monitoringStartedAtEpochMs = 1_000_000)
+        original.evaluate(reading(value = 60, sensorTime = 1_000_000, phoneTime = 1_000_000))
+        original.evaluateFreshness(nowEpochMs = 900_000)
+
+        val restored = AlarmPolicy(
+            monitoringStartedAtEpochMs = 1_000_000,
+            initialState = original.snapshot(),
+        )
+        val rollbackReading = restored.evaluate(
+            reading(value = 120, sensorTime = 901_000, phoneTime = 901_000),
+            nowEpochMs = 901_000,
+        )
+
+        assertTrue(rollbackReading.closed.isEmpty())
+        assertEquals(
+            setOf(AlarmKind.LOW, AlarmKind.SIGNAL_LOSS),
+            rollbackReading.active,
+        )
+        assertEquals(
+            setOf(AlarmKind.SIGNAL_LOSS),
+            restored.evaluateFreshness(nowEpochMs = 902_000).closed,
+        )
+    }
+
+    @Test
+    fun snapshotIsAnImmutableCompleteReducerState() {
+        val policy = policy(monitoringStartedAtEpochMs = 10_000)
+        policy.evaluate(reading(value = 60, sensorTime = 10_000, phoneTime = 10_000))
+
+        val snapshot = policy.snapshot()
+
+        assertEquals(setOf(AlarmKind.LOW), snapshot.active)
+        assertEquals(10_000, snapshot.latestFreshSensorTimeEpochMs)
+        assertEquals(10_000, snapshot.latestFreshPhoneTimeEpochMs)
+        assertEquals(false, snapshot.phoneClockMovedBackwards)
+    }
+
     private fun policy(monitoringStartedAtEpochMs: Long = 1_000L) = AlarmPolicy(
         monitoringStartedAtEpochMs = monitoringStartedAtEpochMs,
     )

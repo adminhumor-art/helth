@@ -49,6 +49,7 @@ data class UploadOutboxRecord(
     val eventId: String,
     val approvalId: String,
     val publicationBindingId: String,
+    val remotePublicationBindingId: String,
     val httpsOrigin: String,
     val backendBindingId: String,
     val credentialId: String,
@@ -68,6 +69,7 @@ data class UploadOutboxRecord(
         require(eventId.isNotBlank())
         require(SHA256.matches(approvalId))
         require(SHA256.matches(publicationBindingId))
+        require(SHA256.matches(remotePublicationBindingId))
         requireCanonicalHttpsOrigin(httpsOrigin)
         require(OPAQUE_IDENTIFIER.matches(backendBindingId))
         require(OPAQUE_IDENTIFIER.matches(credentialId))
@@ -104,6 +106,7 @@ data class UploadBlockedRecoveryKey(
     val eventId: String,
     val approvalId: String,
     val publicationBindingId: String,
+    val remotePublicationBindingId: String,
     val httpsOrigin: String,
     val backendBindingId: String,
     val credentialId: String,
@@ -117,6 +120,7 @@ data class UploadBlockedRecoveryKey(
         require(eventId.isNotBlank())
         require(SHA256.matches(approvalId))
         require(SHA256.matches(publicationBindingId))
+        require(SHA256.matches(remotePublicationBindingId))
         requireCanonicalHttpsOrigin(httpsOrigin)
         require(OPAQUE_IDENTIFIER.matches(backendBindingId))
         require(OPAQUE_IDENTIFIER.matches(credentialId))

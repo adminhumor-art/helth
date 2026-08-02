@@ -238,7 +238,8 @@ data class AtomicSensorCoreRecord(
         require(checkpoint.initializationMode == result.initializationMode)
 
         require(result.publishable == (measurement != null))
-        require((measurement != null) == (publicationContext != null))
+        require(measurement == null || approvedCheckpointContext != null)
+        require(publicationContext == null || measurement != null)
         require(measurement == null || measurement.quality == ReadingQuality.VALID)
         require(!result.alarmEligible || measurement != null)
         if (approvedCheckpointContext == null) {
@@ -268,7 +269,10 @@ data class AtomicSensorCoreRecord(
         raw = raw.toEntity(),
         result = result.toEntity(approvedCheckpointContext),
         checkpoint = checkpoint.toEntity(approvedCheckpointContext),
-        measurement = measurement?.toEntity(checkNotNull(publicationContext)),
+        measurement = measurement?.toEntity(
+            approvedContext = checkNotNull(approvedCheckpointContext),
+            publicationContext = publicationContext,
+        ),
         publicationContext = publicationContext,
         approvedCheckpointContext = approvedCheckpointContext,
     )

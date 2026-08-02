@@ -118,9 +118,11 @@ internal class Gs1ProcessingCoordinator(
         require(family == SensorFamily.SIBIONICS_GS1 || family == SensorFamily.SIBIONICS_GS1SB)
         require(transportVariant >= 0)
         require(initialSensorStartTimeEpochMs == null || initialSensorStartTimeEpochMs > 0L)
+        require(transportProtocol == "GS1_V120" || transportProtocol == "GS1_V115")
         require(
-            transportProtocol == "GS1_V120" && algorithmProfile == AlgorithmProfile.V116A ||
-                transportProtocol == "GS1_V115" && algorithmProfile == AlgorithmProfile.V115G,
+            algorithmProfile == Gs1AlgorithmProfiles.requireForTransportVariant(
+                transportVariant,
+            ),
         )
     }
 
@@ -194,7 +196,7 @@ internal class Gs1ProcessingCoordinator(
                 nativeStateMayHaveChanged = false,
             )
         }
-        if (algorithmProfile == AlgorithmProfile.V116A &&
+        if (transportProtocol == "GS1_V120" &&
             sensorTimeMs - resolvedSensorStartTimeMs !=
             sample.index.toLong() * MILLIS_PER_SENSOR_SAMPLE
         ) {
@@ -205,7 +207,7 @@ internal class Gs1ProcessingCoordinator(
                 sample = sample,
                 phoneTime = phoneTime,
                 code = "SENSOR_START_TIME_MISMATCH",
-                message = "V116A sample time does not match the durable sensor start",
+                message = "V120 sample time does not match the durable sensor start",
                 nativeStateMayHaveChanged = false,
             )
         }

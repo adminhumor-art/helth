@@ -159,7 +159,7 @@ class Gs1ProcessingCoordinatorTest {
     }
 
     @Test
-    fun freshV116aDerivesAndPersistsStartFromTheFirstSensorIndex() = runBlocking {
+    fun freshV120DerivesAndPersistsStartFromTheFirstSensorIndex() = runBlocking {
         val native = FakeNative().apply {
             results += NativeAlgorithmSnapshot(5.8, trend = 0)
         }
@@ -235,6 +235,30 @@ class Gs1ProcessingCoordinatorTest {
     }
 
     @Test
+    fun chineseV120TransportUsesV115gCoreWithoutCrossCoupling() = runBlocking {
+        val native = FakeNative(profile = AlgorithmProfile.V115G).apply {
+            results += NativeAlgorithmSnapshot(5.5, trend = 0)
+        }
+        val store = FakeStore()
+        val first = sample(index = 1, reindex = 0)
+
+        val result = coordinator(
+            native = native,
+            store = store,
+            firstIndex = 1,
+            phoneClock = { first.sensorTimeEpochSeconds * 1_000L + 1_000L },
+            profile = AlgorithmProfile.V115G,
+            transportVariant = 2,
+            transportProtocol = "GS1_V120",
+        ).process(byteArrayOf(1), first) as Gs1ProcessingResult.Diagnostic
+
+        assertEquals(ReadingQuality.VALID, result.candidate.quality)
+        assertEquals(2, store.records.single().raw.transportVariant)
+        assertEquals("GS1_V120", store.records.single().checkpoint.transportProtocol)
+        assertEquals("V115G", store.records.single().checkpoint.algorithmProfile)
+    }
+
+    @Test
     fun approvedV116aWarmupAdvancesStateWithoutMeasurementOrOutbox() = runBlocking {
         val native = FakeNative().apply {
             results += NativeAlgorithmSnapshot(5.5, trend = 0)
@@ -264,7 +288,7 @@ class Gs1ProcessingCoordinatorTest {
     }
 
     @Test
-    fun v116aReopenRejectsTamperedSensorStartBeforeNativeWork() = runBlocking {
+    fun v120ReopenRejectsTamperedSensorStartBeforeNativeWork() = runBlocking {
         val first = sample(index = 46)
         val exactStart = first.sensorTimeEpochSeconds * 1_000L - 46L * 60_000L
         val validNative = FakeNative().apply {
@@ -587,6 +611,14 @@ class Gs1ProcessingCoordinatorTest {
         phoneClock: () -> Long = { sample(65).sensorTimeEpochSeconds * 1_000L + 100_000L },
         productContext: ProductPublicationContext? = null,
         profile: AlgorithmProfile = native.profile,
+        transportVariant: Int = when (profile) {
+            AlgorithmProfile.V116A -> 0
+            AlgorithmProfile.V115G -> 2
+        },
+        transportProtocol: String = when (profile) {
+            AlgorithmProfile.V116A -> "GS1_V120"
+            AlgorithmProfile.V115G -> "GS1_V115"
+        },
         initialSensorStartTimeEpochMs: Long? = if (firstIndex == 1) {
             null
         } else {
@@ -622,7 +654,7 @@ class Gs1ProcessingCoordinatorTest {
             sensorId = "sensor-a",
             bluetoothAddress = "AA:BB:CC:DD:EE:FF",
             family = SensorFamily.SIBIONICS_GS1,
-            transportVariant = 0,
+            transportVariant = transportVariant,
             algorithm = opened.session,
             sensitivity = DecodedSensitivity(
                 token = SensitivityToken.packageCode("ABCDEFGH"),
@@ -630,10 +662,7 @@ class Gs1ProcessingCoordinatorTest {
                 encoding = SensitivityEncoding.NORMAL,
             ),
             store = store,
-            transportProtocol = when (profile) {
-                AlgorithmProfile.V116A -> "GS1_V120"
-                AlgorithmProfile.V115G -> "GS1_V115"
-            },
+            transportProtocol = transportProtocol,
             transportCodecId = "transport-codec-test",
             algorithmProfile = profile,
             initialSensorStartTimeEpochMs = initialSensorStartTimeEpochMs,
@@ -645,6 +674,7 @@ class Gs1ProcessingCoordinatorTest {
     private fun productContext() = ProductPublicationContext(
         approvalId = "ab".repeat(32),
         publicationBindingId = "cd".repeat(32),
+        remotePublicationBindingId = "de".repeat(32),
         httpsOrigin = "https://family.example",
         backendBindingId = "binding-1",
         credentialId = "credential-1",

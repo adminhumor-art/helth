@@ -23,7 +23,11 @@ type StalenessAlertPlanner func(alertpolicy.State, string, time.Time) []alertpol
 
 type Store interface {
 	ResolveActiveDevice(context.Context, []byte, time.Time) (DeviceAccess, error)
+	ProvisionDeviceActivation(context.Context, DeviceActivationProvisioning) error
+	ConsumeDeviceActivation(context.Context, DeviceActivationConsume) (DeviceAccess, error)
 	ResolveActiveFamilySession(context.Context, []byte, time.Time) (FamilySessionAccess, error)
+	IssueFamilyWebSession(context.Context, []byte, FamilyWebSessionCredential, time.Time) (FamilyWebSessionAccess, error)
+	ResolveActiveFamilyWebSession(context.Context, []byte, time.Time) (FamilyWebSessionAccess, error)
 	HouseholdCanAccessPatient(context.Context, string, string) (bool, error)
 	TelegramRecipients(context.Context, string) ([]string, error)
 	HasTelegramRecipients(context.Context) (bool, error)
@@ -52,7 +56,9 @@ type Memory struct {
 	deliveries                  map[string]memoryDelivery
 	monitoringStarted           map[string]time.Time
 	devices                     map[string]memoryDeviceAccess
+	deviceActivations           map[string]memoryDeviceActivationCredential
 	familySessions              map[string]memoryFamilySessionAccess
+	familyWebSessions           map[string]memoryFamilyWebSessionAccess
 	patientHouseholds           map[string]string
 	householdNames              map[string]string
 	patientNames                map[string]string
@@ -85,7 +91,9 @@ func NewMemory() *Memory {
 		deliveries:                  make(map[string]memoryDelivery),
 		monitoringStarted:           make(map[string]time.Time),
 		devices:                     make(map[string]memoryDeviceAccess),
+		deviceActivations:           make(map[string]memoryDeviceActivationCredential),
 		familySessions:              make(map[string]memoryFamilySessionAccess),
+		familyWebSessions:           make(map[string]memoryFamilyWebSessionAccess),
 		patientHouseholds:           make(map[string]string),
 		householdNames:              make(map[string]string),
 		patientNames:                make(map[string]string),

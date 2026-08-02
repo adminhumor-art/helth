@@ -153,9 +153,13 @@ internal data class PhysicalSensorApprovalEntity(
     val schemaVersion: Int,
 )
 
-@Entity(tableName = "product_publication_bindings")
+@Entity(
+    tableName = "product_publication_bindings",
+    indices = [Index(value = ["publicationBindingId"])],
+)
 internal data class ProductPublicationBindingEntity(
-    @PrimaryKey val publicationBindingId: String,
+    @PrimaryKey val remotePublicationBindingId: String,
+    val publicationBindingId: String,
     val approvalId: String,
     val httpsOrigin: String,
     val backendBindingId: String,
@@ -171,6 +175,14 @@ internal data class ProductPublicationBindingEntity(
 internal data class ActiveSensorPublicationBindingEntity(
     @PrimaryKey val activeSlot: Int,
     val publicationBindingId: String,
+    val approvalId: String,
+)
+
+@Entity(tableName = "active_remote_publication_binding")
+internal data class ActiveRemotePublicationBindingEntity(
+    @PrimaryKey val publicationBindingId: String,
+    val approvalId: String,
+    val remotePublicationBindingId: String,
 )
 
 @Entity(
@@ -186,6 +198,7 @@ internal data class UploadOutboxEntity(
     val eventId: String,
     val approvalId: String,
     val publicationBindingId: String,
+    val remotePublicationBindingId: String,
     val httpsOrigin: String,
     val backendBindingId: String,
     val credentialId: String,
@@ -207,6 +220,7 @@ internal data class UploadOutboxEntity(
             eventId: String,
             approvalId: String,
             publicationBindingId: String,
+            remotePublicationBindingId: String,
             httpsOrigin: String,
             backendBindingId: String,
             credentialId: String,
@@ -218,6 +232,7 @@ internal data class UploadOutboxEntity(
             eventId = eventId,
             approvalId = approvalId,
             publicationBindingId = publicationBindingId,
+            remotePublicationBindingId = remotePublicationBindingId,
             httpsOrigin = httpsOrigin,
             backendBindingId = backendBindingId,
             credentialId = credentialId,
@@ -478,6 +493,7 @@ internal fun UploadOutboxEntity.toRecord() = UploadOutboxRecord(
     eventId = eventId,
     approvalId = approvalId,
     publicationBindingId = publicationBindingId,
+    remotePublicationBindingId = remotePublicationBindingId,
     httpsOrigin = httpsOrigin,
     backendBindingId = backendBindingId,
     credentialId = credentialId,
@@ -502,6 +518,7 @@ internal fun UploadDeliveryReport.toEntity() = UploadDeliveryReportEntity(
 )
 
 internal fun ProductPublicationBindingRecord.toEntity() = ProductPublicationBindingEntity(
+    remotePublicationBindingId = remotePublicationBindingId,
     publicationBindingId = publicationBindingId,
     approvalId = approvalId,
     httpsOrigin = httpsOrigin,
@@ -517,6 +534,7 @@ internal fun ProductPublicationBindingRecord.toEntity() = ProductPublicationBind
 internal fun ProductPublicationBindingEntity.toRecord(): ProductPublicationBindingRecord =
     ProductPublicationBindingRecord(
         approvalId = approvalId,
+        publicationBindingId = publicationBindingId,
         httpsOrigin = httpsOrigin,
         backendBindingId = backendBindingId,
         credentialId = credentialId,
@@ -526,8 +544,8 @@ internal fun ProductPublicationBindingEntity.toRecord(): ProductPublicationBindi
         createdAtEpochMs = createdAtEpochMs,
         schemaVersion = schemaVersion,
     ).also { record ->
-        require(record.publicationBindingId == publicationBindingId) {
-            "Stored publication binding identity is not canonical"
+        require(record.remotePublicationBindingId == remotePublicationBindingId) {
+            "Stored remote publication binding identity is not canonical"
         }
     }
 

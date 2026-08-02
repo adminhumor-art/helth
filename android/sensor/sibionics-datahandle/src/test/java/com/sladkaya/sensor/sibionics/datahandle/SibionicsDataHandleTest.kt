@@ -7,6 +7,20 @@ import org.junit.Test
 
 class SibionicsDataHandleTest {
     @Test
+    fun authenticationRejectsAProtocolVariantFromAnotherNativeBundle() {
+        val native = RecordingDataHandleApi()
+        val handle = SibionicsDataHandle(DataHandleBundle.GLOBAL, native)
+
+        val result = handle.authentication(
+            DataHandleVariant.CHINESE_GS1,
+            "AA:BB:CC:DD:EE:FF",
+        ) as DataHandleCommandResult.Failure
+
+        assertEquals(DataHandleError.NATIVE_BUNDLE_MISMATCH, result.error)
+        assertTrue(native.calls.isEmpty())
+    }
+
+    @Test
     fun authenticationRegistersPinnedIdentityAndUsesReversedBluetoothAddress() {
         val native = RecordingDataHandleApi().apply {
             commandBytes = byteArrayOf(0x19, 0x01, 0x02)

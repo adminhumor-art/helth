@@ -194,6 +194,7 @@ class MeasurementUploaderTest {
             eventId = EVENT_ID,
             approvalId = HASH_A,
             publicationBindingId = HASH_B,
+            remotePublicationBindingId = HASH_C,
             httpsOrigin = ORIGIN,
             backendBindingId = "backend-1",
             credentialId = "credential-1",
@@ -243,5 +244,6 @@ class MeasurementUploaderTest {
         const val LEASE_TOKEN = "upload-00000000-0000-4000-8000-000000000401"
         const val HASH_A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         const val HASH_B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        const val HASH_C = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
     }
 }

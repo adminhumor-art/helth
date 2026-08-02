@@ -78,29 +78,141 @@ internal abstract class SensorCoreDao {
         conflict("Physical approval identity conflicts with different evidence")
     }
 
+    /**
+     * One owner-controlled local promotion: the exact diagnostic point, approval and
+     * stable local binding either commit together or Room rolls every write back.
+     */
+    @Transaction
+    open suspend fun approveAndActivatePhysicalSensor(
+        diagnosticEventId: String,
+        approval: PhysicalSensorApprovalEntity,
+        publicationBindingId: String,
+        expectedPreviousPublicationBindingId: String?,
+    ): SensorCoreCommitDisposition {
+        require(diagnosticEventId.isNotBlank() && diagnosticEventId.length <= 128)
+        val raw = rawByEvent(diagnosticEventId)
+            ?: conflict("Physical activation requires the exact diagnostic raw sample")
+        val result = resultByEvent(diagnosticEventId)
+            ?: conflict("Physical activation requires the exact diagnostic algorithm result")
+        val protocol = protocolBinding(raw.sensorId)
+            ?: conflict("Physical activation requires durable protocol evidence")
+        val anchorCheckpoint = checkpoint(raw.sensorId)
+            ?: conflict("Physical activation requires a durable diagnostic checkpoint")
+        val anchor = try {
+            PhysicalSensorDiagnosticAnchor(
+                protocol = protocol.toRecord(),
+                raw = raw.toPhysicalActivationRecord(),
+                result = result.toPhysicalActivationRecord(),
+                checkpoint = anchorCheckpoint.toRecord(),
+            )
+        } catch (_: IllegalArgumentException) {
+            conflict("Physical activation diagnostic evidence is malformed")
+        } catch (_: NoSuchElementException) {
+            conflict("Physical activation diagnostic evidence contains an unsupported typed value")
+        }
+        if (!anchor.isEligibleForLocalPrototypeActivation()) {
+            conflict("Physical activation requires one exact fresh VALID diagnostic point")
+        }
+        val supplied = try {
+            approval.toRecord()
+        } catch (_: IllegalArgumentException) {
+            conflict("Physical activation approval is malformed")
+        } catch (_: NoSuchElementException) {
+            conflict("Physical activation approval contains an unsupported typed value")
+        }
+        val expected = try {
+            PhysicalSensorActivationIdentity.localPrototypeApproval(
+                anchor = anchor,
+                nativeBinarySetSha256 = supplied.nativeBinarySetSha256,
+                nativeDatahandleBinarySetSha256 = supplied.nativeDatahandleBinarySetSha256,
+            )
+        } catch (_: IllegalArgumentException) {
+            conflict("Physical activation evidence cannot produce a canonical approval")
+        }
+        if (supplied != expected) {
+            conflict("Physical activation approval does not match the exact diagnostic evidence")
+        }
+        val approvalDisposition = approvePhysicalSensor(approval)
+        val bindingDisposition = activateLocalSensorBinding(
+            approvalId = supplied.approvalId,
+            publicationBindingId = publicationBindingId,
+            expectedPreviousPublicationBindingId = expectedPreviousPublicationBindingId,
+        )
+        return if (approvalDisposition == SensorCoreCommitDisposition.COMMITTED ||
+            bindingDisposition == SensorCoreCommitDisposition.COMMITTED
+        ) {
+            SensorCoreCommitDisposition.COMMITTED
+        } else {
+            SensorCoreCommitDisposition.ALREADY_COMMITTED
+        }
+    }
+
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     abstract suspend fun insertPublicationBinding(value: ProductPublicationBindingEntity): Long
 
     @Query(
         "SELECT * FROM product_publication_bindings " +
-            "WHERE publicationBindingId = :publicationBindingId LIMIT 1",
+            "WHERE remotePublicationBindingId = :remotePublicationBindingId LIMIT 1",
     )
     abstract suspend fun publicationBinding(
-        publicationBindingId: String,
+        remotePublicationBindingId: String,
     ): ProductPublicationBindingEntity?
 
     @Query(
         "SELECT b.* FROM product_publication_bindings b " +
+            "INNER JOIN active_remote_publication_binding r " +
+            "ON r.remotePublicationBindingId = b.remotePublicationBindingId " +
             "INNER JOIN active_sensor_publication_binding a " +
-            "ON a.publicationBindingId = b.publicationBindingId " +
+            "ON a.publicationBindingId = r.publicationBindingId " +
+            "AND a.approvalId = r.approvalId " +
             "WHERE a.activeSlot = $ACTIVE_PUBLICATION_BINDING_SLOT LIMIT 1",
     )
     abstract suspend fun activePublicationBinding(): ProductPublicationBindingEntity?
+
+    @Query(
+        "SELECT * FROM active_sensor_publication_binding " +
+            "WHERE activeSlot = $ACTIVE_PUBLICATION_BINDING_SLOT LIMIT 1",
+    )
+    abstract suspend fun activeSensorBinding(): ActiveSensorPublicationBindingEntity?
 
     @Upsert
     abstract suspend fun replaceActivePublicationBinding(
         value: ActiveSensorPublicationBindingEntity,
     )
+
+    @Query(
+        "SELECT * FROM active_remote_publication_binding " +
+            "WHERE publicationBindingId = :publicationBindingId LIMIT 1",
+    )
+    abstract suspend fun activeRemotePublicationBinding(
+        publicationBindingId: String,
+    ): ActiveRemotePublicationBindingEntity?
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    abstract suspend fun insertActiveRemotePublicationBinding(
+        value: ActiveRemotePublicationBindingEntity,
+    ): Long
+
+    @Query(
+        "UPDATE active_remote_publication_binding " +
+            "SET remotePublicationBindingId = :remotePublicationBindingId " +
+            "WHERE publicationBindingId = :publicationBindingId AND approvalId = :approvalId " +
+            "AND remotePublicationBindingId = :expectedPreviousRemotePublicationBindingId",
+    )
+    abstract suspend fun updateActiveRemotePublicationBinding(
+        publicationBindingId: String,
+        approvalId: String,
+        remotePublicationBindingId: String,
+        expectedPreviousRemotePublicationBindingId: String,
+    ): Int
+
+    @Query(
+        "DELETE FROM active_remote_publication_binding " +
+            "WHERE publicationBindingId = :publicationBindingId",
+    )
+    abstract suspend fun deleteActiveRemotePublicationBinding(
+        publicationBindingId: String,
+    ): Int
 
     @Query(
         "DELETE FROM active_sensor_publication_binding " +
@@ -114,7 +226,7 @@ internal abstract class SensorCoreDao {
     @Transaction
     open suspend fun activatePublicationBinding(
         value: ProductPublicationBindingEntity,
-        expectedPreviousPublicationBindingId: String?,
+        expectedPreviousRemotePublicationBindingId: String?,
     ): SensorCoreCommitDisposition {
         try {
             value.toRecord()
@@ -144,23 +256,90 @@ internal abstract class SensorCoreDao {
             }
             else -> conflict("Publication binding checkpoint belongs to another approval")
         }
-        val active = activePublicationBinding()
-        if (active?.publicationBindingId == value.publicationBindingId) {
-            if (active == value) return SensorCoreCommitDisposition.ALREADY_COMMITTED
-            conflict("Active publication binding identity conflicts with different contents")
+        val active = activeSensorBinding()
+            ?: conflict("Remote publication binding requires an active local sensor binding")
+        if (active.publicationBindingId != value.publicationBindingId ||
+            active.approvalId != value.approvalId
+        ) {
+            conflict("Remote publication binding does not match the active local sensor binding")
         }
-        if (active?.publicationBindingId != expectedPreviousPublicationBindingId) {
-            conflict("Active publication binding changed or was not explicitly ended")
+        val activeRemote = activeRemotePublicationBinding(value.publicationBindingId)
+        if (activeRemote?.remotePublicationBindingId == value.remotePublicationBindingId) {
+            if (publicationBinding(value.remotePublicationBindingId) == value
+            ) return SensorCoreCommitDisposition.ALREADY_COMMITTED
+            conflict("Active remote publication binding identity conflicts with different contents")
+        }
+        if (activeRemote?.remotePublicationBindingId != expectedPreviousRemotePublicationBindingId) {
+            conflict("Active remote publication binding changed")
         }
         if (insertPublicationBinding(value) == INSERT_IGNORED &&
-            publicationBinding(value.publicationBindingId) != value
+            publicationBinding(value.remotePublicationBindingId) != value
         ) {
-            conflict("Publication binding identity conflicts with different contents")
+            conflict("Remote publication binding identity conflicts with different contents")
         }
+        val activeRoute = ActiveRemotePublicationBindingEntity(
+            publicationBindingId = value.publicationBindingId,
+            approvalId = value.approvalId,
+            remotePublicationBindingId = value.remotePublicationBindingId,
+        )
+        val changed = if (expectedPreviousRemotePublicationBindingId == null) {
+            insertActiveRemotePublicationBinding(activeRoute) != INSERT_IGNORED
+        } else {
+            updateActiveRemotePublicationBinding(
+                publicationBindingId = value.publicationBindingId,
+                approvalId = value.approvalId,
+                remotePublicationBindingId = value.remotePublicationBindingId,
+                expectedPreviousRemotePublicationBindingId =
+                    expectedPreviousRemotePublicationBindingId,
+            ) == 1
+        }
+        if (!changed) conflict("Active local or remote publication binding changed")
+        return SensorCoreCommitDisposition.COMMITTED
+    }
+
+    @Transaction
+    open suspend fun activateLocalSensorBinding(
+        approvalId: String,
+        publicationBindingId: String,
+        expectedPreviousPublicationBindingId: String?,
+    ): SensorCoreCommitDisposition {
+        require(SHA256_HEX.matches(approvalId))
+        require(SHA256_HEX.matches(publicationBindingId))
+        val approval = physicalApproval(approvalId)
+            ?: conflict("Local sensor binding requires durable physical approval")
+        try {
+            approval.toRecord()
+        } catch (_: IllegalArgumentException) {
+            conflict("Local sensor binding references malformed physical approval")
+        } catch (_: NoSuchElementException) {
+            conflict("Local sensor binding approval contains unsupported typed data")
+        }
+        val protocol = protocolBinding(approval.sensorId)
+            ?: conflict("Local sensor binding requires durable protocol provenance")
+        val currentCheckpoint = checkpoint(approval.sensorId)
+            ?: conflict("Local sensor binding requires a durable checkpoint")
+        if (!protocol.matchesApproval(approval) ||
+            !currentCheckpoint.hasApprovedImmutableProvenance(approval) ||
+            currentCheckpoint.publicationApprovalId !in setOf(null, approvalId)
+        ) {
+            conflict("Local sensor binding does not match approved sensor provenance")
+        }
+        val active = activeSensorBinding()
+        if (active?.publicationBindingId == publicationBindingId) {
+            if (active.approvalId == approvalId) {
+                return SensorCoreCommitDisposition.ALREADY_COMMITTED
+            }
+            conflict("Active local sensor binding identity belongs to another approval")
+        }
+        if (active?.publicationBindingId != expectedPreviousPublicationBindingId) {
+            conflict("Active local sensor binding changed or was not explicitly ended")
+        }
+        active?.let { deleteActiveRemotePublicationBinding(it.publicationBindingId) }
         replaceActivePublicationBinding(
             ActiveSensorPublicationBindingEntity(
                 activeSlot = ACTIVE_PUBLICATION_BINDING_SLOT,
-                publicationBindingId = value.publicationBindingId,
+                publicationBindingId = publicationBindingId,
+                approvalId = approvalId,
             ),
         )
         return SensorCoreCommitDisposition.COMMITTED
@@ -170,11 +349,12 @@ internal abstract class SensorCoreDao {
     open suspend fun endActivePublicationBinding(
         expectedPublicationBindingId: String,
     ): SensorCoreCommitDisposition {
-        val active = activePublicationBinding()
+        val active = activeSensorBinding()
             ?: return SensorCoreCommitDisposition.ALREADY_COMMITTED
         if (active.publicationBindingId != expectedPublicationBindingId) {
             conflict("A different publication binding is active")
         }
+        deleteActiveRemotePublicationBinding(expectedPublicationBindingId)
         if (deleteActivePublicationBinding(expectedPublicationBindingId) != 1) {
             conflict("Active publication binding changed while ending the session")
         }
@@ -226,6 +406,12 @@ internal abstract class SensorCoreDao {
 
     @Query("SELECT * FROM measurement_upload_outbox WHERE eventId = :eventId LIMIT 1")
     abstract suspend fun outboxByEvent(eventId: String): UploadOutboxEntity?
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    abstract suspend fun insertLocalEffect(value: LocalReadingEffectEntity): Long
+
+    @Query("SELECT * FROM local_reading_effects WHERE eventId = :eventId LIMIT 1")
+    abstract suspend fun localEffectByEvent(eventId: String): LocalReadingEffectEntity?
 
     @Query(
         "SELECT * FROM measurement_upload_outbox " +
@@ -467,7 +653,9 @@ internal abstract class SensorCoreDao {
             "nextAttemptEpochMs = :nextAttemptEpochMs, sanitizedStatus = NULL, " +
             "sanitizedDetail = NULL " +
             "WHERE eventId = :eventId AND approvalId = :approvalId " +
-            "AND publicationBindingId = :publicationBindingId AND httpsOrigin = :httpsOrigin " +
+            "AND publicationBindingId = :publicationBindingId " +
+            "AND remotePublicationBindingId = :remotePublicationBindingId " +
+            "AND httpsOrigin = :httpsOrigin " +
             "AND backendBindingId = :backendBindingId AND credentialId = :credentialId " +
             "AND credentialRevision = :credentialRevision AND state = 'BLOCKED' " +
             "AND expectedPatientId = :expectedPatientId AND expectedDeviceId = :expectedDeviceId " +
@@ -478,6 +666,7 @@ internal abstract class SensorCoreDao {
         eventId: String,
         approvalId: String,
         publicationBindingId: String,
+        remotePublicationBindingId: String,
         httpsOrigin: String,
         backendBindingId: String,
         credentialId: String,
@@ -499,6 +688,7 @@ internal abstract class SensorCoreDao {
                 eventId = key.eventId,
                 approvalId = key.approvalId,
                 publicationBindingId = key.publicationBindingId,
+                remotePublicationBindingId = key.remotePublicationBindingId,
                 httpsOrigin = key.httpsOrigin,
                 backendBindingId = key.backendBindingId,
                 credentialId = key.credentialId,
@@ -516,6 +706,7 @@ internal abstract class SensorCoreDao {
         if (saved?.state == UploadOutboxState.PENDING.wireName &&
             saved.approvalId == key.approvalId &&
             saved.publicationBindingId == key.publicationBindingId &&
+            saved.remotePublicationBindingId == key.remotePublicationBindingId &&
             saved.httpsOrigin == key.httpsOrigin &&
             saved.backendBindingId == key.backendBindingId &&
             saved.credentialId == key.credentialId &&
@@ -597,7 +788,14 @@ internal abstract class SensorCoreDao {
         if (incomingMeasurement != null && incomingMeasurement.quality != "valid") {
             conflict("Only a VALID reading may become a product measurement")
         }
-        if ((incomingMeasurement != null) != (publicationContext != null)) {
+        if (incomingMeasurement != null &&
+            (!value.result.alarmEligible ||
+                raw.historyDistance != 0 ||
+                raw.phoneTimeEpochMs - raw.sensorTimeEpochMs !in 0 until MAX_REALTIME_AGE_MS)
+        ) {
+            conflict("A product measurement must be a fresh alarm-eligible sample")
+        }
+        if (publicationContext != null && incomingMeasurement == null) {
             conflict("Only a product measurement may carry publication context")
         }
         if (publicationContext != null &&
@@ -606,9 +804,9 @@ internal abstract class SensorCoreDao {
             conflict("Product publication and approved checkpoint contexts differ")
         }
 
-        val activePublication = activePublicationBinding()
+        val activeLocalBinding = activeSensorBinding()
         val approval = if (approvedCheckpointContext == null) {
-            if (activePublication != null) {
+            if (activeLocalBinding != null) {
                 conflict("Diagnostic commit is forbidden while a product sensor session is active")
             }
             if (value.checkpoint.publicationApprovalId != null ||
@@ -618,18 +816,31 @@ internal abstract class SensorCoreDao {
             }
             null
         } else {
-            val active = activePublication
-                ?: conflict("Approved commit requires an active publication binding")
-            try {
-                active.toRecord()
-            } catch (_: IllegalArgumentException) {
-                conflict("Active publication binding is malformed")
+            val active = activeLocalBinding
+                ?: conflict("Approved commit requires an active local sensor binding")
+            if (active.publicationBindingId != approvedCheckpointContext.publicationBindingId ||
+                active.approvalId != approvedCheckpointContext.approvalId
+            ) {
+                conflict("Approved checkpoint context does not match the active local binding")
             }
-            if (!active.matchesApprovedCheckpointContext(approvedCheckpointContext)) {
-                conflict("Approved checkpoint context does not match the active binding")
+            val remoteContext = publicationContext?.remoteBindingOrNull()
+            val activeRemote = activeRemotePublicationBinding(active.publicationBindingId)
+            if (activeRemote != null && activeRemote.approvalId != active.approvalId) {
+                conflict("Active remote route belongs to another local sensor approval")
             }
-            if (publicationContext != null && !active.matchesPublicationContext(publicationContext)) {
-                conflict("Publication context does not match the active binding")
+            if (activeRemote?.remotePublicationBindingId !=
+                remoteContext?.remotePublicationBindingId
+            ) {
+                conflict("Product publication context does not match the active remote route")
+            }
+            if (remoteContext != null) {
+                val remote = publicationBinding(remoteContext.remotePublicationBindingId)
+                    ?: conflict("Publication context has no durable remote binding")
+                if (!remote.matchesRemoteContext(remoteContext) ||
+                    remote.approvalId != active.approvalId
+                ) {
+                    conflict("Publication context does not match the active local binding")
+                }
             }
             val physicalApproval = physicalApproval(approvedCheckpointContext.approvalId)
                 ?: conflict("Approved commit requires durable physical approval")
@@ -658,18 +869,13 @@ internal abstract class SensorCoreDao {
                 conflict("Checkpoint/result lineage does not match approved context")
             }
             if (incomingMeasurement != null) {
-                val productContext = publicationContext
-                    ?: conflict("Product measurement requires publication context")
-                if (incomingMeasurement.publicationApprovalId != productContext.approvalId ||
-                    incomingMeasurement.publicationBindingId != productContext.publicationBindingId ||
-                    incomingMeasurement.httpsOrigin != productContext.httpsOrigin ||
-                    incomingMeasurement.backendBindingId != productContext.backendBindingId ||
-                    incomingMeasurement.credentialId != productContext.credentialId ||
-                    incomingMeasurement.credentialRevision != productContext.credentialRevision ||
-                    incomingMeasurement.expectedPatientId != productContext.expectedPatientId ||
-                    incomingMeasurement.expectedDeviceId != productContext.expectedDeviceId
+                if (incomingMeasurement.publicationApprovalId !=
+                        approvedCheckpointContext.approvalId ||
+                    incomingMeasurement.publicationBindingId !=
+                        approvedCheckpointContext.publicationBindingId ||
+                    !incomingMeasurement.matchesOptionalPublicationContext(publicationContext)
                 ) {
-                    conflict("Measurement lineage does not match publication context")
+                    conflict("Measurement lineage does not match local/remote product context")
                 }
             }
             physicalApproval
@@ -738,6 +944,9 @@ internal abstract class SensorCoreDao {
             if (outboxByEvent(value.raw.eventId) != null) {
                 conflict("A diagnostic result conflicts with an existing upload entry")
             }
+            if (localEffectByEvent(value.raw.eventId) != null) {
+                conflict("A diagnostic result conflicts with an existing local effect")
+            }
         } else if (insertMeasurement(incomingMeasurement) == INSERT_IGNORED) {
             if (measurement(incomingMeasurement.eventId)?.hasSameMedicalDataAs(incomingMeasurement) != true) {
                 conflict("Measurement conflicts with an existing event")
@@ -747,27 +956,51 @@ internal abstract class SensorCoreDao {
         }
 
         if (incomingMeasurement != null) {
-            val productApproval = approval
+            approval
                 ?: conflict("A publishable measurement requires active physical approval")
-            val productContext = publicationContext
-                ?: conflict("A publishable measurement requires typed publication context")
-            val pendingOutbox = UploadOutboxEntity.pending(
+            val localContext = approvedCheckpointContext
+                ?: conflict("A publishable measurement requires approved local context")
+            val remoteContext = publicationContext?.remoteBindingOrNull()
+            if (remoteContext == null) {
+                if (outboxByEvent(incomingMeasurement.eventId) != null) {
+                    conflict("Offline product measurement conflicts with a remote upload entry")
+                }
+            } else {
+                val pendingOutbox = UploadOutboxEntity.pending(
+                    eventId = incomingMeasurement.eventId,
+                    approvalId = remoteContext.approvalId,
+                    publicationBindingId = remoteContext.publicationBindingId,
+                    remotePublicationBindingId = remoteContext.remotePublicationBindingId,
+                    httpsOrigin = remoteContext.httpsOrigin,
+                    backendBindingId = remoteContext.backendBindingId,
+                    credentialId = remoteContext.credentialId,
+                    credentialRevision = remoteContext.credentialRevision,
+                    expectedPatientId = remoteContext.expectedPatientId,
+                    expectedDeviceId = remoteContext.expectedDeviceId,
+                    enqueuedAtEpochMs = incomingMeasurement.phoneTimeEpochMs,
+                )
+                if (insertOutbox(pendingOutbox) == INSERT_IGNORED) {
+                    if (outboxByEvent(incomingMeasurement.eventId)
+                            ?.hasSameImmutableIdentityAs(pendingOutbox) != true
+                    ) {
+                        conflict("Upload entry conflicts with the approved backend identity")
+                    }
+                } else {
+                    wroteAnything = true
+                }
+            }
+
+            val pendingLocalEffect = LocalReadingEffectEntity.pending(
                 eventId = incomingMeasurement.eventId,
-                approvalId = productContext.approvalId,
-                publicationBindingId = productContext.publicationBindingId,
-                httpsOrigin = productContext.httpsOrigin,
-                backendBindingId = productContext.backendBindingId,
-                credentialId = productContext.credentialId,
-                credentialRevision = productContext.credentialRevision,
-                expectedPatientId = productContext.expectedPatientId,
-                expectedDeviceId = productContext.expectedDeviceId,
+                approvalId = localContext.approvalId,
+                publicationBindingId = localContext.publicationBindingId,
                 enqueuedAtEpochMs = incomingMeasurement.phoneTimeEpochMs,
             )
-            if (insertOutbox(pendingOutbox) == INSERT_IGNORED) {
-                if (outboxByEvent(incomingMeasurement.eventId)
-                        ?.hasSameImmutableIdentityAs(pendingOutbox) != true
+            if (insertLocalEffect(pendingLocalEffect) == INSERT_IGNORED) {
+                if (localEffectByEvent(incomingMeasurement.eventId)
+                        ?.hasSameImmutableIdentityAs(pendingLocalEffect) != true
                 ) {
-                    conflict("Upload entry conflicts with the approved backend identity")
+                    conflict("Local effect conflicts with the approved product identity")
                 }
             } else {
                 wroteAnything = true
@@ -793,6 +1026,7 @@ internal abstract class SensorCoreDao {
         const val FIRST_SENSOR_INDEX = 1
         const val MILLIS_PER_SAMPLE = 60_000L
         const val MAX_OUTBOX_LEASE_SIZE = 100
+        const val MAX_REALTIME_AGE_MS = 330_000L
     }
 }
 
@@ -928,9 +1162,10 @@ private fun SensorAlgorithmCheckpointEntity.matchesApprovalAnchor(
     displayOffsetMmolL == approval.displayOffsetMmolL &&
     publicationApprovalId == null
 
-private fun ProductPublicationBindingEntity.matchesPublicationContext(
-    context: ProductPublicationContext,
-): Boolean = publicationBindingId == context.publicationBindingId &&
+private fun ProductPublicationBindingEntity.matchesRemoteContext(
+    context: ProductRemoteBindingContext,
+): Boolean = remotePublicationBindingId == context.remotePublicationBindingId &&
+    publicationBindingId == context.publicationBindingId &&
     approvalId == context.approvalId &&
     httpsOrigin == context.httpsOrigin &&
     backendBindingId == context.backendBindingId &&
@@ -944,10 +1179,26 @@ private fun ProductPublicationBindingEntity.matchesApprovedCheckpointContext(
 ): Boolean = publicationBindingId == context.publicationBindingId &&
     approvalId == context.approvalId
 
+private fun MeasurementEntity.matchesOptionalPublicationContext(
+    context: ProductPublicationContext?,
+): Boolean = if (context == null) {
+    remotePublicationBindingId == null && httpsOrigin == null &&
+        backendBindingId == null && credentialId == null &&
+        credentialRevision == null && expectedPatientId == null && expectedDeviceId == null
+} else {
+    publicationApprovalId == context.approvalId &&
+        publicationBindingId == context.publicationBindingId &&
+        remotePublicationBindingId == context.remotePublicationBindingId &&
+        httpsOrigin == context.httpsOrigin && backendBindingId == context.backendBindingId &&
+        credentialId == context.credentialId && credentialRevision == context.credentialRevision &&
+        expectedPatientId == context.expectedPatientId && expectedDeviceId == context.expectedDeviceId
+}
+
 private fun UploadOutboxEntity.hasSameImmutableIdentityAs(other: UploadOutboxEntity): Boolean =
     eventId == other.eventId &&
         approvalId == other.approvalId &&
         publicationBindingId == other.publicationBindingId &&
+        remotePublicationBindingId == other.remotePublicationBindingId &&
         httpsOrigin == other.httpsOrigin &&
         backendBindingId == other.backendBindingId &&
         credentialId == other.credentialId &&
@@ -961,6 +1212,7 @@ private fun UploadOutboxEntity.matchesMeasurementLineage(
 ): Boolean = eventId == measurement.eventId &&
     approvalId == measurement.publicationApprovalId &&
     publicationBindingId == measurement.publicationBindingId &&
+    remotePublicationBindingId == measurement.remotePublicationBindingId &&
     httpsOrigin == measurement.httpsOrigin &&
     backendBindingId == measurement.backendBindingId &&
     credentialId == measurement.credentialId &&
@@ -1001,6 +1253,7 @@ private fun MeasurementEntity.hasSameMedicalDataAs(other: MeasurementEntity): Bo
         sequence == other.sequence &&
         publicationApprovalId == other.publicationApprovalId &&
         publicationBindingId == other.publicationBindingId &&
+        remotePublicationBindingId == other.remotePublicationBindingId &&
         httpsOrigin == other.httpsOrigin &&
         backendBindingId == other.backendBindingId &&
         credentialId == other.credentialId &&
@@ -1022,3 +1275,5 @@ private fun SensorIngestionFailureEntity.hasSameCauseAs(other: SensorIngestionFa
         transportVariant == other.transportVariant &&
         failureCode == other.failureCode &&
         nativeStateMayHaveChanged == other.nativeStateMayHaveChanged
+
+private val SHA256_HEX = Regex("^[0-9a-f]{64}$")

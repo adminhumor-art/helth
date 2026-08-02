@@ -459,4 +459,5 @@ private class RecordingCommittedIngressDao(
     override suspend fun publicationBinding(
         publicationBindingId: String,
     ): ProductPublicationBindingEntity? = null
+    override suspend fun activeSensorBinding(): ActiveSensorPublicationBindingEntity? = null
 }

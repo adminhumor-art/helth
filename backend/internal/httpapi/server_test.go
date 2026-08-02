@@ -3,6 +3,8 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -46,7 +48,7 @@ func TestDeviceTokenSelectsItsOwnPatientAndPayloadCannotOverrideIt(t *testing.T)
 		familyToken: "second-family-secret", backendBindingID: secondBackendBindingID,
 		credentialID: secondCredentialID, credentialRevision: 2,
 	})
-	server := New(Config{}, values, alerts.NewEngine(alerts.DefaultThresholds()))
+	server := New(Config{FamilyWebOrigins: []string{familyWebOrigin}}, values, alerts.NewEngine(alerts.DefaultThresholds()))
 	value := validMeasurement(time.Now().UTC())
 
 	response := postMeasurementWithIdentity(t, server.Handler(), value, secondToken, func(payload map[string]any) {
@@ -79,7 +81,7 @@ func TestUnknownRevokedAndFamilyTokensCannotIngest(t *testing.T) {
 		familyToken: familyToken,
 	}
 	bootstrapAccess(t, values, fixture)
-	server := New(Config{}, values, alerts.NewEngine(alerts.DefaultThresholds()))
+	server := New(Config{FamilyWebOrigins: []string{familyWebOrigin}}, values, alerts.NewEngine(alerts.DefaultThresholds()))
 	value := validMeasurement(time.Now().UTC())
 
 	for _, token := range []string{"unknown-device-secret", familyToken} {
@@ -111,7 +113,7 @@ func TestFamilySessionCanOnlyReadPatientsInItsHousehold(t *testing.T) {
 		familyToken: "foreign-family-secret", backendBindingID: secondBackendBindingID,
 		credentialID: secondCredentialID, credentialRevision: 2,
 	})
-	server := New(Config{}, values, alerts.NewEngine(alerts.DefaultThresholds()))
+	server := New(Config{FamilyWebOrigins: []string{familyWebOrigin}}, values, alerts.NewEngine(alerts.DefaultThresholds()))
 
 	request := httptest.NewRequest(http.MethodGet, "/v1/patients/"+foreignPatientID+"/snapshot", nil)
 	setFamilySessionCookie(request, familyToken)
@@ -139,7 +141,7 @@ func TestExpiredFamilySessionIsUnauthorized(t *testing.T) {
 		deviceToken: deviceToken, familySessionID: "00000000-0000-4000-8000-000000000301",
 		familyToken: familyToken, familyExpiresAt: &expiresAt,
 	})
-	server := New(Config{}, values, alerts.NewEngine(alerts.DefaultThresholds()))
+	server := New(Config{FamilyWebOrigins: []string{familyWebOrigin}}, values, alerts.NewEngine(alerts.DefaultThresholds()))
 	request := httptest.NewRequest(http.MethodGet, "/v1/patients/"+patientID+"/snapshot", nil)
 	setFamilySessionCookie(request, familyToken)
 	response := httptest.NewRecorder()
@@ -182,7 +184,7 @@ func TestFamilyPatientPathsCanonicalizeUppercaseUUID(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	server := New(Config{}, values, alerts.NewEngine(alerts.DefaultThresholds()))
+	server := New(Config{FamilyWebOrigins: []string{familyWebOrigin}}, values, alerts.NewEngine(alerts.DefaultThresholds()))
 	uppercasePatientID := strings.ToUpper(canonicalPatientID)
 
 	snapshotRequest := httptest.NewRequest(http.MethodGet, "/v1/patients/"+uppercasePatientID+"/snapshot", nil)
@@ -234,7 +236,7 @@ func TestFamilyAlertPathCanonicalizesUppercaseUUID(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	server := New(Config{}, values, alerts.NewEngine(alerts.DefaultThresholds()))
+	server := New(Config{FamilyWebOrigins: []string{familyWebOrigin}}, values, alerts.NewEngine(alerts.DefaultThresholds()))
 	request := httptest.NewRequest(http.MethodPost, "/v1/alerts/"+strings.ToUpper(canonicalAlertID)+"/acknowledge", nil)
 	setFamilySessionCookie(request, familyToken)
 	response := httptest.NewRecorder()
@@ -366,7 +368,7 @@ func TestIngestCanonicalizesValidUppercaseDeviceUUIDBeforeExactBindingMatch(t *t
 		familySessionID: "00000000-0000-4000-8000-000000000301",
 		familyToken:     familyToken,
 	})
-	server := New(Config{}, values, alerts.NewEngine(alerts.DefaultThresholds()))
+	server := New(Config{FamilyWebOrigins: []string{familyWebOrigin}}, values, alerts.NewEngine(alerts.DefaultThresholds()))
 	response := postMeasurementWithIdentity(
 		t,
 		server.Handler(),
@@ -392,7 +394,7 @@ func TestIngestCredentialRevisionMatchesOpenAPIJSONSafeIntegerBoundary(t *testin
 		familySessionID: "00000000-0000-4000-8000-000000000301", familyToken: familyToken,
 		credentialRevision: store.MaxCredentialRevision,
 	})
-	server := New(Config{}, values, alerts.NewEngine(alerts.DefaultThresholds()))
+	server := New(Config{FamilyWebOrigins: []string{familyWebOrigin}}, values, alerts.NewEngine(alerts.DefaultThresholds()))
 	accepted := postMeasurementWithIdentity(
 		t, server.Handler(), validMeasurement(time.Now().UTC()), deviceToken,
 		func(payload map[string]any) { payload["credentialRevision"] = store.MaxCredentialRevision },
@@ -875,7 +877,9 @@ func postMeasurement(t *testing.T, handler http.Handler, value domain.Measuremen
 }
 
 func setFamilySessionCookie(request *http.Request, token string) {
-	request.AddCookie(&http.Cookie{Name: "family_session", Value: token})
+	request.AddCookie(&http.Cookie{Name: familySessionCookieName, Value: testFamilyWebSessionToken(token)})
+	request.Header.Set("Origin", familyWebOrigin)
+	request.Header.Set("X-CSRF-Token", testFamilyCSRFToken(token))
 }
 
 func postMeasurementWithIdentity(
@@ -957,6 +961,7 @@ func bootstrapAccess(t *testing.T, values *store.Memory, fixture accessFixture) 
 	}); err != nil {
 		t.Fatal(err)
 	}
+	issueTestFamilyWebSession(t, values, fixture.familyToken, fixture.familyExpiresAt)
 }
 
 type accessBootstrapper interface {
@@ -995,7 +1000,51 @@ func newTestServerSetup(t *testing.T, values store.Store, config Config, engine 
 	}); err != nil {
 		t.Fatal(err)
 	}
+	issueTestFamilyWebSession(t, values, familyToken, nil)
+	if len(config.FamilyWebOrigins) == 0 {
+		config.FamilyWebOrigins = []string{familyWebOrigin}
+	}
 	return New(config, values, engine)
+}
+
+func issueTestFamilyWebSession(t *testing.T, values store.Store, accessToken string, accessExpiresAt *time.Time) {
+	t.Helper()
+	now := time.Now().UTC()
+	if accessExpiresAt != nil && !accessExpiresAt.After(now) {
+		return
+	}
+	expiresAt := now.Add(time.Hour)
+	if accessExpiresAt != nil && accessExpiresAt.Before(expiresAt) {
+		expiresAt = *accessExpiresAt
+	}
+	_, err := values.IssueFamilyWebSession(
+		context.Background(), store.HashAccessToken(accessToken),
+		store.FamilyWebSessionCredential{
+			ID:            testFamilyWebSessionID(accessToken),
+			TokenHash:     store.HashAccessToken(testFamilyWebSessionToken(accessToken)),
+			CSRFTokenHash: store.HashAccessToken(testFamilyCSRFToken(accessToken)),
+			ExpiresAt:     expiresAt,
+		},
+		now,
+	)
+	if err != nil && !errors.Is(err, store.ErrCredentialConflict) {
+		t.Fatal(err)
+	}
+}
+
+func testFamilyWebSessionToken(accessToken string) string {
+	return "test-web-session:" + accessToken
+}
+
+func testFamilyCSRFToken(accessToken string) string {
+	return "test-csrf:" + accessToken
+}
+
+func testFamilyWebSessionID(accessToken string) string {
+	digest := sha256.Sum256([]byte("test-family-web-session:" + accessToken))
+	encoded := hex.EncodeToString(digest[:16])
+	return encoded[0:8] + "-" + encoded[8:12] + "-4" + encoded[13:16] + "-8" +
+		encoded[17:20] + "-" + encoded[20:32]
 }
 
 func activateHTTPMonitoring(t *testing.T, values *store.Memory, targetPatientID string, at time.Time) {

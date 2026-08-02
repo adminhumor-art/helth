@@ -41,11 +41,72 @@ func TestProductionConfigRejectsPlaintextBootstrapCredentials(t *testing.T) {
 func TestProductionConfigUsesPreprovisionedDatabaseWithoutGlobalPatient(t *testing.T) {
 	err := validateConfig(appConfig{
 		environment: "production", production: true,
-		databaseURL:   "postgres://database.invalid/sladkaya",
-		telegramToken: "production-bot-token",
+		databaseURL:      "postgres://database.invalid/sladkaya",
+		telegramToken:    "production-bot-token",
+		familyWebOrigins: []string{"https://family.example"},
+		deviceAPIOrigin:  "https://api.family.example",
 	})
 	if err != nil {
 		t.Fatalf("preprovisioned production database was rejected: %v", err)
+	}
+}
+
+func TestConfigRequiresExactDeviceAPIOriginWithProductionHTTPS(t *testing.T) {
+	base := appConfig{
+		environment: "production", production: true,
+		databaseURL: "postgres://database.invalid/sladkaya", telegramToken: "production-bot-token",
+		familyWebOrigins: []string{"https://family.example"},
+	}
+	for _, origin := range []string{
+		"", "*", "http://api.family.example", "https://api.family.example/path",
+		"https://user@api.family.example", "https://api.family.example?",
+	} {
+		config := base
+		config.deviceAPIOrigin = origin
+		if err := validateConfig(config); err == nil {
+			t.Fatalf("unsafe device API origin was accepted: %q", origin)
+		}
+	}
+	base.deviceAPIOrigin = "https://api.family.example"
+	if err := validateConfig(base); err != nil {
+		t.Fatalf("exact production HTTPS device API origin was rejected: %v", err)
+	}
+	development := appConfig{environment: "development", deviceAPIOrigin: "http://127.0.0.1:8080"}
+	if err := validateDeviceAPIOrigin(development); err != nil {
+		t.Fatalf("loopback development API origin was rejected: %v", err)
+	}
+}
+
+func TestConfigRequiresExactFamilyWebOriginAllowlist(t *testing.T) {
+	base := appConfig{
+		environment: "production", production: true,
+		databaseURL: "postgres://database.invalid/sladkaya", telegramToken: "production-bot-token",
+		deviceAPIOrigin: "https://api.family.example",
+	}
+	for _, origins := range [][]string{
+		nil,
+		{"*"},
+		{"http://family.example"},
+		{"https://family.example/path"},
+		{"https://family.example?"},
+		{"https://family.example#"},
+		{"https://user@family.example"},
+		{"https://family.example", "https://family.example"},
+	} {
+		config := base
+		config.familyWebOrigins = origins
+		if err := validateConfig(config); err == nil {
+			t.Fatalf("unsafe family origin allowlist was accepted: %#v", origins)
+		}
+	}
+	base.familyWebOrigins = []string{"https://family.example"}
+	if err := validateConfig(base); err != nil {
+		t.Fatalf("exact HTTPS family origin was rejected: %v", err)
+	}
+
+	development := appConfig{environment: "development", familyWebOrigins: []string{"http://localhost:3000"}}
+	if err := validateFamilyWebOrigins(development); err != nil {
+		t.Fatalf("local development origin was rejected: %v", err)
 	}
 }
 
@@ -108,6 +169,8 @@ func TestDevelopmentBootstrapMustBeCompleteAndStrong(t *testing.T) {
 func TestDevelopmentConfigAcceptsCompleteExplicitBootstrap(t *testing.T) {
 	err := validateConfig(appConfig{
 		environment:                 "development",
+		familyWebOrigins:            []string{"http://localhost:3000"},
+		deviceAPIOrigin:             "http://127.0.0.1:8080",
 		bootstrapDeviceToken:        "device-token-0123456789abcdef0123456789abcdef",
 		bootstrapFamilyToken:        "family-token-fedcba9876543210fedcba9876543210",
 		bootstrapPatientID:          "00000000-0000-4000-8000-000000000001",
@@ -130,6 +193,8 @@ func TestComposeDevelopmentDefaultsPassServerValidation(t *testing.T) {
 		"BACKEND_BINDING_ID",
 		"CREDENTIAL_ID",
 		"CREDENTIAL_REVISION",
+		"FAMILY_WEB_ORIGINS",
+		"DEVICE_API_ORIGIN",
 	} {
 		if strings.TrimSpace(values[required]) == "" {
 			t.Fatalf("compose api environment does not provide %s", required)
@@ -141,6 +206,8 @@ func TestComposeDevelopmentDefaultsPassServerValidation(t *testing.T) {
 		"BOOTSTRAP_HOUSEHOLD_ID", "BOOTSTRAP_DEVICE_ID", "BACKEND_BINDING_ID", "CREDENTIAL_ID",
 		"CREDENTIAL_REVISION", "BOOTSTRAP_FAMILY_SESSION_ID", "DATABASE_URL", "TELEGRAM_BOT_TOKEN",
 		"TELEGRAM_CHAT_IDS",
+		"FAMILY_WEB_ORIGINS",
+		"DEVICE_API_ORIGIN",
 	}
 	for _, name := range configEnvironmentNames {
 		t.Setenv(name, "")
@@ -302,6 +369,8 @@ func TestBootstrapIdentityCanonicalizesUUIDsFromConfig(t *testing.T) {
 func TestDevelopmentConfigRejectsCredentialRevisionOutsideJSONSafeRange(t *testing.T) {
 	config := appConfig{
 		environment:                 "development",
+		familyWebOrigins:            []string{"http://localhost:3000"},
+		deviceAPIOrigin:             "http://127.0.0.1:8080",
 		bootstrapDeviceToken:        "device-token-0123456789abcdef0123456789abcdef",
 		bootstrapFamilyToken:        "family-token-fedcba9876543210fedcba9876543210",
 		bootstrapPatientID:          "00000000-0000-4000-8000-000000000001",

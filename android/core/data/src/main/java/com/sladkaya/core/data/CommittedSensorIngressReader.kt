@@ -183,11 +183,17 @@ internal abstract class CommittedSensorIngressDao {
 
     @Query(
         "SELECT * FROM product_publication_bindings " +
-            "WHERE publicationBindingId = :publicationBindingId LIMIT 1",
+            "WHERE remotePublicationBindingId = :remotePublicationBindingId LIMIT 1",
     )
     protected abstract suspend fun publicationBinding(
-        publicationBindingId: String,
+        remotePublicationBindingId: String,
     ): ProductPublicationBindingEntity?
+
+    @Query(
+        "SELECT * FROM active_sensor_publication_binding " +
+            "WHERE activeSlot = $ACTIVE_PUBLICATION_BINDING_SLOT LIMIT 1",
+    )
+    protected abstract suspend fun activeSensorBinding(): ActiveSensorPublicationBindingEntity?
 
     @Transaction
     open suspend fun readExact(
@@ -384,9 +390,7 @@ internal abstract class CommittedSensorIngressDao {
                 raw = raw,
                 result = result,
                 measurement = measurement,
-                outbox = outbox ?: return mismatch(
-                    "Publishable measurement has no atomic upload lineage",
-                ),
+                outbox = outbox,
             ) ?: return mismatch("Publishable measurement lineage is malformed")
             committed += CommittedSensorIngressSampleRecord(
                 raw = raw,
@@ -402,7 +406,7 @@ internal abstract class CommittedSensorIngressDao {
         raw: RawSensorSampleRecord,
         result: SensorAlgorithmResultEntity,
         measurement: MeasurementEntity,
-        outbox: UploadOutboxEntity,
+        outbox: UploadOutboxEntity?,
     ): CommittedProductPublicationRecord? {
         if (result.algorithmErrorCode != null || !result.alarmEligible ||
             !measurement.matches(raw) || measurement.quality != ReadingQuality.VALID.wireName
@@ -410,14 +414,11 @@ internal abstract class CommittedSensorIngressDao {
         val approvalId = measurement.publicationApprovalId ?: return null
         val publicationBindingId = measurement.publicationBindingId ?: return null
         if (result.publicationApprovalId != approvalId) return null
-        try {
-            outbox.toRecord()
-        } catch (_: IllegalArgumentException) {
-            return null
-        } catch (_: NoSuchElementException) {
-            return null
-        }
-        if (!outbox.matches(measurement)) return null
+        val activeBinding = activeSensorBinding() ?: return null
+        if (activeBinding.activeSlot != ACTIVE_PUBLICATION_BINDING_SLOT ||
+            activeBinding.approvalId != approvalId ||
+            activeBinding.publicationBindingId != publicationBindingId
+        ) return null
         val approval = try {
             physicalApproval(approvalId)?.toRecord()
         } catch (_: IllegalArgumentException) {
@@ -433,17 +434,42 @@ internal abstract class CommittedSensorIngressDao {
             !result.matchesApproval(approval) ||
             !measurement.matchesDisplayContract(result)
         ) return null
-        val binding = try {
-            publicationBinding(publicationBindingId)?.toRecord()
-        } catch (_: IllegalArgumentException) {
-            null
-        } catch (_: NoSuchElementException) {
-            null
-        } ?: return null
-        if (binding.publicationBindingId != publicationBindingId ||
-            binding.approvalId != approval.approvalId ||
-            !binding.matches(measurement)
-        ) return null
+        val remoteFields = listOf(
+            measurement.remotePublicationBindingId,
+            measurement.httpsOrigin,
+            measurement.backendBindingId,
+            measurement.credentialId,
+            measurement.credentialRevision,
+            measurement.expectedPatientId,
+            measurement.expectedDeviceId,
+        )
+        val hasRemoteLineage = remoteFields.all { it != null }
+        if (!hasRemoteLineage && remoteFields.any { it != null }) return null
+        if (hasRemoteLineage) {
+            val exactOutbox = outbox ?: return null
+            try {
+                exactOutbox.toRecord()
+            } catch (_: IllegalArgumentException) {
+                return null
+            } catch (_: NoSuchElementException) {
+                return null
+            }
+            if (!exactOutbox.matches(measurement)) return null
+            val binding = try {
+                publicationBinding(requireNotNull(measurement.remotePublicationBindingId))?.toRecord()
+            } catch (_: IllegalArgumentException) {
+                null
+            } catch (_: NoSuchElementException) {
+                null
+            } ?: return null
+            if (binding.publicationBindingId != publicationBindingId ||
+                binding.remotePublicationBindingId != measurement.remotePublicationBindingId ||
+                binding.approvalId != approval.approvalId ||
+                !binding.matches(measurement)
+            ) return null
+        } else if (outbox != null) {
+            return null
+        }
         val reading = try {
             measurement.toModel()
         } catch (_: IllegalArgumentException) {
@@ -568,6 +594,7 @@ private fun SensorAlgorithmResultEntity.matchesApproval(
 private fun UploadOutboxEntity.matches(measurement: MeasurementEntity): Boolean =
     eventId == measurement.eventId && approvalId == measurement.publicationApprovalId &&
         publicationBindingId == measurement.publicationBindingId &&
+        remotePublicationBindingId == measurement.remotePublicationBindingId &&
         httpsOrigin == measurement.httpsOrigin && backendBindingId == measurement.backendBindingId &&
         credentialId == measurement.credentialId && credentialRevision == measurement.credentialRevision &&
         expectedPatientId == measurement.expectedPatientId &&
@@ -576,6 +603,7 @@ private fun UploadOutboxEntity.matches(measurement: MeasurementEntity): Boolean 
 private fun ProductPublicationBindingRecord.matches(
     measurement: MeasurementEntity,
 ): Boolean = publicationBindingId == measurement.publicationBindingId &&
+    remotePublicationBindingId == measurement.remotePublicationBindingId &&
     httpsOrigin == measurement.httpsOrigin &&
     backendBindingId == measurement.backendBindingId && credentialId == measurement.credentialId &&
     credentialRevision == measurement.credentialRevision &&

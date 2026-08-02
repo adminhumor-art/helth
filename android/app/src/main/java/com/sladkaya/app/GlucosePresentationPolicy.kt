@@ -41,6 +41,10 @@ internal object ReadingFreshnessPolicy {
     private const val MAX_SENSOR_FUTURE_SKEW_MS = 5 * 60_000L
 }
 
+internal object CurrentGlucoseNumberPolicy {
+    fun show(freshness: ReadingFreshness): Boolean = freshness == ReadingFreshness.FRESH
+}
+
 internal data class ChartPoint(
     val reading: GlucoseReading,
     val xFraction: Float,

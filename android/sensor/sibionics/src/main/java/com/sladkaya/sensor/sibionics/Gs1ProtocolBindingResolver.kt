@@ -85,10 +85,13 @@ internal class Gs1ProtocolBindingResolver(
             return failure("PROTOCOL_BINDING_EVIDENCE_INVALID")
         }
         val spec = try {
-            Gs1WireProfiles.requireResolved(wireProfile)
+            Gs1WireProfiles.requireResolved(wireProfile, profile.transportVariant)
         } catch (invalid: IllegalArgumentException) {
             return failure("PROTOCOL_BINDING_PROFILE_INVALID", invalid.message)
         }
+        val algorithmProfile = Gs1AlgorithmProfiles.resolveForTransportVariant(
+            profile.transportVariant,
+        ) ?: return failure("ALGORITHM_BUNDLE_UNSUPPORTED")
         val record = SensorProtocolBindingRecord(
             sensorId = profile.sensorId,
             bluetoothAddress = profile.bluetoothAddress,
@@ -98,7 +101,7 @@ internal class Gs1ProtocolBindingResolver(
             wireProfile = wireProfile.name,
             transportProtocol = spec.transportProtocol,
             transportCodecId = spec.transportCodecId,
-            algorithmProfile = spec.algorithmProfile.name,
+            algorithmProfile = algorithmProfile.name,
             sensitivityEncoding = sensitivityEncoding,
             evidenceKind = evidenceKind,
             evidenceSha256 = evidence.sha256(),
@@ -129,8 +132,13 @@ internal class Gs1ProtocolBindingResolver(
     ): Gs1ProtocolResolution {
         val wireProfile = Gs1WireProfile.entries.firstOrNull { it.name == binding.wireProfile }
             ?: return failure("PROTOCOL_BINDING_MISMATCH", "Unknown wire profile")
-        val spec = runCatching { Gs1WireProfiles.requireResolved(wireProfile) }.getOrNull()
+        val spec = runCatching {
+            Gs1WireProfiles.requireResolved(wireProfile, profile.transportVariant)
+        }.getOrNull()
             ?: return failure("PROTOCOL_BINDING_MISMATCH", "Unresolved wire profile was persisted")
+        val algorithmProfile = Gs1AlgorithmProfiles.resolveForTransportVariant(
+            profile.transportVariant,
+        ) ?: return failure("ALGORITHM_BUNDLE_UNSUPPORTED")
         val exact = binding.sensorId == profile.sensorId &&
             binding.bluetoothAddress == profile.bluetoothAddress &&
             binding.sensorFamily == profile.family &&
@@ -138,7 +146,7 @@ internal class Gs1ProtocolBindingResolver(
             binding.sensitivityToken == profile.packageCode &&
             binding.transportProtocol == spec.transportProtocol &&
             binding.transportCodecId == spec.transportCodecId &&
-            binding.algorithmProfile == spec.algorithmProfile.name &&
+            binding.algorithmProfile == algorithmProfile.name &&
             binding.schemaVersion == SensorProtocolBindingRecord.SCHEMA_VERSION
         return if (exact) {
             Gs1ProtocolResolution.Resolved(wireProfile, binding)

@@ -1,6 +1,5 @@
 package com.sladkaya.sensor.sibionics.datahandle
 
-import com.no.sisense.enanddecryption.CGMDataHandle130
 import java.nio.charset.StandardCharsets
 
 /**
@@ -49,6 +48,7 @@ enum class DataHandleError {
     UNEXPECTED_SPLIT_TYPE,
     MALFORMED_NATIVE_PAYLOAD,
     NATIVE_BUFFER_OVERFLOW,
+    NATIVE_BUNDLE_MISMATCH,
 }
 
 sealed interface DataHandleCommandResult {
@@ -121,14 +121,27 @@ sealed interface Gs1DataSplitResult {
 }
 
 class SibionicsDataHandle internal constructor(
+    override val bundle: DataHandleBundle,
     private val native: NativeDataHandleApi,
-) {
-    constructor() : this(JniNativeDataHandleApi)
+    private val closeNative: () -> Unit = {},
+) : DataHandleGateway {
+    internal constructor(native: NativeDataHandleApi) : this(DataHandleBundle.GLOBAL, native)
 
-    fun authentication(
+    @Volatile
+    private var closed = false
+
+    override fun authentication(
         variant: DataHandleVariant,
         bluetoothAddress: String,
     ): DataHandleCommandResult = synchronized(nativeCallLock) {
+        if (closed) return@synchronized DataHandleCommandResult.Failure(
+            DataHandleError.NATIVE_CALL_FAILED,
+        )
+        if (variant.protocolCode != bundle.transportVariant) {
+            return@synchronized DataHandleCommandResult.Failure(
+                DataHandleError.NATIVE_BUNDLE_MISMATCH,
+            )
+        }
         val reversedAddress = parseReversedAddress(bluetoothAddress)
             ?: return@synchronized DataHandleCommandResult.Failure(
                 DataHandleError.INVALID_BLUETOOTH_ADDRESS,
@@ -164,7 +177,7 @@ class SibionicsDataHandle internal constructor(
         }
     }
 
-    fun activation(epochSeconds: Long): DataHandleCommandResult = synchronized(nativeCallLock) {
+    override fun activation(epochSeconds: Long): DataHandleCommandResult = synchronized(nativeCallLock) {
         if (!validEpochSeconds(epochSeconds)) {
             return@synchronized DataHandleCommandResult.Failure(DataHandleError.INVALID_TIME)
         }
@@ -181,7 +194,7 @@ class SibionicsDataHandle internal constructor(
         }
     }
 
-    fun timeUpdate(epochSeconds: Long): DataHandleCommandResult = synchronized(nativeCallLock) {
+    override fun timeUpdate(epochSeconds: Long): DataHandleCommandResult = synchronized(nativeCallLock) {
         if (!validEpochSeconds(epochSeconds)) {
             return@synchronized DataHandleCommandResult.Failure(DataHandleError.INVALID_TIME)
         }
@@ -197,7 +210,7 @@ class SibionicsDataHandle internal constructor(
         }
     }
 
-    fun rawData(index: Int): DataHandleCommandResult = synchronized(nativeCallLock) {
+    override fun rawData(index: Int): DataHandleCommandResult = synchronized(nativeCallLock) {
         if (index !in 0..0xffff) {
             return@synchronized DataHandleCommandResult.Failure(DataHandleError.INVALID_INDEX)
         }
@@ -214,7 +227,7 @@ class SibionicsDataHandle internal constructor(
         }
     }
 
-    fun reset(): DataHandleCommandResult = synchronized(nativeCallLock) {
+    override fun reset(): DataHandleCommandResult = synchronized(nativeCallLock) {
         command(RESET_BUFFER_SIZE) { output ->
             native.reset(
                 command = 0,
@@ -227,7 +240,10 @@ class SibionicsDataHandle internal constructor(
         }
     }
 
-    fun split(packet: ByteArray): DataHandleSplitResult = synchronized(nativeCallLock) {
+    override fun split(packet: ByteArray): DataHandleSplitResult = synchronized(nativeCallLock) {
+        if (closed) return@synchronized DataHandleSplitResult.Failure(
+            DataHandleError.NATIVE_CALL_FAILED,
+        )
         if (packet.isEmpty() || packet.size > MAX_PACKET_SIZE) {
             return@synchronized DataHandleSplitResult.Failure(DataHandleError.INVALID_PACKET_SIZE)
         }
@@ -270,7 +286,7 @@ class SibionicsDataHandle internal constructor(
         )
     }
 
-    fun splitGs1Data(packet: ByteArray): Gs1DataSplitResult {
+    override fun splitGs1Data(packet: ByteArray): Gs1DataSplitResult {
         val split = split(packet)
         if (split is DataHandleSplitResult.Failure) {
             return Gs1DataSplitResult.Failure(split.error, split.nativeCode)
@@ -374,6 +390,7 @@ class SibionicsDataHandle internal constructor(
         capacity: Int,
         nativeCall: (ByteArray) -> Int,
     ): DataHandleCommandResult {
+        if (closed) return DataHandleCommandResult.Failure(DataHandleError.NATIVE_CALL_FAILED)
         val output = ByteArray(capacity)
         val length = runCatching { nativeCall(output) }.getOrElse {
             return DataHandleCommandResult.Failure(DataHandleError.NATIVE_CALL_FAILED)
@@ -400,8 +417,14 @@ class SibionicsDataHandle internal constructor(
 
     private fun Char.isHexDigit(): Boolean = this in '0'..'9' || this in 'a'..'f' || this in 'A'..'F'
 
+    override fun close() = synchronized(nativeCallLock) {
+        if (!closed) {
+            closed = true
+            closeNative()
+        }
+    }
+
     companion object {
-        const val BINARY_SET_ID = "sha256:13c2e96b3a590da34e85114ede0810279abb7142661bc8ccdad79f184663293b"
         private val nativeCallLock = Any()
         private val EMPTY_NATIVE_INPUT = ByteArray(2)
         private const val AUTHENTICATION_BUFFER_SIZE = 50
@@ -503,115 +526,4 @@ internal interface NativeDataHandleApi {
         workspace: ByteArray,
         workspaceLength: Int,
     ): Int
-}
-
-private object JniNativeDataHandleApi : NativeDataHandleApi {
-    init {
-        System.loadLibrary("data-handle-lib")
-    }
-
-    override fun registerKey(input: ByteArray, length: Int, output: ByteArray): Int =
-        CGMDataHandle130.v120RegisterKey(input, length, output)
-
-    override fun applyAuthentication(
-        command: Int,
-        encrypted: Boolean,
-        value: Int,
-        input: ByteArray,
-        output: ByteArray,
-        outputLength: Int,
-    ): Int = CGMDataHandle130.V120ApplyAuthentication(
-        command,
-        encrypted,
-        value,
-        input,
-        output,
-        outputLength,
-    )
-
-    override fun activation(
-        command: Int,
-        encrypted: Boolean,
-        input: ByteArray,
-        unixTime: Long,
-        value: Int,
-        output: ByteArray,
-        outputLength: Int,
-    ): Int = CGMDataHandle130.V120Activation(
-        command,
-        encrypted,
-        input,
-        unixTime,
-        value,
-        output,
-        outputLength,
-    )
-
-    override fun timeUpdate(
-        command: Int,
-        encrypted: Boolean,
-        input: ByteArray,
-        unixTime: Long,
-        output: ByteArray,
-        outputLength: Int,
-    ): Int = CGMDataHandle130.V120IsecUpdate(
-        command,
-        encrypted,
-        input,
-        unixTime,
-        output,
-        outputLength,
-    )
-
-    override fun rawData(
-        command: Int,
-        encrypted: Boolean,
-        input: ByteArray,
-        value: Long,
-        index: Int,
-        output: ByteArray,
-        outputLength: Int,
-    ): Int = CGMDataHandle130.V120RawData(
-        command,
-        encrypted,
-        input,
-        value,
-        index,
-        output,
-        outputLength,
-    )
-
-    override fun reset(
-        command: Int,
-        encrypted: Boolean,
-        input: ByteArray,
-        value: Int,
-        output: ByteArray,
-        outputLength: Int,
-    ): Int = CGMDataHandle130.V120Reset(
-        command,
-        encrypted,
-        input,
-        value,
-        output,
-        outputLength,
-    )
-
-    override fun splitData(
-        command: Int,
-        packet: ByteArray,
-        metadata: IntArray,
-        formattedPayload: ByteArray,
-        encrypted: Boolean,
-        workspace: ByteArray,
-        workspaceLength: Int,
-    ): Int = CGMDataHandle130.V120SpiltData(
-        command,
-        packet,
-        metadata,
-        formattedPayload,
-        encrypted,
-        workspace,
-        workspaceLength,
-    )
 }

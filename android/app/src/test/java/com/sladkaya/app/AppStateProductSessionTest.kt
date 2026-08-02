@@ -71,6 +71,23 @@ class AppStateProductSessionTest {
         assertNull(AppState.state.value.latest)
     }
 
+    @Test
+    fun durableWatchdogCanUpdateOnlyTheCurrentlyBoundProductSession() {
+        AppState.onProductStarting(BINDING, listOf(productReading(sequence = 1)))
+
+        assertFalse(
+            AppState.onProductAlarmDelivery("33".repeat(32), setOf(AlarmKind.SIGNAL_LOSS)),
+        )
+        assertTrue(
+            AppState.onProductAlarmDelivery(BINDING, setOf(AlarmKind.SIGNAL_LOSS)),
+        )
+        assertEquals(setOf(AlarmKind.SIGNAL_LOSS), AppState.state.value.activeAlarms)
+
+        AppState.onDemoStarting()
+        assertFalse(AppState.onProductAlarmDelivery(BINDING, setOf(AlarmKind.LOW)))
+        assertTrue(AppState.state.value.activeAlarms.isEmpty())
+    }
+
     private fun productReading(sequence: Long) = GlucoseReading(
         eventId = "product-$sequence",
         sensorId = "sensor-a",
@@ -82,4 +99,9 @@ class AppStateProductSessionTest {
         quality = ReadingQuality.VALID,
         sequence = sequence,
     )
+
+    private companion object {
+        const val BINDING =
+            "2222222222222222222222222222222222222222222222222222222222222222"
+    }
 }

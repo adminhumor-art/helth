@@ -34,6 +34,21 @@ class PhysicalSensorApprovalRecordTest {
     }
 
     @Test
+    fun globalFactionDecodeEvidenceKeepsTheOfficialStandardInitialization() {
+        val approval = approval().copy(
+            sensitivityEncoding = "FACTION",
+            initializationMode = "STANDARD",
+        )
+
+        assertEquals("V116A", approval.algorithmProfile)
+        assertEquals("FACTION", approval.sensitivityEncoding)
+        assertEquals("STANDARD", approval.initializationMode)
+        assertThrows(IllegalArgumentException::class.java) {
+            approval.copy(algorithmProfile = "V115G")
+        }
+    }
+
+    @Test
     fun approvalIdIsCanonicalAndStoredIdentityTamperingFailsClosed() {
         val approval = approval()
         val changed = approval.copy(approvedSequence = approval.approvedSequence + 1)
@@ -50,14 +65,19 @@ class PhysicalSensorApprovalRecordTest {
     }
 
     @Test
-    fun credentialRotationChangesPublicationBindingButNotPhysicalApproval() {
+    fun credentialRotationChangesOnlyRemoteRouteIdentity() {
         val approval = approval()
         val first = publicationBinding(approval, credentialRevision = 1L)
         val rotated = publicationBinding(approval, credentialRevision = 2L)
 
         assertEquals(approval.approvalId, first.approvalId)
         assertEquals(approval.approvalId, rotated.approvalId)
-        org.junit.Assert.assertNotEquals(first.publicationBindingId, rotated.publicationBindingId)
+        assertEquals(LOCAL_PUBLICATION_BINDING_ID, first.publicationBindingId)
+        assertEquals(first.publicationBindingId, rotated.publicationBindingId)
+        org.junit.Assert.assertNotEquals(
+            first.remotePublicationBindingId,
+            rotated.remotePublicationBindingId,
+        )
     }
 
     @Test
@@ -95,9 +115,10 @@ class PhysicalSensorApprovalRecordTest {
         val changedOrigin = binding.copy(httpsOrigin = "https://backup.sladkaya.test")
 
         org.junit.Assert.assertNotEquals(
-            binding.publicationBindingId,
-            changedOrigin.publicationBindingId,
+            binding.remotePublicationBindingId,
+            changedOrigin.remotePublicationBindingId,
         )
+        assertEquals(binding.publicationBindingId, changedOrigin.publicationBindingId)
         listOf(
             "http://api.sladkaya.test",
             "https://API.sladkaya.test",
@@ -222,6 +243,7 @@ class PhysicalSensorApprovalRecordTest {
         credentialRevision: Long,
     ) = ProductPublicationBindingRecord(
         approvalId = approval.approvalId,
+        publicationBindingId = LOCAL_PUBLICATION_BINDING_ID,
         httpsOrigin = "https://api.sladkaya.test",
         backendBindingId = "backend-binding-a",
         credentialId = "credential-a",
@@ -231,6 +253,10 @@ class PhysicalSensorApprovalRecordTest {
         createdAtEpochMs = 1_700_000_000_000L + credentialRevision,
     )
 
+    private companion object {
+        val LOCAL_PUBLICATION_BINDING_ID = "56".repeat(32)
+    }
+
     private fun uploadRecord(
         state: UploadOutboxState,
         leaseToken: String?,
@@ -239,6 +265,7 @@ class PhysicalSensorApprovalRecordTest {
         eventId = "event-a",
         approvalId = "ab".repeat(32),
         publicationBindingId = "cd".repeat(32),
+        remotePublicationBindingId = "de".repeat(32),
         httpsOrigin = "https://api.sladkaya.test",
         backendBindingId = "backend-binding-a",
         credentialId = "credential-a",

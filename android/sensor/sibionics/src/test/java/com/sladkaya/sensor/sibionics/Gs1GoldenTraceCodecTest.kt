@@ -240,34 +240,29 @@ class Gs1GoldenTraceCodecTest {
     }
 
     @Test
-    fun plannerAcceptsOnlyMatchingInitializationAndSensitivityEncodingPairs() {
+    fun globalPlannerKeepsFactionDecodeSeparateFromOfficialStandardInitialization() {
         val base = syntheticGoldenTrace()
         val faction = base.copy(
             sensitivityEvidence = base.sensitivityEvidence.copy(
-                initializationMode = AlgorithmInitializationMode.FACTION,
                 encoding = SensitivityEncoding.FACTION,
             ),
         )
+        val chineseV120 = base.copy(
+            algorithmProfile = AlgorithmProfile.V115G,
+        )
 
-        val mismatchedFactionMode = Gs1GoldenReplayPlanner().plan(
+        val unsupportedFactionInit = Gs1GoldenReplayPlanner().plan(
             base.copy(
                 sensitivityEvidence = base.sensitivityEvidence.copy(
                     initializationMode = AlgorithmInitializationMode.FACTION,
                 ),
             ),
         )
-        val mismatchedFactionEncoding = Gs1GoldenReplayPlanner().plan(
-            base.copy(
-                sensitivityEvidence = base.sensitivityEvidence.copy(
-                    encoding = SensitivityEncoding.FACTION,
-                ),
-            ),
-        )
 
         assertTrue(Gs1GoldenReplayPlanner().plan(base) is Gs1GoldenReplayPlanResult.Ready)
         assertTrue(Gs1GoldenReplayPlanner().plan(faction) is Gs1GoldenReplayPlanResult.Ready)
-        assertTrue(mismatchedFactionMode is Gs1GoldenReplayPlanResult.Invalid)
-        assertTrue(mismatchedFactionEncoding is Gs1GoldenReplayPlanResult.Invalid)
+        assertTrue(Gs1GoldenReplayPlanner().plan(chineseV120) is Gs1GoldenReplayPlanResult.Ready)
+        assertTrue(unsupportedFactionInit is Gs1GoldenReplayPlanResult.Invalid)
     }
 
     @Test

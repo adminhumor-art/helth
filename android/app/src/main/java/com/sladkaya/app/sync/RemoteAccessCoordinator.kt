@@ -24,8 +24,8 @@ sealed interface RemoteSyncScheduleResult {
 }
 
 /**
- * Internal one-use transport for provisioning material. This type does not verify identity:
- * a future authenticated provisioning parser must perform that check before calling [capture].
+ * Internal one-use transport for provisioning material. [DeviceProvisioningResponsePolicy]
+ * verifies the exact HTTPS origin and installation identity before calling [capture].
  * Source bytes and the owned token are erased even when persistence is cancelled or fails.
  */
 internal class RemoteProvisioningPayload private constructor(

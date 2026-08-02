@@ -23,7 +23,7 @@ class V115GNativeAlgorithmApi(
             }
         }
     }
-    override val supportedInitializationModes = AlgorithmInitializationMode.entries.toSet()
+    override val supportedInitializationModes = setOf(AlgorithmInitializationMode.STANDARD)
 
     override fun createContext(): NativeAlgorithmContext = V115GContext(
         requireNotNull(NativeAlgorithmLibraryV1_11_15G.getAlgorithmContextFromNative()) {
@@ -35,15 +35,15 @@ class V115GNativeAlgorithmApi(
         context: NativeAlgorithmContext,
         sensitivityToken: String,
         mode: AlgorithmInitializationMode,
-    ): Int = when (mode) {
-        AlgorithmInitializationMode.STANDARD ->
-            NativeAlgorithmLibraryV1_11_15G.initAlgorithmContext(context.unwrap(), 0, sensitivityToken)
-        AlgorithmInitializationMode.FACTION ->
-            NativeAlgorithmLibraryV1_11_15G.initAlgorithmContextFaction(
-                context.unwrap(),
-                0,
-                sensitivityToken,
-            )
+    ): Int {
+        require(mode == AlgorithmInitializationMode.STANDARD) {
+            "v115G product route supports only the verified standard initialization"
+        }
+        return NativeAlgorithmLibraryV1_11_15G.initAlgorithmContext(
+            context.unwrap(),
+            0,
+            sensitivityToken,
+        )
     }
 
     override fun restoreState(context: NativeAlgorithmContext, state: ByteArray): Int {

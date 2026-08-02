@@ -67,11 +67,12 @@ payload-sha256=<64 lower-case hex>
 закреплёнными enum/числами/хешами, кодируются lower-case hex от UTF-8 bytes.
 
 Метаданные закрепляют trace id, provenance/privacy classification, семейство,
-algorithm version, binary set и точную transport/profile-пару:
-`GS1_V120/V116A` либо `GS1_V115/V115G`. Также фиксируются согласованная пара
-`NORMAL/STANDARD` либо `FACTION/FACTION`, источник `PACKAGE_CODE`, точные
-IEEE-754 Float bits коэффициента, HMAC точного sensitivity input и
-pseudonymous identity evidence.
+algorithm version, binary set и две независимые оси transport/profile. V120
+допускает Global V116A либо CN V115G; V115 допускает V115G. Encoding и init
+также фиксируются отдельно: V116A принимает `NORMAL|FACTION` только со
+`STANDARD`, V115G — пока только `NORMAL/STANDARD`. Дополнительно сохраняются
+источник `PACKAGE_CODE`, точные IEEE-754 Float bits коэффициента, HMAC точного
+sensitivity input и pseudonymous identity evidence.
 
 Каждая строка `notification` содержит attempt/pseudonym, ordinal, ingress time,
 полный encrypted packet и SHA-256, ожидаемый исход `GS1_DATA`, `NON_DATA` либо

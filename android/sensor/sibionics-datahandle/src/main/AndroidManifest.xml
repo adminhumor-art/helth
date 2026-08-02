@@ -1,1 +1,12 @@
-<manifest />
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <service
+            android:name=".ipc.GlobalDataHandleService"
+            android:exported="false"
+            android:process=":dh_global" />
+        <service
+            android:name=".ipc.ChineseDataHandleService"
+            android:exported="false"
+            android:process=":dh_cn" />
+    </application>
+</manifest>

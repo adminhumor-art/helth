@@ -8,7 +8,13 @@ import androidx.core.content.ContextCompat
 import com.sladkaya.app.AppState
 import com.sladkaya.app.DiagnosticGattPresentationPolicy
 import com.sladkaya.app.RequiredPermissionPolicy
+import com.sladkaya.app.familyaccess.ProductionFamilyAccessFactory
 import com.sladkaya.app.settings.AlarmSettingsStore
+import com.sladkaya.app.sync.RemoteUploadAfterPublicationHook
+import com.sladkaya.core.data.LocalAlarmStateReadResult
+import com.sladkaya.core.data.LocalAlarmRepository
+import com.sladkaya.core.data.AlarmThresholdSnapshot
+import com.sladkaya.core.data.MeasurementRepository
 import com.sladkaya.core.model.AlarmChanges
 import com.sladkaya.core.model.AlarmKind
 import com.sladkaya.core.model.AlarmPolicy
@@ -19,6 +25,8 @@ import com.sladkaya.sensor.simulator.SimulationScenario
 import com.sladkaya.sensor.simulator.SimulatorDriver
 import com.sladkaya.sensor.sibionics.Gs1DiagnosticGattDriver
 import com.sladkaya.sensor.sibionics.Gs1PendingDiagnosticProfile
+import com.sladkaya.sensor.sibionics.Gs1PhysicalSensorActivationCoordinator
+import com.sladkaya.sensor.sibionics.Gs1ProductGattState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -35,12 +43,18 @@ import java.lang.ref.WeakReference
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
+internal sealed interface DiagnosticSensorActivationStartResult {
+    data object Started : DiagnosticSensorActivationStartResult
+    data class Failed(val message: String) : DiagnosticSensorActivationStartResult
+}
+
 class SensorForegroundService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val sessionTransitionScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val sessionTransitionMutex = Mutex()
     private val sessionRequestGate = ServiceSessionRequestGate()
     private val destroyed = AtomicBoolean(false)
+    private val productSessionDesired = AtomicBoolean(false)
     private val startPolicy = SensorServiceStartPolicy()
     private val demoSessionGate = DemoSessionGate()
     private val demoStartRequestGate = DemoStartRequestGate()
@@ -49,6 +63,7 @@ class SensorForegroundService : Service() {
     private var demoDriver: SimulatorDriver? = null
     @Volatile
     private var diagnosticDriver: Gs1DiagnosticGattDriver? = null
+    private lateinit var productSession: ProductSensorSessionCoordinator
     private var monitoringStartedAtEpochMs = System.currentTimeMillis()
     private var alarms = AlarmPolicy(
         monitoringStartedAtEpochMs = monitoringStartedAtEpochMs,
@@ -66,6 +81,10 @@ class SensorForegroundService : Service() {
     private var collectionJob: Job? = null
     private var diagnosticCollectionJob: Job? = null
     private var activeDiagnosticStateGeneration: Long? = null
+    @Volatile
+    private var activeProductStateGeneration: Long? = null
+    @Volatile
+    private var activeProductConfiguration: ProductSensorConfiguration? = null
     private var foregroundStarted = false
 
     override fun onCreate() {
@@ -75,6 +94,7 @@ class SensorForegroundService : Service() {
         alarmRepeatScheduler = AlarmRepeatScheduler(this)
         signalLossWatchdogStore = SignalLossWatchdogPreferenceStore(this)
         signalLossWatchdogScheduler = SignalLossWatchdogScheduler(this)
+        productSession = createProductSession()
         if (!RequiredPermissionPolicy.hasMandatoryBlePermissions(this)) {
             AppState.onSetupRequired(PERMISSION_REQUIRED_MESSAGE)
             com.sladkaya.app.widget.GlucoseWidgetProvider.showSetupRequired(this)
@@ -95,8 +115,9 @@ class SensorForegroundService : Service() {
         val diagnosticSessionStore = DiagnosticSessionPreferenceStore(this)
         val mode = startPolicy.select(
             action = intent?.action,
-            hasConfirmedConfiguration = ConfirmedSensorConfigurationStore(this)
-                .hasConfirmedConfiguration(),
+            // Product approval is loaded asynchronously by the sole durable
+            // ProductSensorConfigurationSource, never from a marker flag.
+            hasConfirmedConfiguration = null,
             hasPendingDiagnosticConfiguration = pendingDiagnosticProfile != null,
             diagnosticResumeIdentityMatches = pendingDiagnosticFingerprint?.let(
                 diagnosticSessionStore::matches,
@@ -143,20 +164,302 @@ class SensorForegroundService : Service() {
                 message = SETUP_REQUIRED_MESSAGE,
                 startId = startId,
             )
-            SensorServiceStartMode.ConfiguredSensor -> failClosed(
-                message = CONFIGURED_SENSOR_NOT_CONNECTED_MESSAGE,
-                startId = startId,
-            )
+            SensorServiceStartMode.ConfiguredSensor -> {
+                if (!diagnosticSessionStore.clear()) {
+                    failClosed(DIAGNOSTIC_RESUME_STATE_FAILED_MESSAGE, startId)
+                    return START_NOT_STICKY
+                }
+                if (
+                    ProductSessionRequestPolicy.shouldDispatch(
+                        action = intent?.action,
+                        productSessionDesired = productSessionDesired.get(),
+                    )
+                ) {
+                    requestProductSession(startId)
+                }
+            }
         }
-        return if (mode == SensorServiceStartMode.DiagnosticSensor) {
-            START_REDELIVER_INTENT
-        } else {
-            START_NOT_STICKY
+        return when (mode) {
+            SensorServiceStartMode.ConfiguredSensor -> START_STICKY
+            SensorServiceStartMode.DiagnosticSensor -> START_REDELIVER_INTENT
+            SensorServiceStartMode.Demo,
+            SensorServiceStartMode.SetupRequired,
+            -> START_NOT_STICKY
         }
     }
 
-    private fun requestDiagnosticSession(profile: Gs1PendingDiagnosticProfile) {
+    private fun createProductSession() = ProductSensorSessionCoordinator(
+        configurationSource = LocalProductSensorConfigurationSource(this),
+        driverFactory = ProductSensorDriverFactory { Gs1ProductSensorDriver(this) },
+        publicationApplier = ProductLocalPublicationApplier(
+            store = LocalAlarmRepository.create(this),
+            thresholds = { AlarmSettingsStore(this).load().thresholds },
+            monitoringStartedAtEpochMs = monitoringStartedAtEpochMs,
+            nextLeaseToken = { UUID.randomUUID().toString() },
+            afterDurableBatch = {
+                scope.launch {
+                    ProductLocalDeliveryProductionRuntime.createDrain(this@SensorForegroundService)
+                        .runBounded()
+                }
+                RemoteUploadAfterPublicationHook(this).onProductPublicationCommitted()
+            },
+        ),
+        historySource = ProductSensorHistorySource { configuration ->
+            MeasurementRepository.create(this).recent(
+                approvalId = configuration.approvalId,
+                publicationBindingId = configuration.publicationBindingId,
+            )
+        },
+        monitoringStarter = RoomProductAlarmMonitoringStarter(this),
+        observer = object : ProductSensorSessionObserver {
+            override fun onSessionStarting(
+                configuration: ProductSensorConfiguration,
+                restoredHistory: List<GlucoseReading>,
+            ) {
+                activeProductConfiguration = configuration
+                val generation = AppState.onProductStarting(
+                    configuration.publicationBindingId,
+                    restoredHistory,
+                )
+                activeProductStateGeneration = generation
+                restoredHistory.lastOrNull()?.let { reading ->
+                    com.sladkaya.app.widget.GlucoseWidgetProvider.updateAll(
+                        this@SensorForegroundService,
+                        reading,
+                    )
+                } ?: com.sladkaya.app.widget.GlucoseWidgetProvider.showNoFreshData(
+                    this@SensorForegroundService,
+                    demoActive = false,
+                )
+                scope.launch {
+                    when (
+                        val restored = LocalAlarmRepository
+                            .create(this@SensorForegroundService)
+                            .readState(configuration.publicationBindingId)
+                    ) {
+                        is LocalAlarmStateReadResult.Exact -> AppState.onProductAlarmState(
+                            generation,
+                            restored.state.policyState.active,
+                        )
+                        LocalAlarmStateReadResult.Empty,
+                        is LocalAlarmStateReadResult.Conflict,
+                        -> Unit
+                    }
+                    ProductLocalDeliveryProductionRuntime
+                        .createDrain(this@SensorForegroundService)
+                        .runBounded()
+                }
+                getSystemService(android.app.NotificationManager::class.java).notify(
+                    FOREGROUND_ID,
+                    notifier.foregroundStatus("Подготовка подключения к датчику"),
+                )
+            }
+
+            override fun onDriverState(state: Gs1ProductGattState) {
+                val generation = activeProductStateGeneration ?: return
+                val presentation = ProductGattPresentationPolicy.present(state)
+                if (AppState.onProductDriverState(generation, presentation.state)) {
+                    getSystemService(android.app.NotificationManager::class.java).notify(
+                        FOREGROUND_ID,
+                        notifier.foregroundStatus(presentation.label),
+                    )
+                }
+            }
+
+            override fun onVerifiedReadings(
+                readings: List<GlucoseReading>,
+                activeAlarms: Set<AlarmKind>,
+            ) {
+                val generation = activeProductStateGeneration ?: return
+                readings.forEach { reading ->
+                    if (AppState.onProductReading(generation, reading, activeAlarms)) {
+                        getSystemService(android.app.NotificationManager::class.java).notify(
+                            FOREGROUND_ID,
+                            notifier.foreground(reading, demo = false),
+                        )
+                    }
+                }
+            }
+
+            override fun onDriverFailure(code: String, detail: String?, retryable: Boolean) {
+                val generation = activeProductStateGeneration ?: return
+                val presentation = ProductGattPresentationPolicy.present(
+                    Gs1ProductGattState.Failed(code, detail, retryable),
+                )
+                AppState.onProductDriverState(generation, presentation.state)
+                getSystemService(android.app.NotificationManager::class.java).notify(
+                    FOREGROUND_ID,
+                    notifier.foregroundStatus(presentation.label),
+                )
+            }
+        },
+        scope = scope,
+    )
+
+    private fun requestProductSession(startId: Int) {
+        productSessionDesired.set(true)
         val request = sessionRequestGate.request()
+        productSession.requestStop()
+        diagnosticDriver?.requestStop()
+        getSystemService(android.app.NotificationManager::class.java).notify(
+            FOREGROUND_ID,
+            notifier.foregroundStatus("Проверка подтверждённой конфигурации датчика"),
+        )
+        sessionTransitionScope.launch {
+            sessionTransitionMutex.withLock {
+                stopAllSessionsLocked()
+                if (destroyed.get() || !sessionRequestGate.isCurrent(request)) return@withLock
+                val started = startProductSessionLocked()
+                productStartFailureMessage(started)?.let { message ->
+                    failProductStartLocked(message, startId)
+                }
+            }
+        }
+    }
+
+    private suspend fun startProductSessionLocked(): ProductSensorSessionStartResult {
+        try {
+            ProductionFamilyAccessFactory
+                .createSensorBindingReconciler(this)
+                .reconcile()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: RuntimeException) {
+            // Remote access is copy-only: it must never block local collection.
+        }
+        return productSession.start()
+    }
+
+    private fun productStartFailureMessage(
+        result: ProductSensorSessionStartResult,
+    ): String? = when (result) {
+        is ProductSensorSessionStartResult.Started -> null
+        ProductSensorSessionStartResult.ConfigurationMissing -> SETUP_REQUIRED_MESSAGE
+        is ProductSensorSessionStartResult.ConfigurationInvalid ->
+            "Подтверждённая конфигурация датчика недействительна: ${result.code}"
+        is ProductSensorSessionStartResult.ConfigurationStorageUnavailable ->
+            "Не удалось прочитать подтверждённую конфигурацию датчика"
+        is ProductSensorSessionStartResult.LocalAlarmUnavailable ->
+            "Не удалось запустить локальную тревогу: ${result.code}"
+    }
+
+    private fun requestDiagnosticSensorActivation(
+        diagnosticEventId: String,
+        onCompleted: (DiagnosticSensorActivationStartResult) -> Unit,
+    ) {
+        if (!RequiredPermissionPolicy.hasPermissionsForStart(this, alarmMonitoring = true)) {
+            dispatchDiagnosticActivationResult(
+                onCompleted,
+                DiagnosticSensorActivationStartResult.Failed(
+                    RequiredPermissionPolicy.denialMessage(this, alarmMonitoring = true),
+                ),
+            )
+            return
+        }
+        val pendingProfile = PendingDiagnosticGs1OnboardingStateStore(this)
+            .loadPendingDiagnosticProfile()
+        if (pendingProfile == null) {
+            dispatchDiagnosticActivationResult(
+                onCompleted,
+                DiagnosticSensorActivationStartResult.Failed(
+                    "Настройка датчика изменилась. Запустите подключение ещё раз.",
+                ),
+            )
+            return
+        }
+        val request = sessionRequestGate.request()
+        productSession.requestStop()
+        diagnosticDriver?.requestStop()
+        getSystemService(android.app.NotificationManager::class.java).notify(
+            FOREGROUND_ID,
+            notifier.foregroundStatus("Сохранение датчика и запуск мониторинга"),
+        )
+        sessionTransitionScope.launch {
+            var stopAfterFailure = false
+            val outcome = sessionTransitionMutex.withLock {
+                stopAllSessionsLocked()
+                if (destroyed.get() || !sessionRequestGate.isCurrent(request)) {
+                    stopAfterFailure = true
+                    return@withLock DiagnosticSensorActivationStartResult.Failed(
+                        "Запуск датчика был отменён.",
+                    )
+                }
+                val activation = Gs1PhysicalSensorActivationCoordinator(
+                    this@SensorForegroundService,
+                ).activate(
+                    profile = pendingProfile.diagnosticActivationProfile(),
+                    diagnosticEventId = diagnosticEventId,
+                )
+                when (val decision = DiagnosticSensorPromotionPolicy.decide(activation)) {
+                    is DiagnosticSensorPromotionDecision.Rejected -> {
+                        stopAfterFailure = true
+                        presentDiagnosticActivationFailureLocked(decision.message)
+                        DiagnosticSensorActivationStartResult.Failed(decision.message)
+                    }
+                    DiagnosticSensorPromotionDecision.StartProduct -> {
+                        val onboardingCleared =
+                            PendingDiagnosticGs1OnboardingStateStore(
+                                this@SensorForegroundService,
+                            ).clearDraft()
+                        val resumeCleared =
+                            DiagnosticSessionPreferenceStore(this@SensorForegroundService).clear()
+                        if (!onboardingCleared || !resumeCleared) {
+                            val message =
+                                "Датчик сохранён, но Android не завершил настройку. Повторите запуск."
+                            stopAfterFailure = true
+                            presentDiagnosticActivationFailureLocked(message)
+                            DiagnosticSensorActivationStartResult.Failed(message)
+                        } else {
+                            productSessionDesired.set(true)
+                            val started = startProductSessionLocked()
+                            val failure = productStartFailureMessage(started)
+                            if (failure == null) {
+                                DiagnosticSensorActivationStartResult.Started
+                            } else {
+                                productSessionDesired.set(false)
+                                stopAfterFailure = true
+                                presentDiagnosticActivationFailureLocked(failure)
+                                DiagnosticSensorActivationStartResult.Failed(failure)
+                            }
+                        }
+                    }
+                }
+            }
+            dispatchDiagnosticActivationResult(onCompleted, outcome)
+            if (stopAfterFailure) stopSelf()
+        }
+    }
+
+    private fun presentDiagnosticActivationFailureLocked(message: String) {
+        AppState.onSetupRequired(message)
+        com.sladkaya.app.widget.GlucoseWidgetProvider.showSetupRequired(this)
+        getSystemService(android.app.NotificationManager::class.java).notify(
+            FOREGROUND_ID,
+            notifier.foregroundStatus(message),
+        )
+    }
+
+    private fun dispatchDiagnosticActivationResult(
+        onCompleted: (DiagnosticSensorActivationStartResult) -> Unit,
+        result: DiagnosticSensorActivationStartResult,
+    ) {
+        ContextCompat.getMainExecutor(this).execute { onCompleted(result) }
+    }
+
+    private fun failProductStartLocked(message: String, startId: Int) {
+        productSessionDesired.set(false)
+        activeProductStateGeneration = null
+        AppState.onSetupRequired(message)
+        com.sladkaya.app.widget.GlucoseWidgetProvider.showSetupRequired(this)
+        getSystemService(android.app.NotificationManager::class.java)
+            .notify(FOREGROUND_ID, notifier.foregroundStatus(message))
+        stopSelf(startId)
+    }
+
+    private fun requestDiagnosticSession(profile: Gs1PendingDiagnosticProfile) {
+        productSessionDesired.set(false)
+        val request = sessionRequestGate.request()
+        productSession.requestStop()
         diagnosticDriver?.requestStop()
         getSystemService(android.app.NotificationManager::class.java).notify(
             FOREGROUND_ID,
@@ -229,8 +532,10 @@ class SensorForegroundService : Service() {
     }
 
     private fun requestDemoSession(restoredEpisode: AlarmEpisode?) {
+        productSessionDesired.set(false)
         if (!demoStartRequestGate.claim()) return
         val request = sessionRequestGate.request()
+        productSession.requestStop()
         diagnosticDriver?.requestStop()
         sessionTransitionScope.launch {
             sessionTransitionMutex.withLock {
@@ -312,7 +617,7 @@ class SensorForegroundService : Service() {
         val driver = SimulatorDriver(SimulationScenario.NIGHT_LOW)
         demoDriver = driver
         getSystemService(android.app.NotificationManager::class.java)
-            .notify(FOREGROUND_ID, notifier.foreground(null))
+            .notify(FOREGROUND_ID, notifier.foreground(null, demo = true))
         collectionJob = scope.launch {
             launch {
                 driver.state.collect { state ->
@@ -341,7 +646,10 @@ class SensorForegroundService : Service() {
                         }
                         if (AppState.onDemoReading(stateGeneration, reading, changes.active)) {
                             getSystemService(android.app.NotificationManager::class.java)
-                                .notify(FOREGROUND_ID, notifier.foreground(reading))
+                                .notify(
+                                    FOREGROUND_ID,
+                                    notifier.foreground(reading, demo = true),
+                                )
                             com.sladkaya.app.widget.GlucoseWidgetProvider.updateDemoAll(
                                 this@SensorForegroundService,
                                 reading,
@@ -399,10 +707,12 @@ class SensorForegroundService : Service() {
     }
 
     private fun failClosed(message: String, startId: Int? = null) {
+        productSessionDesired.set(false)
         val failureRequest = sessionRequestGate.invalidate()
         demoSessionGate.invalidate()
         collectionJob?.cancel()
         diagnosticCollectionJob?.cancel()
+        productSession.requestStop()
         diagnosticDriver?.requestStop()
         AppState.onSetupRequired(message)
         com.sladkaya.app.widget.GlucoseWidgetProvider.showSetupRequired(this)
@@ -657,6 +967,9 @@ class SensorForegroundService : Service() {
         demoStopReason: AlarmEpisodeStopReason = AlarmEpisodeStopReason.MODE_SWITCH,
         releaseDemoStartClaim: Boolean = true,
     ) {
+        productSession.stop()
+        activeProductStateGeneration = null
+        activeProductConfiguration = null
         stopDemoSessionLocked(demoStopReason, releaseDemoStartClaim)
         stopDiagnosticSessionLocked()
     }
@@ -719,11 +1032,13 @@ class SensorForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        productSessionDesired.set(false)
         unregisterActiveInstance(this)
         destroyed.set(true)
         sessionRequestGate.invalidate()
         collectionJob?.cancel()
         diagnosticCollectionJob?.cancel()
+        productSession.requestStop()
         diagnosticDriver?.requestStop()
         scope.cancel()
         sessionTransitionScope.launch {
@@ -738,6 +1053,51 @@ class SensorForegroundService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     private fun reloadAlarmSettingsForActiveSession(): Boolean {
+        val productConfiguration = activeProductConfiguration
+        val productGeneration = activeProductStateGeneration
+        if (productConfiguration != null && productGeneration != null) {
+            val thresholds = try {
+                AlarmThresholdSnapshot.from(AlarmSettingsStore(this).load().thresholds)
+            } catch (_: IllegalArgumentException) {
+                return false
+            } catch (_: RuntimeException) {
+                return false
+            }
+            scope.launch {
+                val store = LocalAlarmRepository.create(this@SensorForegroundService)
+                val reconciled = ProductAlarmSettingsReconciler(store).reconcile(
+                    productConfiguration.publicationBindingId,
+                    thresholds,
+                )
+                val active = when (reconciled) {
+                    is ProductAlarmSettingsReconcileResult.Applied ->
+                        reconciled.settlement.activeKinds
+                    is ProductAlarmSettingsReconcileResult.Current ->
+                        reconciled.state.policyState.active
+                    is ProductAlarmSettingsReconcileResult.Conflict,
+                    is ProductAlarmSettingsReconcileResult.StorageUnavailable,
+                    -> {
+                        reportAlarmDeliveryFailure(
+                            this@SensorForegroundService,
+                            ALARM_SETTINGS_APPLY_FAILED_MESSAGE,
+                        )
+                        return@launch
+                    }
+                }
+                AppState.onProductAlarmState(productGeneration, active)
+                try {
+                    ProductLocalDeliveryProductionRuntime
+                        .createDrain(this@SensorForegroundService)
+                        .runBounded()
+                } catch (_: RuntimeException) {
+                    reportAlarmDeliveryFailure(
+                        this@SensorForegroundService,
+                        ALARM_SETTINGS_APPLY_FAILED_MESSAGE,
+                    )
+                }
+            }
+            return true
+        }
         val sideEffectGeneration = activeDemoSideEffectGeneration ?: run {
             return false
         }
@@ -786,6 +1146,41 @@ class SensorForegroundService : Service() {
     }
 
     private fun acknowledgeActiveAlarmsForCurrentSession(): Boolean {
+        val productConfiguration = activeProductConfiguration
+        val productGeneration = activeProductStateGeneration
+        if (productConfiguration != null && productGeneration != null) {
+            val visibleState = AppState.state.value
+            if (visibleState.activeAlarms.isEmpty()) return false
+            scope.launch {
+                val alarmStore = LocalAlarmRepository.create(this@SensorForegroundService)
+                val durable = alarmStore.readState(productConfiguration.publicationBindingId)
+                val state = (durable as? LocalAlarmStateReadResult.Exact)?.state ?: return@launch
+                if (state.policyState.active.isEmpty() || state.episodeAcknowledged) return@launch
+                val request = ProductAlarmAcknowledgementMutationRequest(
+                    episodeId = ProductAlarmEpisodeIdentity.derive(
+                        productConfiguration.publicationBindingId,
+                        state.episodeGeneration,
+                    ),
+                    publicationBindingId = productConfiguration.publicationBindingId,
+                    generation = state.episodeGeneration,
+                    acknowledgedAtEpochMs = System.currentTimeMillis(),
+                )
+                when (RoomProductAlarmAcknowledgementMutation(this@SensorForegroundService)
+                    .acknowledge(request)) {
+                    ProductAlarmAcknowledgementMutationResult.Applied,
+                    ProductAlarmAcknowledgementMutationResult.AlreadyApplied,
+                    -> ProductLocalDeliveryProductionRuntime
+                        .createDrain(this@SensorForegroundService)
+                        .runBounded()
+                    ProductAlarmAcknowledgementMutationResult.Stale,
+                    ProductAlarmAcknowledgementMutationResult.TransientFailure,
+                    ProductAlarmAcknowledgementMutationResult.Conflict,
+                    -> Unit
+                }
+                AppState.onProductAlarmState(productGeneration, state.policyState.active)
+            }
+            return true
+        }
         val episodeId = activeAlarmEpisodeId ?: return false
         return alarmEpisodeStore.atomically {
             when (val result = alarmEpisodeStore.acknowledge(episodeId)) {
@@ -854,15 +1249,19 @@ class SensorForegroundService : Service() {
             "Не удалось закрыть завершённый контроль свежести"
         private const val SIGNAL_LOSS_OLD_SLOT_CANCEL_FAILED_MESSAGE =
             "Android оставил резерв предыдущего контроля свежести"
-        private const val CONFIGURED_SENSOR_NOT_CONNECTED_MESSAGE =
-            "Подтверждённый датчик ещё не подключён к продуктовому потоку"
-
+        private const val ALARM_SETTINGS_APPLY_FAILED_MESSAGE =
+            "Не удалось немедленно применить настройки тревог. Проверьте состояние датчика."
         private val activeInstanceLock = Any()
         private var activeInstance: WeakReference<SensorForegroundService>? = null
 
         fun start(context: Context): Boolean {
             if (!clearDiagnosticResumeState(context)) return false
             return startIfPermitted(context, SensorServiceActions.START)
+        }
+
+        fun ensureStarted(context: Context): Boolean {
+            if (!clearDiagnosticResumeState(context)) return false
+            return startIfPermitted(context, SensorServiceActions.ENSURE_SENSOR)
         }
 
         fun startDemo(context: Context): Boolean {
@@ -882,6 +1281,17 @@ class SensorForegroundService : Service() {
             return startIfPermitted(context, SensorServiceActions.START_DIAGNOSTIC).also { started ->
                 if (!started) DiagnosticSessionPreferenceStore(context).clear()
             }
+        }
+
+        internal fun activateDiagnosticSensor(
+            diagnosticEventId: String,
+            onCompleted: (DiagnosticSensorActivationStartResult) -> Unit,
+        ): Boolean {
+            if (diagnosticEventId.isBlank() || diagnosticEventId.length > 128) return false
+            val instance = synchronized(activeInstanceLock) { activeInstance?.get() }
+                ?: return false
+            instance.requestDiagnosticSensorActivation(diagnosticEventId, onCompleted)
+            return true
         }
 
         fun stop(context: Context): Boolean {

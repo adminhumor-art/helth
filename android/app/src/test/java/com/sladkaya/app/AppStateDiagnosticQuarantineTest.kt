@@ -36,6 +36,8 @@ class AppStateDiagnosticQuarantineTest {
         assertFalse(state.simulatorMode)
         assertEquals(91L, state.diagnostic.latestReading?.sequence)
         assertEquals(104, state.diagnostic.latestReading?.glucoseMgDl)
+        assertEquals("private-diagnostic-event", state.diagnostic.latestReading?.eventId)
+        assertEquals("private-diagnostic-sensor", state.diagnostic.latestReading?.sensorId)
     }
 
     @Test

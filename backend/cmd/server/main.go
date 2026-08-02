@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -70,7 +72,8 @@ func main() {
 	}
 	engine := alerts.NewEngine(alerts.DefaultThresholds())
 	api := httpapi.New(httpapi.Config{
-		Logger: logger,
+		Logger: logger, FamilyWebOrigins: config.familyWebOrigins,
+		DeviceAPIOrigin: config.deviceAPIOrigin,
 	}, values, engine)
 	startupAt := time.Now().UTC()
 	if config.production {
@@ -270,6 +273,8 @@ type appConfig struct {
 	telegramToken               string
 	telegramChatIDs             []string
 	databaseURL                 string
+	familyWebOrigins            []string
+	deviceAPIOrigin             string
 }
 
 func validateConfig(config appConfig) error {
@@ -328,7 +333,60 @@ func validateConfig(config appConfig) error {
 	if len(config.telegramChatIDs) > 0 && !config.hasBootstrapAccess() {
 		return errors.New("TELEGRAM_CHAT_IDS is allowed only for an explicit development household bootstrap")
 	}
+	if err := validateFamilyWebOrigins(config); err != nil {
+		return err
+	}
+	if err := validateDeviceAPIOrigin(config); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateFamilyWebOrigins(config appConfig) error {
+	if len(config.familyWebOrigins) == 0 {
+		return errors.New("FAMILY_WEB_ORIGINS must contain at least one exact web origin")
+	}
+	seen := make(map[string]struct{}, len(config.familyWebOrigins))
+	for _, origin := range config.familyWebOrigins {
+		if err := validateExactOrigin(origin, config.production, "FAMILY_WEB_ORIGINS"); err != nil {
+			return err
+		}
+		if _, duplicate := seen[origin]; duplicate {
+			return fmt.Errorf("FAMILY_WEB_ORIGINS contains duplicate origin %q", origin)
+		}
+		seen[origin] = struct{}{}
+	}
+	return nil
+}
+
+func validateDeviceAPIOrigin(config appConfig) error {
+	return validateExactOrigin(config.deviceAPIOrigin, config.production, "DEVICE_API_ORIGIN")
+}
+
+func validateExactOrigin(origin string, production bool, name string) error {
+	if origin == "" || strings.TrimSpace(origin) != origin {
+		return fmt.Errorf("%s must contain one exact origin", name)
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil ||
+		parsed.Path != "" || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.Fragment != "" ||
+		parsed.ForceQuery || parsed.String() != origin {
+		return fmt.Errorf("%s contains an invalid origin %q", name, origin)
+	}
+	secure := parsed.Scheme == "https"
+	loopbackDevelopment := !production && parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname())
+	if !secure && !loopbackDevelopment {
+		return fmt.Errorf("%s contains an insecure origin %q", name, origin)
+	}
+	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	address := net.ParseIP(host)
+	return address != nil && address.IsLoopback()
 }
 
 func loadConfig() appConfig {
@@ -348,6 +406,8 @@ func loadConfig() appConfig {
 		telegramToken:               strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN")),
 		telegramChatIDs:             splitCSV(os.Getenv("TELEGRAM_CHAT_IDS")),
 		databaseURL:                 strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		familyWebOrigins:            splitCSV(os.Getenv("FAMILY_WEB_ORIGINS")),
+		deviceAPIOrigin:             strings.TrimSpace(os.Getenv("DEVICE_API_ORIGIN")),
 	}
 }
 

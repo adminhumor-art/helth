@@ -141,6 +141,116 @@ class SensorServiceStartPolicyTest {
     }
 
     @Test
+    fun automaticEnsureDoesNotRestartAnActiveOrStartingProductSession() {
+        assertEquals(
+            SensorServiceStartMode.ConfiguredSensor,
+            policy.select(
+                action = SensorServiceActions.ENSURE_SENSOR,
+                hasConfirmedConfiguration = true,
+            ),
+        )
+        assertEquals(
+            false,
+            ProductSessionRequestPolicy.shouldDispatch(
+                action = SensorServiceActions.ENSURE_SENSOR,
+                productSessionDesired = true,
+            ),
+        )
+        assertEquals(
+            true,
+            ProductSessionRequestPolicy.shouldDispatch(
+                action = SensorServiceActions.ENSURE_SENSOR,
+                productSessionDesired = false,
+            ),
+        )
+    }
+
+    @Test
+    fun explicitSensorStartCanRetryAnExistingProductSession() {
+        assertEquals(
+            true,
+            ProductSessionRequestPolicy.shouldDispatch(
+                action = SensorServiceActions.START,
+                productSessionDesired = true,
+            ),
+        )
+        assertEquals(
+            false,
+            ProductSessionRequestPolicy.shouldDispatch(
+                action = null,
+                productSessionDesired = true,
+            ),
+        )
+    }
+
+    @Test
+    fun automaticProductEnsureNeverInterruptsAnExplicitDiagnosticFlow() {
+        assertEquals(
+            false,
+            ProductAutomaticStartPolicy.shouldEnsure(
+                setupOpen = false,
+                diagnosticResumeActive = true,
+            ),
+        )
+        assertEquals(
+            false,
+            ProductAutomaticStartPolicy.shouldEnsure(
+                setupOpen = true,
+                diagnosticResumeActive = false,
+            ),
+        )
+        assertEquals(
+            true,
+            ProductAutomaticStartPolicy.shouldEnsure(
+                setupOpen = false,
+                diagnosticResumeActive = false,
+            ),
+        )
+    }
+
+    @Test
+    fun bootRestoresExplicitDiagnosticBeforeAnExistingProductBinding() {
+        assertEquals(
+            SensorBackgroundLaunchDecision.Diagnostic,
+            SensorBackgroundLaunchPolicy.decide(
+                hasConfirmedConfiguration = true,
+                diagnosticWasRunning = true,
+                hasPendingDiagnosticConfiguration = true,
+                hasMandatoryBlePermissions = true,
+            ),
+        )
+        assertEquals(
+            SensorBackgroundLaunchDecision.Product,
+            SensorBackgroundLaunchPolicy.decide(
+                hasConfirmedConfiguration = true,
+                diagnosticWasRunning = false,
+                hasPendingDiagnosticConfiguration = true,
+                hasMandatoryBlePermissions = true,
+            ),
+        )
+    }
+
+    @Test
+    fun ordinaryAndProcessRestartRequestsDelegateProductApprovalToTheDurableSource() {
+        assertEquals(
+            SensorServiceStartMode.ConfiguredSensor,
+            policy.select(
+                action = SensorServiceActions.START,
+                hasConfirmedConfiguration = null,
+                hasPendingDiagnosticConfiguration = false,
+            ),
+        )
+        assertEquals(
+            SensorServiceStartMode.ConfiguredSensor,
+            policy.select(
+                action = null,
+                hasConfirmedConfiguration = null,
+                hasPendingDiagnosticConfiguration = false,
+            ),
+        )
+    }
+
+    @Test
     fun demoActionDoesNotDependOnSavedConfiguration() {
         assertEquals(
             SensorServiceStartMode.Demo,

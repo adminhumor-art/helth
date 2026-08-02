@@ -54,10 +54,7 @@ data class PhysicalSensorApprovalRecord(
         requireTypedValue(binarySetId)
         require(sensitivityTokenSource == "PACKAGE_CODE")
         require(sensitivityCoefficient in MIN_SENSITIVITY..MAX_SENSITIVITY)
-        require(
-            sensitivityEncoding == "NORMAL" && initializationMode == "STANDARD" ||
-                sensitivityEncoding == "FACTION" && initializationMode == "FACTION",
-        )
+        require(hasVerifiedInitializationRoute())
         require(displayOffsetMmolL.isFinite())
         requireTypedValue(protocolEvidenceKind)
         require(SHA256.matches(protocolEvidenceSha256))
@@ -111,6 +108,14 @@ data class PhysicalSensorApprovalRecord(
         return MessageDigest.getInstance("SHA-256")
             .digest(canonical.encodeToByteArray())
             .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+    }
+
+    private fun hasVerifiedInitializationRoute(): Boolean = when (algorithmProfile) {
+        "V116A" ->
+            initializationMode == "STANDARD" && sensitivityEncoding in setOf("NORMAL", "FACTION")
+        "V115G" ->
+            initializationMode == "STANDARD" && sensitivityEncoding == "NORMAL"
+        else -> false
     }
 
     companion object {

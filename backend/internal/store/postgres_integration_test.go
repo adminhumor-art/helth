@@ -62,19 +62,39 @@ func TestPostgresFreshSchemaIsCurrentAndIdempotent(t *testing.T) {
 	if err := values.pool.QueryRow(ctx, `
 		SELECT count(*) FROM information_schema.columns
 		WHERE table_schema=$1 AND table_name='devices'
-		  AND column_name IN ('token_hash','backend_binding_id','credential_id','credential_revision')
+		  AND column_name IN ('backend_binding_id','credential_id','credential_revision')
 		  AND is_nullable='NO'`, schemaName).Scan(&requiredColumns); err != nil {
 		t.Fatal(err)
 	}
-	if requiredColumns != 4 {
-		t.Fatalf("fresh devices schema has %d required identity columns, want 4", requiredColumns)
+	if requiredColumns != 3 {
+		t.Fatalf("fresh devices schema has %d required binding columns, want 3", requiredColumns)
 	}
-	var hasFamilySessions bool
-	if err := values.pool.QueryRow(ctx, `SELECT to_regclass('family_sessions') IS NOT NULL`).Scan(&hasFamilySessions); err != nil {
+	var deviceTokenNullable bool
+	if err := values.pool.QueryRow(ctx, `
+		SELECT is_nullable='YES' FROM information_schema.columns
+		WHERE table_schema=$1 AND table_name='devices' AND column_name='token_hash'`, schemaName).Scan(&deviceTokenNullable); err != nil {
+		t.Fatal(err)
+	}
+	if !deviceTokenNullable {
+		t.Fatal("fresh devices schema cannot represent a safe pending activation without a bearer token")
+	}
+	var hasFamilySessions, hasFamilyWebSessions, hasDeviceActivations bool
+	if err := values.pool.QueryRow(ctx, `
+		SELECT to_regclass('family_sessions') IS NOT NULL,
+		       to_regclass('family_web_sessions') IS NOT NULL,
+		       to_regclass('device_activation_codes') IS NOT NULL`).Scan(
+		&hasFamilySessions, &hasFamilyWebSessions, &hasDeviceActivations,
+	); err != nil {
 		t.Fatal(err)
 	}
 	if !hasFamilySessions {
 		t.Fatal("fresh v1 schema is missing family_sessions")
+	}
+	if !hasFamilyWebSessions {
+		t.Fatal("fresh v1 schema is missing family_web_sessions")
+	}
+	if !hasDeviceActivations {
+		t.Fatal("fresh v1 schema is missing device_activation_codes")
 	}
 	hasRecipients, err := values.HasTelegramRecipients(ctx)
 	if err != nil || hasRecipients {
@@ -550,6 +570,26 @@ func TestPostgresAccessTokensResolveMultipleFamiliesWithoutStoringPlaintext(t *t
 	if _, err := values.ResolveActiveFamilySession(ctx, second.FamilyTokenHash, expiresAt); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expired family session remained active: %v", err)
 	}
+	webCredential := FamilyWebSessionCredential{
+		ID: testUUID(t), TokenHash: HashAccessToken("postgres-browser-session-0123456789abcdef"),
+		CSRFTokenHash: HashAccessToken("postgres-csrf-token-0123456789abcdef"),
+		ExpiresAt:     now.Add(30 * time.Second),
+	}
+	issuedWebSession, err := values.IssueFamilyWebSession(ctx, second.FamilyTokenHash, webCredential, now)
+	if err != nil || issuedWebSession.HouseholdID != second.HouseholdID {
+		t.Fatalf("issue PostgreSQL family web session: access=%#v err=%v", issuedWebSession, err)
+	}
+	resolvedWebSession, err := values.ResolveActiveFamilyWebSession(ctx, webCredential.TokenHash, now)
+	if err != nil || resolvedWebSession.ID != webCredential.ID ||
+		!bytes.Equal(resolvedWebSession.CSRFTokenHash, webCredential.CSRFTokenHash) {
+		t.Fatalf("resolve PostgreSQL family web session: access=%#v err=%v", resolvedWebSession, err)
+	}
+	if _, err := values.ResolveActiveFamilyWebSession(ctx, second.FamilyTokenHash, now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("provisioned family token authenticated as PostgreSQL web session: %v", err)
+	}
+	if _, err := values.ResolveActiveFamilyWebSession(ctx, webCredential.TokenHash, webCredential.ExpiresAt); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired PostgreSQL family web session remained active: %v", err)
+	}
 	if err := values.RevokeDevice(ctx, second.DeviceID, now); err != nil {
 		t.Fatal(err)
 	}
@@ -669,6 +709,121 @@ func TestPostgresProductionReadinessRequiresRecipientForEveryPatientHousehold(t 
 	}
 	if err := values.ValidateProductionAccess(ctx, now); err != nil {
 		t.Fatalf("complete PostgreSQL delivery graph failed readiness: %v", err)
+	}
+}
+
+func TestPostgresDeviceActivationIsAtomicAndSingleUseUnderConcurrency(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	values, err := NewPostgres(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer values.Close()
+	if err := values.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	plan := testDeviceActivationProvisioning(now)
+	plan.Identity.HouseholdID = testUUID(t)
+	plan.Identity.PatientID = testUUID(t)
+	plan.Identity.DeviceID = testUUID(t)
+	plan.Identity.FamilySessionID = testUUID(t)
+	plan.Identity.BackendBindingID = "activation-binding-" + plan.Identity.DeviceID
+	plan.Identity.CredentialID = "activation-credential-" + plan.Identity.DeviceID
+	plan.Identity.FamilyTokenHash = HashAccessToken("activation-family-" + plan.Identity.FamilySessionID)
+	plan.Identity.TelegramRecipients = []string{"activation-chat-" + plan.Identity.HouseholdID}
+	plan.Activation.ID = testUUID(t)
+	plan.Activation.CodeHash = HashAccessToken("activation-code-" + plan.Activation.ID)
+	plan.Activation.DeviceNonceHash = HashAccessToken("activation-nonce-" + plan.Identity.DeviceID)
+	if err := values.ProvisionDeviceActivation(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_, _ = values.pool.Exec(cleanupCtx, `DELETE FROM households WHERE id=$1`, plan.Identity.HouseholdID)
+	}()
+	if err := values.ValidateProductionAccess(ctx, now); err != nil {
+		t.Fatalf("live pending PostgreSQL activation failed readiness: %v", err)
+	}
+	if _, err := values.ResolveActiveDevice(ctx, HashAccessToken("not-issued"), now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("pending PostgreSQL device authenticated before consume: %v", err)
+	}
+	wrong := DeviceActivationConsume{
+		CodeHash: plan.Activation.CodeHash, DeviceID: plan.Identity.DeviceID,
+		DeviceNonceHash: HashAccessToken("wrong-postgres-nonce"),
+		DeviceTokenHash: HashAccessToken("wrong-postgres-token"), At: now.Add(time.Minute),
+	}
+	if _, err := values.ConsumeDeviceActivation(ctx, wrong); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("wrong PostgreSQL device proof did not fail closed: %v", err)
+	}
+
+	type activationResult struct {
+		access    DeviceAccess
+		tokenHash []byte
+		err       error
+	}
+	start := make(chan struct{})
+	results := make(chan activationResult, 2)
+	var workers sync.WaitGroup
+	for _, rawToken := range []string{"postgres-activation-token-a", "postgres-activation-token-b"} {
+		workers.Add(1)
+		go func(rawToken string) {
+			defer workers.Done()
+			<-start
+			tokenHash := HashAccessToken(rawToken)
+			access, consumeErr := values.ConsumeDeviceActivation(ctx, DeviceActivationConsume{
+				CodeHash: plan.Activation.CodeHash, DeviceID: plan.Identity.DeviceID,
+				DeviceNonceHash: plan.Activation.DeviceNonceHash,
+				DeviceTokenHash: tokenHash, At: now.Add(2 * time.Minute),
+			})
+			results <- activationResult{access: access, tokenHash: tokenHash, err: consumeErr}
+		}(rawToken)
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+	winners := 0
+	var winningHash []byte
+	for outcome := range results {
+		if outcome.err == nil {
+			winners++
+			winningHash = outcome.tokenHash
+			if outcome.access.ID != plan.Identity.DeviceID || outcome.access.PatientID != plan.Identity.PatientID {
+				t.Fatalf("PostgreSQL activation returned wrong binding: %#v", outcome.access)
+			}
+		} else if !errors.Is(outcome.err, ErrNotFound) {
+			t.Fatalf("losing PostgreSQL activation returned unexpected error: %v", outcome.err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("concurrent PostgreSQL activation winners=%d want 1", winners)
+	}
+	resolved, err := values.ResolveActiveDevice(ctx, winningHash, now.Add(3*time.Minute))
+	if err != nil || resolved.ID != plan.Identity.DeviceID {
+		t.Fatalf("winning PostgreSQL device token was not durable: access=%#v err=%v", resolved, err)
+	}
+	var storedTokenHash, storedCodeHash, storedNonceHash []byte
+	var consumedAt *time.Time
+	if err := values.pool.QueryRow(ctx, `
+		SELECT device.token_hash, activation.code_hash, activation.device_nonce_hash, activation.consumed_at
+		FROM devices device
+		JOIN device_activation_codes activation ON activation.device_id=device.id
+		WHERE device.id=$1 AND activation.id=$2`, plan.Identity.DeviceID, plan.Activation.ID).Scan(
+		&storedTokenHash, &storedCodeHash, &storedNonceHash, &consumedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(storedTokenHash, winningHash) || !bytes.Equal(storedCodeHash, plan.Activation.CodeHash) ||
+		!bytes.Equal(storedNonceHash, plan.Activation.DeviceNonceHash) || consumedAt == nil {
+		t.Fatalf("PostgreSQL activation persistence mismatch: token=%x code=%x nonce=%x consumed=%v",
+			storedTokenHash, storedCodeHash, storedNonceHash, consumedAt)
 	}
 }
 

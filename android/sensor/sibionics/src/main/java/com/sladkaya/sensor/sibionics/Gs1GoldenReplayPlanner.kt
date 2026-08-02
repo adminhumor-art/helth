@@ -38,10 +38,13 @@ internal class Gs1GoldenReplayPlanner {
         if (!boundedAscii(trace.algorithmVersion, MAX_METADATA_CHARS)) return invalidField("algorithm version is invalid")
         if (!boundedAscii(trace.algorithmBinarySetId, MAX_METADATA_CHARS)) return invalidField("binary set id is invalid")
         val wireProfile = when (trace.transportProtocol) {
-            V120_TRANSPORT_PROTOCOL -> if (trace.algorithmProfile == V120_ALGORITHM_PROFILE) {
+            V120_TRANSPORT_PROTOCOL -> if (
+                trace.algorithmProfile == GLOBAL_V120_ALGORITHM_PROFILE ||
+                trace.algorithmProfile == CHINESE_V120_ALGORITHM_PROFILE
+            ) {
                 GoldenWireProfile.V120
             } else {
-                return invalidField("GS1 V120 trace requires the V116A algorithm profile")
+                return invalidField("GS1 V120 trace requires a verified market algorithm profile")
             }
             V115_TRANSPORT_PROTOCOL -> if (trace.algorithmProfile == V115_ALGORITHM_PROFILE) {
                 GoldenWireProfile.V115
@@ -53,8 +56,8 @@ internal class Gs1GoldenReplayPlanner {
         if (trace.sensitivityEvidence.tokenSource != SensitivityTokenSource.PACKAGE_CODE) {
             return invalidField("sensitivity token source is not the package code")
         }
-        if (!trace.sensitivityEvidence.hasConsistentInitialization()) {
-            return invalidField("sensitivity encoding does not match initialization mode")
+        if (!trace.sensitivityEvidence.hasVerifiedInitialization(trace.algorithmProfile)) {
+            return invalidField("sensitivity encoding has no verified initialization route")
         }
         val coefficient = Float.fromBits(trace.sensitivityEvidence.coefficientBits)
         if (!coefficient.isFinite() || coefficient !in MIN_SENSITIVITY..MAX_SENSITIVITY) {
@@ -258,10 +261,14 @@ internal class Gs1GoldenReplayPlanner {
     private fun String.isSha256(): Boolean =
         length == SHA256_CHARS && all { it in '0'..'9' || it in 'a'..'f' }
 
-    private fun Gs1GoldenSensitivityEvidence.hasConsistentInitialization(): Boolean =
-        when (initializationMode) {
-            AlgorithmInitializationMode.STANDARD -> encoding == SensitivityEncoding.NORMAL
-            AlgorithmInitializationMode.FACTION -> encoding == SensitivityEncoding.FACTION
+    private fun Gs1GoldenSensitivityEvidence.hasVerifiedInitialization(
+        profile: AlgorithmProfile,
+    ): Boolean = when (profile) {
+        AlgorithmProfile.V116A ->
+            initializationMode == AlgorithmInitializationMode.STANDARD
+        AlgorithmProfile.V115G ->
+            initializationMode == AlgorithmInitializationMode.STANDARD &&
+                encoding == SensitivityEncoding.NORMAL
         }
 
     private companion object {
@@ -281,7 +288,8 @@ internal class Gs1GoldenReplayPlanner {
         const val MIN_SENSITIVITY = 0.8f
         const val MAX_SENSITIVITY = 2.5f
         val V115_ALGORITHM_PROFILE = AlgorithmProfile.V115G
-        val V120_ALGORITHM_PROFILE = AlgorithmProfile.V116A
+        val GLOBAL_V120_ALGORITHM_PROFILE = AlgorithmProfile.V116A
+        val CHINESE_V120_ALGORITHM_PROFILE = AlgorithmProfile.V115G
         val U16_RANGE = 0..0xffff
         val TRACE_ID = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
         val ATTEMPT_PSEUDONYM = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")

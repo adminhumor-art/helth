@@ -6,21 +6,37 @@ class AlarmPolicy(
     initiallyOpen: Set<AlarmKind> = emptySet(),
     initialLatestFreshSensorTimeEpochMs: Long = 0L,
     initialLatestFreshPhoneTimeEpochMs: Long = 0L,
+    initialState: AlarmPolicyState? = null,
 ) {
-    private val open = linkedSetOf<AlarmKind>().apply { addAll(initiallyOpen) }
-    private var latestFreshSensorTime = initialLatestFreshSensorTimeEpochMs
-    private var latestFreshPhoneTime = initialLatestFreshPhoneTimeEpochMs
-    private var phoneClockMovedBackwards = false
+    private val open = linkedSetOf<AlarmKind>().apply {
+        addAll(initialState?.active ?: initiallyOpen)
+    }
+    private var latestFreshSensorTime =
+        initialState?.latestFreshSensorTimeEpochMs ?: initialLatestFreshSensorTimeEpochMs
+    private var latestFreshPhoneTime =
+        initialState?.latestFreshPhoneTimeEpochMs ?: initialLatestFreshPhoneTimeEpochMs
+    private var phoneClockMovedBackwards = initialState?.phoneClockMovedBackwards ?: false
 
     init {
         require(monitoringStartedAtEpochMs > 0L)
-        require(initialLatestFreshSensorTimeEpochMs >= 0L)
-        require(initialLatestFreshPhoneTimeEpochMs >= 0L)
+        require(initialState == null || (
+            initiallyOpen.isEmpty() &&
+                initialLatestFreshSensorTimeEpochMs == 0L &&
+                initialLatestFreshPhoneTimeEpochMs == 0L
+            )) { "Restored state cannot be combined with legacy initial fields" }
+        require(latestFreshSensorTime >= 0L)
+        require(latestFreshPhoneTime >= 0L)
         require(
-            (initialLatestFreshSensorTimeEpochMs == 0L) ==
-                (initialLatestFreshPhoneTimeEpochMs == 0L),
+            (latestFreshSensorTime == 0L) == (latestFreshPhoneTime == 0L),
         )
     }
+
+    fun snapshot(): AlarmPolicyState = AlarmPolicyState(
+        active = open.toSet(),
+        latestFreshSensorTimeEpochMs = latestFreshSensorTime,
+        latestFreshPhoneTimeEpochMs = latestFreshPhoneTime,
+        phoneClockMovedBackwards = phoneClockMovedBackwards,
+    )
 
     fun evaluate(
         reading: GlucoseReading,
@@ -115,6 +131,22 @@ class AlarmPolicy(
 
     private companion object {
         const val MAX_SENSOR_FUTURE_SKEW_MS = 5 * 60_000L
+    }
+}
+
+data class AlarmPolicyState(
+    val active: Set<AlarmKind> = emptySet(),
+    val latestFreshSensorTimeEpochMs: Long = 0L,
+    val latestFreshPhoneTimeEpochMs: Long = 0L,
+    val phoneClockMovedBackwards: Boolean = false,
+) {
+    init {
+        require(latestFreshSensorTimeEpochMs >= 0L)
+        require(latestFreshPhoneTimeEpochMs >= 0L)
+        require(
+            (latestFreshSensorTimeEpochMs == 0L) ==
+                (latestFreshPhoneTimeEpochMs == 0L),
+        )
     }
 }
 

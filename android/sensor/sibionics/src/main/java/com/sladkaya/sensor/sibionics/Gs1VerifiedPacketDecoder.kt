@@ -3,7 +3,6 @@ package com.sladkaya.sensor.sibionics
 import com.sladkaya.core.model.SensorFamily
 import com.sladkaya.sensor.sibionics.datahandle.Gs1DataSplitResult
 import com.sladkaya.sensor.sibionics.datahandle.Gs1NativeRecord
-import com.sladkaya.sensor.sibionics.datahandle.SibionicsDataHandle
 
 enum class Gs1VerifiedPacketError {
     WIRE_PACKET_INVALID,
@@ -39,9 +38,7 @@ internal fun interface Gs1PacketVerifier {
  */
 internal class Gs1VerifiedPacketDecoder(
     private val wireCodec: SibionicsPacketCodec = SibionicsPacketCodec(),
-    private val nativeSplitter: Gs1NativeSplitter = Gs1NativeSplitter { packet ->
-        SibionicsDataHandle().splitGs1Data(packet)
-    },
+    private val nativeSplitter: Gs1NativeSplitter,
 ) : Gs1PacketVerifier {
     override fun decode(
         encryptedPacket: ByteArray,

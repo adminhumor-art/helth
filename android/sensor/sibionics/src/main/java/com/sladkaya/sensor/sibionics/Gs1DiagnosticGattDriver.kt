@@ -22,11 +22,12 @@ import com.sladkaya.core.data.SensorPacketIngressJournal
 import com.sladkaya.core.data.SensorPacketIngressMarkHandledResult
 import com.sladkaya.core.data.SensorPacketIngressOutcomeRecord
 import com.sladkaya.core.data.SensorPacketIngressOutcomeStatus
-import com.sladkaya.core.data.ProductPublicationConfigurationReader
-import com.sladkaya.core.data.ProductPublicationRepository
+import com.sladkaya.core.data.LocalSensorBindingRepository
 import com.sladkaya.core.model.ReadingQuality
 import com.sladkaya.core.sensor.SensorConfiguration
-import com.sladkaya.sensor.sibionics.datahandle.SibionicsDataHandle
+import com.sladkaya.sensor.sibionics.datahandle.DataHandleGateway
+import com.sladkaya.sensor.sibionics.datahandle.DataHandleGatewayOpenResult
+import com.sladkaya.sensor.sibionics.datahandle.RemoteDataHandleGatewayConnector
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -202,7 +203,7 @@ class Gs1DiagnosticGattDriver internal constructor(
 class Gs1ProductGattDriver internal constructor(
     context: Context,
     factory: Gs1CoreFactory,
-    configurationReader: ProductPublicationConfigurationReader,
+    configurationReader: Gs1ProductConfigurationReader,
     ingressJournal: SensorPacketIngressJournal,
     committedIngressReader: CommittedSensorIngressReader =
         RoomCommittedSensorIngressReader.create(context.applicationContext),
@@ -212,7 +213,9 @@ class Gs1ProductGattDriver internal constructor(
     constructor(context: Context) : this(
         context = context,
         factory = Gs1CoreFactory(SensorCoreRepository.create(context.applicationContext)),
-        configurationReader = ProductPublicationRepository.create(context.applicationContext),
+        configurationReader = Gs1ProductConfigurationReader {
+            LocalSensorBindingRepository.create(context.applicationContext).active()
+        },
         ingressJournal = RoomSensorPacketIngressJournal.create(context.applicationContext),
     )
 
@@ -305,9 +308,6 @@ private class Gs1GattEngine(
     private val bluetoothManager: BluetoothManager? =
         appContext.getSystemService(BluetoothManager::class.java)
     private val codec = SibionicsPacketCodec()
-    private val v120CommandCodec: Gs1CommandCodec by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
-        OfficialGs1CommandCodec(SibionicsDataHandle())
-    }
     private val transportRegistry = Gs1GattTransportRegistry<BluetoothGatt>(
         disconnect = ::safeDisconnect,
         close = ::safeClose,
@@ -402,9 +402,42 @@ private class Gs1GattEngine(
             }
             publishState(Gs1GattEngineState.OpeningCore)
 
-            val core = when (val result = coreRuntime.start(profile)) {
+            val dataHandle = when (
+                val opened = RemoteDataHandleGatewayConnector.connect(
+                    appContext,
+                    profile.transportVariant,
+                )
+            ) {
+                is DataHandleGatewayOpenResult.Success -> opened.gateway
+                is DataHandleGatewayOpenResult.Failure -> {
+                    publishPreAttemptFailure(
+                        requested = requested,
+                        code = "DATAHANDLE_GATEWAY_UNAVAILABLE",
+                        detail = opened.error.name,
+                        retryable = true,
+                    )
+                    return
+                }
+            }
+            val dataHandleBinding = try {
+                Gs1V120DataHandleBinding.bind(profile.transportVariant, dataHandle)
+            } catch (invalid: IllegalArgumentException) {
+                dataHandle.close()
+                publishPreAttemptFailure(
+                    requested = requested,
+                    code = "DATAHANDLE_BUNDLE_MISMATCH",
+                    detail = invalid.message,
+                    retryable = false,
+                )
+                return
+            }
+
+            val core = when (
+                val result = coreRuntime.start(profile, dataHandleBinding.packetVerifier)
+            ) {
                 is Gs1RuntimeStartResult.Started -> result
                 is Gs1RuntimeStartResult.Failed -> {
+                    dataHandle.close()
                     if (result.code == "PERSISTENCE_PENDING") {
                         publishState(Gs1GattEngineState.PersistencePending)
                         reconnectGate.onRetryableFailure(requested.reconnectToken)?.let(::scheduleReconnect)
@@ -424,6 +457,7 @@ private class Gs1GattEngine(
                     Gs1ProductLocalEffectsFailureCode.APPLICATION_STOPPED,
                 )
                 coreRuntime.stop(expectedGeneration = core.generation)
+                dataHandle.close()
                 return
             }
             var coreTransferred = false
@@ -489,7 +523,7 @@ private class Gs1GattEngine(
                         bluetoothAddress = profile.bluetoothAddress,
                         protocolVariant = profile.transportVariant,
                     ),
-                    gs1CommandProvider = { v120CommandCodec },
+                    gs1CommandProvider = { dataHandleBinding.commandCodec },
                     initialNextIndex = recoveryCursor,
                     initialWireProfile = completedRecovery.finalWireProfile,
                 )
@@ -500,6 +534,7 @@ private class Gs1GattEngine(
                     session = session,
                     deadlinePolicy = initialDeadline.policy,
                     reconnectToken = requested.reconnectToken,
+                    dataHandle = dataHandle,
                 )
                 attempt.job = scope.launch { runAttempt(attempt) }
                 active.set(attempt)
@@ -548,7 +583,10 @@ private class Gs1GattEngine(
                     failOffer(attempt, "GATT_IDENTITY_CONFLICT", null, false)
                 }
             } finally {
-                if (!coreTransferred) coreRuntime.stop(expectedGeneration = core.generation)
+                if (!coreTransferred) {
+                    coreRuntime.stop(expectedGeneration = core.generation)
+                    dataHandle.close()
+                }
             }
     }
 
@@ -746,6 +784,7 @@ private class Gs1GattEngine(
                 closeAttemptTransport(attempt)
                 attempt.mailbox.cancel()
                 val coreStop = coreRuntime.stop(expectedGeneration = attempt.coreGeneration)
+                attempt.dataHandle.close()
                 if (!attempt.stopRequested.get() && active.get() === attempt) {
                     val failure = attempt.terminalFailure.current() ?: terminal ?: GattEvent.Failure(
                         code = "GATT_ATTEMPT_ENDED",
@@ -1519,6 +1558,7 @@ private class Gs1GattEngine(
         val reconnectToken: Gs1ReconnectToken,
         val coreGeneration: Long,
         val session: SibionicsSession,
+        val dataHandle: DataHandleGateway,
         val attemptId: String = UUID.randomUUID().toString(),
         val mailbox: Channel<GattEvent> = Channel(
             capacity = GATT_MAILBOX_CAPACITY,

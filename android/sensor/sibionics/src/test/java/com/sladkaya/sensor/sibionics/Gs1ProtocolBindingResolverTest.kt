@@ -45,7 +45,7 @@ class Gs1ProtocolBindingResolverTest {
         assertEquals(Gs1WireProfile.V120, (second as Gs1ProtocolResolution.Resolved).wireProfile)
         assertEquals(2, store.commits.size)
         assertEquals(store.commits.first(), store.commits.last())
-        assertEquals("V116A", store.saved?.algorithmProfile)
+        assertEquals("V115G", store.saved?.algorithmProfile)
     }
 
     @Test
@@ -105,7 +105,7 @@ class Gs1ProtocolBindingResolverTest {
         profile: Gs1DiagnosticActivationProfile,
         wireProfile: Gs1WireProfile,
     ): SensorProtocolBindingRecord {
-        val spec = Gs1WireProfiles.requireResolved(wireProfile)
+        val spec = Gs1WireProfiles.requireResolved(wireProfile, profile.transportVariant)
         return SensorProtocolBindingRecord(
             sensorId = profile.sensorId,
             bluetoothAddress = profile.bluetoothAddress,
@@ -115,7 +115,9 @@ class Gs1ProtocolBindingResolverTest {
             wireProfile = wireProfile.name,
             transportProtocol = spec.transportProtocol,
             transportCodecId = spec.transportCodecId,
-            algorithmProfile = spec.algorithmProfile.name,
+            algorithmProfile = Gs1AlgorithmProfiles.requireForTransportVariant(
+                profile.transportVariant,
+            ).name,
             sensitivityEncoding = "NORMAL",
             evidenceKind = "TEST_EVIDENCE",
             evidenceSha256 = "ab".repeat(32),

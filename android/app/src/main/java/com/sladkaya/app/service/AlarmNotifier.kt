@@ -41,9 +41,9 @@ class AlarmNotifier(private val context: Context) {
         manager.createNotificationChannels(listOf(alarms, status))
     }
 
-    fun foreground(reading: GlucoseReading?): Notification {
-        val text = reading?.let { String.format(Locale.forLanguageTag("ru"), "ДЕМО · %.1f ммоль/л · тестовые данные", it.glucoseMmolL) }
-            ?: "Демо: ожидание тестовых данных"
+    fun foreground(reading: GlucoseReading?, demo: Boolean): Notification {
+        val text = reading?.let { SensorForegroundNotificationText.forReading(it, demo) }
+            ?: SensorForegroundNotificationText.waiting(demo)
         return foregroundStatus(text)
     }
 

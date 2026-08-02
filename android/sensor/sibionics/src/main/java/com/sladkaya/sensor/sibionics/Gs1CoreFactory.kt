@@ -131,13 +131,18 @@ internal class Gs1CoreFactory private constructor(
         evidence: ByteArray,
     ): Gs1ProtocolResolution {
         val spec = try {
-            Gs1WireProfiles.requireResolved(wireProfile)
+            Gs1WireProfiles.requireResolved(wireProfile, profile.transportVariant)
         } catch (invalid: IllegalArgumentException) {
             return Gs1ProtocolResolution.Failure(
                 code = "PROTOCOL_BINDING_PROFILE_INVALID",
                 detail = invalid.message,
             )
         }
+        val algorithmProfile = Gs1AlgorithmProfiles.resolveForTransportVariant(
+            profile.transportVariant,
+        ) ?: return Gs1ProtocolResolution.Failure(
+            code = "ALGORITHM_BUNDLE_UNSUPPORTED",
+        )
         val token = when (
             val validation = SensitivityTokenPolicy.validatePackageCode(profile.packageCode)
         ) {
@@ -148,7 +153,7 @@ internal class Gs1CoreFactory private constructor(
             )
         }
         val decoded = try {
-            decodeSensitivityForProfile(spec.algorithmProfile, token)
+            decodeSensitivityForProfile(algorithmProfile, token)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: LinkageError) {
@@ -240,13 +245,22 @@ internal class Gs1CoreFactory private constructor(
             return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.UNSUPPORTED_TRANSPORT_VARIANT)
         }
         val spec = try {
-            Gs1WireProfiles.requireResolved(configuration.wireProfile)
+            Gs1WireProfiles.requireResolved(
+                configuration.wireProfile,
+                configuration.transportVariant,
+            )
         } catch (invalid: IllegalArgumentException) {
             return Gs1CoreOpenResult.Failure(
                 Gs1CoreOpenError.UNSUPPORTED_WIRE_PROFILE,
                 invalid.message,
             )
         }
+        val algorithmProfile = Gs1AlgorithmProfiles.resolveForTransportVariant(
+            configuration.transportVariant,
+        ) ?: return Gs1CoreOpenResult.Failure(
+            Gs1CoreOpenError.UNSUPPORTED_TRANSPORT_VARIANT,
+            "No verified official algorithm bundle",
+        )
         val token = when (val validation = SensitivityTokenPolicy.validatePackageCode(configuration.packageCode)) {
             is SensitivityTokenValidation.Valid -> validation.token
             is SensitivityTokenValidation.Invalid -> {
@@ -256,7 +270,7 @@ internal class Gs1CoreFactory private constructor(
                 )
             }
         }
-        if (!protocolBinding.matches(configuration, spec, token)) {
+        if (!protocolBinding.matches(configuration, spec, algorithmProfile, token)) {
             return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.PROTOCOL_BINDING_MISMATCH)
         }
         if (productPermit != null &&
@@ -264,6 +278,7 @@ internal class Gs1CoreFactory private constructor(
                 configuration = configuration,
                 protocolBinding = protocolBinding,
                 spec = spec,
+                expectedAlgorithmProfile = algorithmProfile,
             )
         ) {
             return Gs1CoreOpenResult.Failure(
@@ -271,7 +286,7 @@ internal class Gs1CoreFactory private constructor(
             )
         }
         val decoded = try {
-                decodeSensitivityForProfile(spec.algorithmProfile, token)
+                decodeSensitivityForProfile(algorithmProfile, token)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: LinkageError) {
@@ -297,19 +312,28 @@ internal class Gs1CoreFactory private constructor(
         if (protocolBinding.sensitivityEncoding != sensitivity.encoding.name) {
             return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.PROTOCOL_BINDING_MISMATCH)
         }
-        val initializationMode = sensitivity.initializationMode()
+        val initializationMode = algorithmProfile.initializationModeFor(
+            sensitivity.encoding,
+        ) ?: return Gs1CoreOpenResult.Failure(
+            Gs1CoreOpenError.UNSUPPORTED_SENSITIVITY_ENCODING,
+            "${algorithmProfile.name} has no verified initialization route for " +
+                sensitivity.encoding.name,
+        )
 
         val native: NativeAlgorithmApi
         val nativeAlgorithmVersion: String
         val nativeArtifactIdentity: Gs1NativeArtifactIdentity?
         try {
-            native = nativeProvider(spec.algorithmProfile)
+            native = nativeProvider(algorithmProfile)
             nativeAlgorithmVersion = native.algorithmVersion
             require(nativeAlgorithmVersion.isNotBlank() &&
                 !nativeAlgorithmVersion.trim().equals("unknown", ignoreCase = true)
             ) { "Native algorithm version is absent or unknown" }
             nativeArtifactIdentity = productPermit?.let {
-                nativeArtifactIdentityProvider.resolve(spec.algorithmProfile)
+                nativeArtifactIdentityProvider.resolve(
+                    algorithmProfile,
+                    configuration.transportVariant,
+                )
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -370,6 +394,7 @@ internal class Gs1CoreFactory private constructor(
                 configuration,
                 sensitivity,
                 spec,
+                algorithmProfile,
                 initializationMode,
                 native.binarySetId,
                 nativeAlgorithmVersion,
@@ -399,6 +424,7 @@ internal class Gs1CoreFactory private constructor(
             configuration,
             sensitivity,
             spec,
+            algorithmProfile,
             initializationMode,
         )
             ?: if (stored == null) null else {
@@ -414,7 +440,7 @@ internal class Gs1CoreFactory private constructor(
 
         return when (
             val opened = SibionicsAlgorithmSession.open(
-                profile = spec.algorithmProfile,
+                profile = algorithmProfile,
                 sensitivityToken = sensitivity.token,
                 initializationMode = initializationMode,
                 checkpoint = checkpoint,
@@ -436,13 +462,13 @@ internal class Gs1CoreFactory private constructor(
                     store = store,
                     transportProtocol = spec.transportProtocol,
                     transportCodecId = spec.transportCodecId,
-                    algorithmProfile = spec.algorithmProfile,
+                    algorithmProfile = algorithmProfile,
                     initialSensorStartTimeEpochMs = stored?.sensorStartTimeEpochMs,
                     productContext = if (productPermit == null) {
                         null
                     } else {
                         val identity = checkNotNull(nativeArtifactIdentity)
-                        productPermit.active.verifiedRuntimeContext(
+                        productPermit.active.verifiedProductRuntimeContext(
                             nativeBinarySetSha256 = identity.algorithmBinarySetSha256,
                             nativeDatahandleBinarySetSha256 = identity.datahandleBinarySetSha256,
                         )
@@ -458,6 +484,7 @@ internal class Gs1CoreFactory private constructor(
         configuration: Gs1CoreConfiguration,
         sensitivity: DecodedSensitivity,
         spec: Gs1WireProfileSpec,
+        expectedAlgorithmProfile: AlgorithmProfile,
         initializationMode: AlgorithmInitializationMode,
         nativeBinarySetId: String,
         nativeAlgorithmVersion: String,
@@ -468,7 +495,7 @@ internal class Gs1CoreFactory private constructor(
             transportVariant == configuration.transportVariant &&
             transportProtocol == spec.transportProtocol &&
             transportCodecId == spec.transportCodecId &&
-            algorithmProfile == spec.algorithmProfile.name &&
+            algorithmProfile == expectedAlgorithmProfile.name &&
             sensitivityToken == sensitivity.token.value &&
             sensitivityTokenSource == sensitivity.token.source.name &&
             sensitivityCoefficient == sensitivity.coefficient.toDouble() &&
@@ -481,6 +508,7 @@ internal class Gs1CoreFactory private constructor(
         configuration: Gs1CoreConfiguration,
         sensitivity: DecodedSensitivity,
         spec: Gs1WireProfileSpec,
+        expectedAlgorithmProfile: AlgorithmProfile,
         initializationMode: AlgorithmInitializationMode,
     ): AlgorithmCheckpoint? {
         if (sensorId != configuration.sensorId ||
@@ -489,12 +517,12 @@ internal class Gs1CoreFactory private constructor(
             transportVariant != configuration.transportVariant ||
             transportProtocol != spec.transportProtocol ||
             transportCodecId != spec.transportCodecId ||
-            algorithmProfile != spec.algorithmProfile.name ||
+            algorithmProfile != expectedAlgorithmProfile.name ||
             sensorTimeEpochMs <= 0 ||
             sensorTimeEpochMs % MILLIS_PER_SECOND != 0L
         ) return null
         return AlgorithmCheckpoint(
-            profile = spec.algorithmProfile,
+            profile = expectedAlgorithmProfile,
             binarySetId = binarySetId,
             sensitivityToken = sensitivity.token,
             initializationMode = initializationMode,
@@ -521,6 +549,7 @@ internal class Gs1CoreFactory private constructor(
 private fun SensorProtocolBindingRecord.matches(
     configuration: Gs1CoreConfiguration,
     spec: Gs1WireProfileSpec,
+    expectedAlgorithmProfile: AlgorithmProfile,
     sensitivityToken: SensitivityToken,
 ): Boolean = sensorId == configuration.sensorId &&
     bluetoothAddress == configuration.bluetoothAddress &&
@@ -530,13 +559,14 @@ private fun SensorProtocolBindingRecord.matches(
     wireProfile == spec.wireProfile.name &&
     transportProtocol == spec.transportProtocol &&
     transportCodecId == spec.transportCodecId &&
-    algorithmProfile == spec.algorithmProfile.name &&
+    algorithmProfile == expectedAlgorithmProfile.name &&
     schemaVersion == SensorProtocolBindingRecord.SCHEMA_VERSION
 
 private fun PhysicalSensorApprovalRecord.matchesStaticProductConfiguration(
     configuration: Gs1CoreConfiguration,
     protocolBinding: SensorProtocolBindingRecord,
     spec: Gs1WireProfileSpec,
+    expectedAlgorithmProfile: AlgorithmProfile,
 ): Boolean = sensorId == configuration.sensorId &&
     bluetoothAddress == configuration.bluetoothAddress &&
     sensorFamily == configuration.family &&
@@ -545,7 +575,7 @@ private fun PhysicalSensorApprovalRecord.matchesStaticProductConfiguration(
     wireProfile == spec.wireProfile.name &&
     transportProtocol == spec.transportProtocol &&
     transportCodecId == spec.transportCodecId &&
-    algorithmProfile == spec.algorithmProfile.name &&
+    algorithmProfile == expectedAlgorithmProfile.name &&
     protocolEvidenceKind == protocolBinding.evidenceKind &&
     protocolEvidenceSha256 == protocolBinding.evidenceSha256 &&
     sensitivityEncoding == protocolBinding.sensitivityEncoding &&
@@ -580,10 +610,15 @@ private fun SensorAlgorithmCheckpointRecord.matchesApprovedLineage(
     sequence > approval.approvedSequence &&
     sensorTimeEpochMs >= approval.approvedSensorTimeEpochMs
 
-private fun DecodedSensitivity.initializationMode(): AlgorithmInitializationMode =
-    when (encoding) {
-        SensitivityEncoding.NORMAL -> AlgorithmInitializationMode.STANDARD
-        SensitivityEncoding.FACTION -> AlgorithmInitializationMode.FACTION
+private fun AlgorithmProfile.initializationModeFor(
+    encoding: SensitivityEncoding,
+): AlgorithmInitializationMode? =
+    when (this) {
+        AlgorithmProfile.V116A -> AlgorithmInitializationMode.STANDARD
+        AlgorithmProfile.V115G -> when (encoding) {
+            SensitivityEncoding.NORMAL -> AlgorithmInitializationMode.STANDARD
+            SensitivityEncoding.FACTION -> null
+        }
     }
 
 private val CANONICAL_BLUETOOTH_ADDRESS = Regex("^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$")

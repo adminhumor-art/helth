@@ -295,6 +295,7 @@ class SensorCoreRecordTest {
     private fun publicationContext() = ProductPublicationContext(
         approvalId = "ab".repeat(32),
         publicationBindingId = "cd".repeat(32),
+        remotePublicationBindingId = "de".repeat(32),
         httpsOrigin = "https://api.sladkaya.test",
         backendBindingId = "backend-binding-a",
         credentialId = "credential-a",

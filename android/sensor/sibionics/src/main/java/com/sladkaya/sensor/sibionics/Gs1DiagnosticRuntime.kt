@@ -25,6 +25,11 @@ internal interface Gs1RuntimeCoreLease : AutoCloseable {
 
 internal fun interface Gs1RuntimeCoreOpener {
     suspend fun open(profile: Gs1DiagnosticActivationProfile): Gs1RuntimeCoreOpenResult
+
+    suspend fun open(
+        profile: Gs1DiagnosticActivationProfile,
+        v120Verifier: Gs1PacketVerifier,
+    ): Gs1RuntimeCoreOpenResult = open(profile)
 }
 
 internal sealed interface Gs1RuntimeCoreOpenResult {
@@ -134,7 +139,10 @@ internal class Gs1DiagnosticRuntime(
         require(stopTimeoutMillis > 0)
     }
 
-    suspend fun start(profile: Gs1DiagnosticActivationProfile): Gs1RuntimeStartResult =
+    suspend fun start(
+        profile: Gs1DiagnosticActivationProfile,
+        v120Verifier: Gs1PacketVerifier = UNAVAILABLE_V120_VERIFIER,
+    ): Gs1RuntimeStartResult =
         lifecycle.withLock {
             current?.let { previous ->
                 stopAndJoin(previous)
@@ -142,7 +150,7 @@ internal class Gs1DiagnosticRuntime(
             }
 
             val opened = try {
-                opener.open(profile)
+                opener.open(profile, v120Verifier)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: LinkageError) {
@@ -610,21 +618,37 @@ private class Gs1CommittedSettlementRejectedException(
 internal class FactoryGs1RuntimeCoreOpener(
     private val factory: Gs1CoreFactory,
 ) : Gs1RuntimeCoreOpener {
-    override suspend fun open(profile: Gs1DiagnosticActivationProfile): Gs1RuntimeCoreOpenResult {
+    override suspend fun open(profile: Gs1DiagnosticActivationProfile): Gs1RuntimeCoreOpenResult =
+        Gs1RuntimeCoreOpenResult.Failure("DATAHANDLE_GATEWAY_REQUIRED")
+
+    override suspend fun open(
+        profile: Gs1DiagnosticActivationProfile,
+        v120Verifier: Gs1PacketVerifier,
+    ): Gs1RuntimeCoreOpenResult {
         return when (val resolution = factory.inspectProtocol(profile)) {
             is Gs1ProtocolResolution.Failure -> Gs1RuntimeCoreOpenResult.Failure(
                 code = resolution.code,
                 detail = resolution.detail,
             )
             Gs1ProtocolResolution.Unresolved -> Gs1RuntimeCoreOpenResult.Success(
-                ResolvingGs1RuntimeCoreLease(profile, factory, Gs1WireProfile.UNRESOLVED),
+                ResolvingGs1RuntimeCoreLease(
+                    profile,
+                    factory,
+                    Gs1WireProfile.UNRESOLVED,
+                    v120Verifier,
+                ),
             )
             is Gs1ProtocolResolution.Resolved -> if (resolution.binding == null) {
                 Gs1RuntimeCoreOpenResult.Success(
-                    ResolvingGs1RuntimeCoreLease(profile, factory, resolution.wireProfile),
+                    ResolvingGs1RuntimeCoreLease(
+                        profile,
+                        factory,
+                        resolution.wireProfile,
+                        v120Verifier,
+                    ),
                 )
             } else {
-                openResolved(profile, resolution)
+                openResolved(profile, resolution, v120Verifier)
             }
         }
     }
@@ -632,6 +656,7 @@ internal class FactoryGs1RuntimeCoreOpener(
     private suspend fun openResolved(
         profile: Gs1DiagnosticActivationProfile,
         resolution: Gs1ProtocolResolution.Resolved,
+        v120Verifier: Gs1PacketVerifier,
     ): Gs1RuntimeCoreOpenResult = when (val opened = factory.openBound(profile, resolution)) {
             is Gs1CoreOpenResult.Failure -> Gs1RuntimeCoreOpenResult.Failure(
                 code = opened.error.name,
@@ -643,6 +668,7 @@ internal class FactoryGs1RuntimeCoreOpener(
                     coordinator = opened.coordinator,
                     initialNextIndex = opened.nextSensorIndex,
                     wireProfile = resolution.wireProfile,
+                    v120Verifier = v120Verifier,
                 ),
             )
         }
@@ -653,7 +679,13 @@ internal class FactoryGs1ApprovedRuntimeCoreOpener(
     private val factory: Gs1CoreFactory,
     private val permitIssuer: Gs1ProductPermitIssuer,
 ) : Gs1RuntimeCoreOpener {
-    override suspend fun open(profile: Gs1DiagnosticActivationProfile): Gs1RuntimeCoreOpenResult {
+    override suspend fun open(profile: Gs1DiagnosticActivationProfile): Gs1RuntimeCoreOpenResult =
+        Gs1RuntimeCoreOpenResult.Failure("DATAHANDLE_GATEWAY_REQUIRED")
+
+    override suspend fun open(
+        profile: Gs1DiagnosticActivationProfile,
+        v120Verifier: Gs1PacketVerifier,
+    ): Gs1RuntimeCoreOpenResult {
         val permit = when (val issued = permitIssuer.issue(profile)) {
             is Gs1ProductPermitIssueResult.Granted -> issued.permit
             is Gs1ProductPermitIssueResult.Denied -> return Gs1RuntimeCoreOpenResult.Failure(
@@ -677,6 +709,7 @@ internal class FactoryGs1ApprovedRuntimeCoreOpener(
                         coordinator = opened.coordinator,
                         initialNextIndex = opened.nextSensorIndex,
                         wireProfile = wireProfile,
+                        v120Verifier = v120Verifier,
                     ),
                 )
             }
@@ -688,7 +721,7 @@ private class ResolvingGs1RuntimeCoreLease(
     private val profile: Gs1DiagnosticActivationProfile,
     private val factory: Gs1CoreFactory,
     initialWireProfile: Gs1WireProfile,
-    private val v120Verifier: Gs1PacketVerifier = Gs1VerifiedPacketDecoder(),
+    private val v120Verifier: Gs1PacketVerifier,
     private val v115Verifier: Gs1PacketVerifier = Gs1V115VerifiedPacketDecoder(),
 ) : Gs1RuntimeCoreLease {
     override val initialNextIndex: Int = 1
@@ -811,6 +844,7 @@ private class ResolvingGs1RuntimeCoreLease(
             coordinator = opened.coordinator,
             initialNextIndex = opened.nextSensorIndex,
             wireProfile = bound.wireProfile,
+            v120Verifier = v120Verifier,
         )
         delegate = lease
         pending = null
@@ -853,12 +887,13 @@ private class FactoryGs1RuntimeCoreLease(
     private val coordinator: Gs1ProcessingCoordinator,
     override val initialNextIndex: Int,
     override val wireProfile: Gs1WireProfile,
+    private val v120Verifier: Gs1PacketVerifier,
 ) : Gs1RuntimeCoreLease {
     private val processor = Gs1PacketProcessor(
         core = coordinator,
         decoder = when (wireProfile) {
             Gs1WireProfile.V115 -> Gs1V115VerifiedPacketDecoder()
-            Gs1WireProfile.V120 -> Gs1VerifiedPacketDecoder()
+            Gs1WireProfile.V120 -> v120Verifier
             Gs1WireProfile.UNRESOLVED -> error("Resolved core lease requires a wire profile")
         },
         initialExpectedIndex = initialNextIndex,
@@ -879,4 +914,11 @@ private class FactoryGs1RuntimeCoreLease(
     override fun close() {
         coordinator.close()
     }
+}
+
+private val UNAVAILABLE_V120_VERIFIER = Gs1PacketVerifier { _, _ ->
+    Gs1VerifiedPacketResult.Failure(
+        Gs1VerifiedPacketError.NATIVE_SPLIT_FAILED,
+        "A bundle-bound data-handle gateway is required",
+    )
 }

@@ -58,12 +58,15 @@ fun SensorSetupScreen(
     diagnostic: DiagnosticUiState,
     scannerMessage: String?,
     scannerSuggestedCode: String?,
+    activationInProgress: Boolean,
+    activationMessage: String?,
     onBack: () -> Unit,
     onSubmitManual: (SensorFamily, Gs1MarketProfile, String) -> Unit,
     onScanDataMatrix: (SensorFamily, Gs1MarketProfile) -> Unit,
     onRetrySearch: () -> Unit,
     onStartDiagnostic: () -> Unit,
     onStopDiagnostic: () -> Unit,
+    onUseSensor: (String) -> Unit,
     onReset: () -> Unit,
 ) {
     var family by rememberSaveable { mutableStateOf(SensorFamily.SIBIONICS_GS1) }
@@ -112,7 +115,11 @@ fun SensorSetupScreen(
                     Text("Подключение датчика", color = SetupInk, fontWeight = FontWeight.Bold, fontSize = 22.sp)
                     Text("GS1 и GS1Sb · безопасная диагностика", color = SetupMuted, fontSize = 11.sp)
                 }
-                OutlinedButton(onClick = onBack, shape = RoundedCornerShape(12.dp)) {
+                OutlinedButton(
+                    onClick = onBack,
+                    enabled = !activationInProgress,
+                    shape = RoundedCornerShape(12.dp),
+                ) {
                     Text("Назад")
                 }
             }
@@ -185,8 +192,11 @@ fun SensorSetupScreen(
                     marketProfile = onboarding.profile.marketProfile,
                     deviceName = onboarding.profile.deviceName,
                     diagnostic = diagnostic,
+                    activationInProgress = activationInProgress,
+                    activationMessage = activationMessage,
                     onStart = onStartDiagnostic,
                     onStop = onStopDiagnostic,
+                    onUseSensor = onUseSensor,
                     onReset = onReset,
                 )
             }
@@ -197,7 +207,7 @@ fun SensorSetupScreen(
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(
-                    "До сравнения с официальным приложением диагностические числа не включают график, тревоги, виджет, сайт или Telegram.",
+                    "До нажатия «Использовать этот датчик» диагностические числа не включают график, тревоги, виджет, сайт или Telegram.",
                     color = SetupDanger,
                     fontSize = 12.sp,
                     lineHeight = 17.sp,
@@ -391,8 +401,11 @@ private fun DiagnosticCard(
     marketProfile: Gs1MarketProfile,
     deviceName: String,
     diagnostic: DiagnosticUiState,
+    activationInProgress: Boolean,
+    activationMessage: String?,
     onStart: () -> Unit,
     onStop: () -> Unit,
+    onUseSensor: (String) -> Unit,
     onReset: () -> Unit,
 ) {
     val nowEpochMs by produceState(
@@ -434,16 +447,47 @@ private fun DiagnosticCard(
         diagnostic.technicalCode?.let { code ->
             Text("Код проверки: $code", color = SetupMuted, fontSize = 10.sp)
         }
+        visibleReading?.let { reading ->
+            Text(
+                "Первый запуск проверит эту сохранённую точку и сразу откроет основной экран.",
+                color = SetupMuted,
+                fontSize = 11.sp,
+            )
+            Button(
+                onClick = { onUseSensor(reading.eventId) },
+                enabled = !activationInProgress,
+                colors = ButtonDefaults.buttonColors(containerColor = SetupForest),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    if (activationInProgress) "Запускаем датчик…"
+                    else "Использовать этот датчик",
+                )
+            }
+        }
+        activationMessage?.let { message ->
+            Text(message, color = SetupDanger, fontSize = 12.sp)
+        }
         Button(
             onClick = onStart,
+            enabled = !activationInProgress,
             colors = ButtonDefaults.buttonColors(containerColor = SetupForest),
             shape = RoundedCornerShape(12.dp),
             modifier = Modifier.fillMaxWidth(),
         ) { Text(if (diagnostic.active) "Повторить подключение" else "Запустить диагностику") }
-        OutlinedButton(onClick = onStop, enabled = diagnostic.active, modifier = Modifier.fillMaxWidth()) {
+        OutlinedButton(
+            onClick = onStop,
+            enabled = diagnostic.active && !activationInProgress,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
             Text("Остановить диагностику")
         }
-        OutlinedButton(onClick = onReset, modifier = Modifier.fillMaxWidth()) {
+        OutlinedButton(
+            onClick = onReset,
+            enabled = !activationInProgress,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
             Text("Подключить другой датчик")
         }
     }

@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS devices (
     id UUID PRIMARY KEY,
     patient_id UUID NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
-    token_hash BYTEA NOT NULL UNIQUE CHECK (octet_length(token_hash) = 32),
+    token_hash BYTEA UNIQUE CHECK (token_hash IS NULL OR octet_length(token_hash) = 32),
     backend_binding_id TEXT NOT NULL UNIQUE CHECK (backend_binding_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'),
     credential_id TEXT NOT NULL CHECK (credential_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'),
     credential_revision BIGINT NOT NULL CHECK (credential_revision BETWEEN 1 AND 9007199254740991),
@@ -49,7 +49,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS devices_credential_revision_uniq
     ON devices (credential_id, credential_revision);
 
 CREATE INDEX IF NOT EXISTS devices_active_token_hash_idx
-    ON devices (token_hash) WHERE revoked_at IS NULL;
+    ON devices (token_hash) WHERE revoked_at IS NULL AND token_hash IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS device_activation_codes (
+    id UUID PRIMARY KEY,
+    device_id UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    code_hash BYTEA NOT NULL UNIQUE CHECK (octet_length(code_hash) = 32),
+    device_nonce_hash BYTEA NOT NULL CHECK (octet_length(device_nonce_hash) = 32),
+    created_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    consumed_at TIMESTAMPTZ,
+    CHECK (expires_at > created_at),
+    CHECK (expires_at <= created_at + INTERVAL '30 minutes'),
+    CHECK (consumed_at IS NULL OR (consumed_at >= created_at AND consumed_at < expires_at))
+);
+
+CREATE INDEX IF NOT EXISTS device_activation_codes_active_hash_idx
+    ON device_activation_codes (code_hash) WHERE consumed_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS device_activation_codes_device_idx
+    ON device_activation_codes (device_id, expires_at DESC);
 
 CREATE TABLE IF NOT EXISTS family_sessions (
     id UUID PRIMARY KEY,
@@ -62,6 +81,20 @@ CREATE TABLE IF NOT EXISTS family_sessions (
 
 CREATE INDEX IF NOT EXISTS family_sessions_active_token_hash_idx
     ON family_sessions (token_hash) WHERE revoked_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS family_web_sessions (
+    id UUID PRIMARY KEY,
+    family_access_id UUID NOT NULL REFERENCES family_sessions(id) ON DELETE CASCADE,
+    token_hash BYTEA NOT NULL UNIQUE CHECK (octet_length(token_hash) = 32),
+    csrf_token_hash BYTEA NOT NULL UNIQUE CHECK (octet_length(csrf_token_hash) = 32),
+    expires_at TIMESTAMPTZ NOT NULL,
+    revoked_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (expires_at > created_at)
+);
+
+CREATE INDEX IF NOT EXISTS family_web_sessions_active_token_hash_idx
+    ON family_web_sessions (token_hash) WHERE revoked_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS measurements (
     event_id TEXT PRIMARY KEY CHECK (

@@ -23,6 +23,8 @@ class DiagnosticReadingUiPolicyTest {
     }
 
     private fun reading() = DiagnosticReadingUi(
+        eventId = "diagnostic-event",
+        sensorId = "diagnostic-sensor",
         family = SensorFamily.SIBIONICS_GS1,
         sensorTimeEpochMs = 1_000L,
         phoneTimeEpochMs = 1_100L,

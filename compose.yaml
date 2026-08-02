@@ -26,6 +26,8 @@ services:
       BACKEND_BINDING_ID: ${BACKEND_BINDING_ID:-backend-binding-development-1}
       CREDENTIAL_ID: ${CREDENTIAL_ID:-device-credential-development-1}
       CREDENTIAL_REVISION: ${CREDENTIAL_REVISION:-1}
+      FAMILY_WEB_ORIGINS: ${FAMILY_WEB_ORIGINS:-http://localhost:3000}
+      DEVICE_API_ORIGIN: ${DEVICE_API_ORIGIN:-http://127.0.0.1:8080}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_IDS: ${TELEGRAM_CHAT_IDS:-}
     depends_on:

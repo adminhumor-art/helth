@@ -38,7 +38,6 @@ class RemoteCredentialPolicyTest {
     fun endpointAcceptsOnlyCanonicalHttpsOrigin() {
         assertTrue(RemoteUploadEndpoint.parse("https://family.example") is RemoteUploadEndpointParseResult.Valid)
         assertTrue(RemoteUploadEndpoint.parse("https://family.example:443") is RemoteUploadEndpointParseResult.Valid)
-        assertTrue(RemoteUploadEndpoint.parse("https://[2001:db8::1]") is RemoteUploadEndpointParseResult.Valid)
         listOf(
             "http://family.example",
             "https://family.example:0",
@@ -53,6 +52,7 @@ class RemoteCredentialPolicyTest {
             "https://bad_host.example",
             "https://localhost",
             "https://[fe80::1%25eth0]",
+            "https://[2001:db8::1]",
             "https://2001:db8::1",
             "not a url",
         ).forEach { candidate ->
@@ -69,6 +69,7 @@ class RemoteCredentialPolicyTest {
             { baseline.copy(credentialId = "") },
             { baseline.copy(credentialRevision = 0) },
             { baseline.copy(credentialRevision = 9_007_199_254_740_992L) },
+            { baseline.copy(httpsOrigin = "https://[2001:db8::1]") },
         ).forEach { invalid ->
             assertThrows(IllegalArgumentException::class.java) { invalid() }
         }

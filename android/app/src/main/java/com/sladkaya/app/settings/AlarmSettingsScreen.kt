@@ -44,6 +44,7 @@ private val DangerSoft = Color(0xFFFFF0ED)
 internal fun AlarmSettingsScreen(
     initial: LoadedAlarmSettings,
     onBack: () -> Unit,
+    onOpenFamilyAccess: () -> Unit,
     onSave: (AlarmThresholds) -> Boolean,
     onTestAlarm: () -> Boolean,
     onCancelTestAlarm: () -> Unit,
@@ -179,6 +180,23 @@ internal fun AlarmSettingsScreen(
                 ) {
                     Text("Остановить тест")
                 }
+            }
+        }
+
+        SettingsCard {
+            Text("Семейный доступ", color = Ink, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+            Text(
+                "Подключение телефона к семейному сайту и Telegram. Локальная работа датчика и тревоги от него не зависит.",
+                color = Muted,
+                fontSize = 11.sp,
+                lineHeight = 16.sp,
+            )
+            OutlinedButton(
+                onClick = onOpenFamilyAccess,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Text("Открыть семейный доступ")
             }
         }
 

@@ -9,6 +9,7 @@ class Gs1NativeArtifactIdentityProviderTest {
     fun factoryAndPhysicalApprovalCanShareOneCanonicalInstalledIdentityProvider() {
         val identity = Gs1InstalledNativeArtifactIdentityProvider.resolve(
             profile = AlgorithmProfile.V116A,
+            transportVariant = 0,
             supportedAbis = listOf("arm64-v8a"),
         )
 
@@ -17,7 +18,21 @@ class Gs1NativeArtifactIdentityProviderTest {
             identity.algorithmBinarySetSha256,
         )
         assertEquals(
-            "13c2e96b3a590da34e85114ede0810279abb7142661bc8ccdad79f184663293b",
+            "4267da74d2889a6f0179214c3f352c28c2741768a902720b67997899b26f5203",
+            identity.datahandleBinarySetSha256,
+        )
+    }
+
+    @Test
+    fun chineseApprovalPinsTheChineseDataHandleBundle() {
+        val identity = Gs1InstalledNativeArtifactIdentityProvider.resolve(
+            profile = AlgorithmProfile.V115G,
+            transportVariant = 2,
+            supportedAbis = listOf("arm64-v8a"),
+        )
+
+        assertEquals(
+            "31a2f31c237cdcf6e0b1e228b7015ad8b46f3e56d4207ecc1ff552b8db8defd4",
             identity.datahandleBinarySetSha256,
         )
     }

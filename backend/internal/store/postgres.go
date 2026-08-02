@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/subtle"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -240,6 +241,15 @@ func (p *Postgres) ValidateProductionAccess(ctx context.Context, at time.Time) e
 			WHERE NOT EXISTS (
 				SELECT 1 FROM devices d
 				WHERE d.patient_id=p.id AND d.revoked_at IS NULL
+				  AND (
+					d.token_hash IS NOT NULL OR EXISTS (
+						SELECT 1 FROM device_activation_codes activation
+						WHERE activation.device_id=d.id
+						  AND activation.consumed_at IS NULL
+						  AND activation.created_at<=$1
+						  AND activation.expires_at>$1
+					)
+				  )
 			) OR NOT EXISTS (
 				SELECT 1 FROM family_sessions fs
 				WHERE fs.household_id=p.household_id
@@ -271,6 +281,79 @@ func (p *Postgres) ResolveActiveFamilySession(ctx context.Context, tokenHash []b
 		  AND (expires_at IS NULL OR expires_at > $2)`, tokenHash, at.UTC()).Scan(&result.ID, &result.HouseholdID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return FamilySessionAccess{}, ErrNotFound
+	}
+	return result, err
+}
+
+func (p *Postgres) IssueFamilyWebSession(
+	ctx context.Context,
+	familyAccessTokenHash []byte,
+	credential FamilyWebSessionCredential,
+	at time.Time,
+) (FamilyWebSessionAccess, error) {
+	at = at.UTC()
+	credential.ID = canonicalUUID(credential.ID)
+	credential.ExpiresAt = credential.ExpiresAt.UTC()
+	if len(familyAccessTokenHash) != AccessTokenHashSize {
+		return FamilyWebSessionAccess{}, ErrNotFound
+	}
+	if err := credential.validate(at); err != nil {
+		return FamilyWebSessionAccess{}, err
+	}
+	if subtle.ConstantTimeCompare(familyAccessTokenHash, credential.TokenHash) == 1 ||
+		subtle.ConstantTimeCompare(familyAccessTokenHash, credential.CSRFTokenHash) == 1 {
+		return FamilyWebSessionAccess{}, ErrCredentialConflict
+	}
+	var result FamilyWebSessionAccess
+	err := p.pool.QueryRow(ctx, `
+		WITH active_access AS (
+			SELECT id, household_id
+			FROM family_sessions
+			WHERE token_hash=$2
+			  AND revoked_at IS NULL
+			  AND (expires_at IS NULL OR expires_at > $6)
+		), inserted AS (
+			INSERT INTO family_web_sessions (
+				id, family_access_id, token_hash, csrf_token_hash, expires_at
+			)
+			SELECT $1, active_access.id, $3, $4, $5
+			FROM active_access
+			RETURNING id, family_access_id, csrf_token_hash
+		)
+		SELECT inserted.id, active_access.household_id, inserted.csrf_token_hash
+		FROM inserted
+		JOIN active_access ON active_access.id=inserted.family_access_id`,
+		credential.ID, familyAccessTokenHash, credential.TokenHash,
+		credential.CSRFTokenHash, credential.ExpiresAt, at,
+	).Scan(&result.ID, &result.HouseholdID, &result.CSRFTokenHash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return FamilyWebSessionAccess{}, ErrNotFound
+	}
+	return result, err
+}
+
+func (p *Postgres) ResolveActiveFamilyWebSession(
+	ctx context.Context,
+	tokenHash []byte,
+	at time.Time,
+) (FamilyWebSessionAccess, error) {
+	if len(tokenHash) != AccessTokenHashSize {
+		return FamilyWebSessionAccess{}, ErrNotFound
+	}
+	var result FamilyWebSessionAccess
+	err := p.pool.QueryRow(ctx, `
+		SELECT web_session.id, family_access.household_id, web_session.csrf_token_hash
+		FROM family_web_sessions AS web_session
+		JOIN family_sessions AS family_access ON family_access.id=web_session.family_access_id
+		WHERE web_session.token_hash=$1
+		  AND web_session.revoked_at IS NULL
+		  AND web_session.expires_at > $2
+		  AND family_access.revoked_at IS NULL
+		  AND (family_access.expires_at IS NULL OR family_access.expires_at > $2)`,
+		tokenHash, at.UTC(),
+	).Scan(&result.ID, &result.HouseholdID, &result.CSRFTokenHash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return FamilyWebSessionAccess{}, ErrNotFound
 	}
 	return result, err
 }

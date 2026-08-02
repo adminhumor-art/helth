@@ -1,2 +1,4 @@
-03fcdd49471a4904a95f2e3e747b7b40e9eb7aa8e4468f32c5ea4b08af810443  arm64-v8a/libdata-handle-lib.so
-d9b94deff955b4acf51c03e7d1b9c69b46578410ad5c349aef48362b02aaf39d  armeabi-v7a/libdata-handle-lib.so
+03fcdd49471a4904a95f2e3e747b7b40e9eb7aa8e4468f32c5ea4b08af810443  arm64-v8a/libsladkaya-datahandle-global.so
+7f8e4751d63c66b115066126caed4aed712a6b6c3aa19eed03e41cd8044c260d  arm64-v8a/libsladkaya-datahandle-cn.so
+d9b94deff955b4acf51c03e7d1b9c69b46578410ad5c349aef48362b02aaf39d  armeabi-v7a/libsladkaya-datahandle-global.so
+85e693ba7f53cfe3baf36f1b52e4ed2e2f844b64ed563e9bb42087ee3516e999  armeabi-v7a/libsladkaya-datahandle-cn.so

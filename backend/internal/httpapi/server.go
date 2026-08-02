@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,21 +13,34 @@ import (
 	"time"
 
 	"glucose-monitor/backend/internal/alerts"
+	"glucose-monitor/backend/internal/deviceprovisioning"
 	"glucose-monitor/backend/internal/domain"
 	"glucose-monitor/backend/internal/store"
 )
 
 type Config struct {
-	FreshAfter time.Duration
-	Logger     *slog.Logger
+	FreshAfter       time.Duration
+	Logger           *slog.Logger
+	FamilyWebOrigins []string
+	FamilySessionTTL time.Duration
+	Random           io.Reader
+	DeviceAPIOrigin  string
 }
 
 type Server struct {
-	config Config
-	store  store.Store
-	alerts *alerts.Engine
-	mux    *http.ServeMux
+	config  Config
+	store   store.Store
+	alerts  *alerts.Engine
+	mux     *http.ServeMux
+	origins map[string]struct{}
 }
+
+const (
+	familySessionCookieName = "family_session"
+	defaultFamilySessionTTL = 12 * time.Hour
+	minimumFamilySessionTTL = time.Minute
+	maximumFamilySessionTTL = 24 * time.Hour
+)
 
 func New(config Config, values store.Store, engine *alerts.Engine) *Server {
 	if config.FreshAfter == 0 {
@@ -34,7 +49,27 @@ func New(config Config, values store.Store, engine *alerts.Engine) *Server {
 	if config.Logger == nil {
 		config.Logger = slog.Default()
 	}
-	s := &Server{config: config, store: values, alerts: engine, mux: http.NewServeMux()}
+	if config.FamilySessionTTL <= 0 {
+		config.FamilySessionTTL = defaultFamilySessionTTL
+	}
+	if config.FamilySessionTTL < minimumFamilySessionTTL {
+		config.FamilySessionTTL = minimumFamilySessionTTL
+	}
+	if config.FamilySessionTTL > maximumFamilySessionTTL {
+		config.FamilySessionTTL = maximumFamilySessionTTL
+	}
+	if config.Random == nil {
+		config.Random = rand.Reader
+	}
+	origins := make(map[string]struct{}, len(config.FamilyWebOrigins))
+	for _, origin := range config.FamilyWebOrigins {
+		if origin = strings.TrimSpace(origin); origin != "" {
+			origins[origin] = struct{}{}
+		}
+	}
+	s := &Server{
+		config: config, store: values, alerts: engine, mux: http.NewServeMux(), origins: origins,
+	}
 	s.routes()
 	return s
 }
@@ -65,9 +100,115 @@ func (s *Server) CheckStaleness(ctx context.Context, patientID string, at time.T
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.health)
 	s.mux.HandleFunc("POST /v1/device/measurements", s.ingestMeasurement)
+	s.mux.HandleFunc("POST /v1/device/provision", s.provisionDevice)
+	s.mux.HandleFunc("POST /v1/family/session", s.issueFamilySession)
 	s.mux.HandleFunc("GET /v1/patients/{patientId}/snapshot", s.patientSnapshot)
 	s.mux.HandleFunc("GET /v1/patients/{patientId}/measurements", s.listMeasurements)
 	s.mux.HandleFunc("POST /v1/alerts/{alertId}/acknowledge", s.acknowledgeAlert)
+}
+
+func (s *Server) provisionDevice(w http.ResponseWriter, r *http.Request) {
+	var input deviceProvisionInput
+	if err := decodeJSON(w, r, &input); err != nil {
+		writeProblem(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !deviceprovisioning.ValidActivationCode(input.ActivationCode) {
+		writeProblem(w, http.StatusBadRequest, "activationCode has an invalid format")
+		return
+	}
+	if !domain.IsUUID(input.DeviceID) {
+		writeProblem(w, http.StatusBadRequest, "deviceId must be a UUID")
+		return
+	}
+	if !deviceprovisioning.ValidDeviceNonce(input.DeviceNonce) {
+		writeProblem(w, http.StatusBadRequest, "deviceNonce must be a canonical 256-bit base64url value")
+		return
+	}
+	deviceToken, err := deviceprovisioning.GenerateOpaqueToken(s.config.Random)
+	if err != nil {
+		s.config.Logger.Error("generate device credential", "error", err)
+		writeProblem(w, http.StatusInternalServerError, "device credential could not be issued")
+		return
+	}
+	access, err := s.store.ConsumeDeviceActivation(r.Context(), store.DeviceActivationConsume{
+		CodeHash: store.HashAccessToken(input.ActivationCode), DeviceID: strings.ToLower(input.DeviceID),
+		DeviceNonceHash: store.HashAccessToken(input.DeviceNonce),
+		DeviceTokenHash: store.HashAccessToken(deviceToken), At: time.Now().UTC(),
+	})
+	if errors.Is(err, store.ErrNotFound) {
+		writeProblem(w, http.StatusUnauthorized, "device activation is invalid or unavailable")
+		return
+	}
+	if err != nil {
+		s.config.Logger.Error("consume device activation", "error", err)
+		writeProblem(w, http.StatusInternalServerError, "device credential could not be issued")
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"deviceToken": deviceToken, "apiOrigin": s.config.DeviceAPIOrigin,
+		"deviceId": access.ID, "patientId": access.PatientID,
+		"backendBindingId": access.BackendBindingID, "credentialId": access.CredentialID,
+		"credentialRevision": access.CredentialRevision,
+	})
+}
+
+func (s *Server) issueFamilySession(w http.ResponseWriter, r *http.Request) {
+	if !s.hasTrustedFamilyOrigin(r) {
+		writeProblem(w, http.StatusForbidden, "request origin is not allowed")
+		return
+	}
+	accessToken, ok := bearerToken(r)
+	if !ok {
+		writeProblem(w, http.StatusUnauthorized, "family access is required")
+		return
+	}
+	now := time.Now().UTC()
+	sessionToken, err := s.randomToken()
+	if err != nil {
+		s.config.Logger.Error("generate family session token", "error", err)
+		writeProblem(w, http.StatusInternalServerError, "family session could not be issued")
+		return
+	}
+	csrfToken, err := s.randomToken()
+	if err != nil {
+		s.config.Logger.Error("generate family CSRF token", "error", err)
+		writeProblem(w, http.StatusInternalServerError, "family session could not be issued")
+		return
+	}
+	sessionID, err := s.randomUUID()
+	if err != nil {
+		s.config.Logger.Error("generate family session ID", "error", err)
+		writeProblem(w, http.StatusInternalServerError, "family session could not be issued")
+		return
+	}
+	expiresAt := now.Add(s.config.FamilySessionTTL)
+	_, err = s.store.IssueFamilyWebSession(
+		r.Context(), store.HashAccessToken(accessToken),
+		store.FamilyWebSessionCredential{
+			ID: sessionID, TokenHash: store.HashAccessToken(sessionToken),
+			CSRFTokenHash: store.HashAccessToken(csrfToken), ExpiresAt: expiresAt,
+		},
+		now,
+	)
+	if errors.Is(err, store.ErrNotFound) {
+		writeProblem(w, http.StatusUnauthorized, "family access is invalid or expired")
+		return
+	}
+	if err != nil {
+		s.config.Logger.Error("issue family web session", "error", err)
+		writeProblem(w, http.StatusInternalServerError, "family session could not be issued")
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: familySessionCookieName, Value: sessionToken,
+		Path: "/", Expires: expiresAt, MaxAge: int(s.config.FamilySessionTTL / time.Second),
+		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
+	})
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"csrfToken": csrfToken,
+		"expiresAt": expiresAt,
+	})
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -244,6 +385,10 @@ func (s *Server) acknowledgeAlert(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, http.StatusInternalServerError, "family session could not be authenticated")
 		return
 	}
+	if !s.authorizeFamilyMutation(r, session) {
+		writeProblem(w, http.StatusForbidden, "request origin or CSRF token is invalid")
+		return
+	}
 	alertID, validAlertID := canonicalPathUUID(r.PathValue("alertId"))
 	if !validAlertID {
 		writeProblem(w, http.StatusBadRequest, "alertId must be a UUID")
@@ -274,14 +419,59 @@ func (s *Server) authenticateDevice(r *http.Request) (store.DeviceAccess, error)
 	return s.store.ResolveActiveDevice(r.Context(), store.HashAccessToken(token), time.Now().UTC())
 }
 
-func (s *Server) authenticateFamily(r *http.Request) (store.FamilySessionAccess, error) {
-	cookie, err := r.Cookie("family_session")
-	if err != nil || cookie.Value == "" || len(cookie.Value) > 4096 {
-		return store.FamilySessionAccess{}, store.ErrNotFound
+func (s *Server) authenticateFamily(r *http.Request) (store.FamilyWebSessionAccess, error) {
+	var sessionToken string
+	count := 0
+	for _, cookie := range r.Cookies() {
+		if cookie.Name == familySessionCookieName {
+			count++
+			sessionToken = cookie.Value
+		}
 	}
-	return s.store.ResolveActiveFamilySession(
-		r.Context(), store.HashAccessToken(cookie.Value), time.Now().UTC(),
+	if count != 1 || sessionToken == "" || len(sessionToken) > 4096 {
+		return store.FamilyWebSessionAccess{}, store.ErrNotFound
+	}
+	return s.store.ResolveActiveFamilyWebSession(
+		r.Context(), store.HashAccessToken(sessionToken), time.Now().UTC(),
 	)
+}
+
+func (s *Server) authorizeFamilyMutation(r *http.Request, session store.FamilyWebSessionAccess) bool {
+	if !s.hasTrustedFamilyOrigin(r) || len(session.CSRFTokenHash) != store.AccessTokenHashSize {
+		return false
+	}
+	values := r.Header.Values("X-CSRF-Token")
+	if len(values) != 1 {
+		return false
+	}
+	token := strings.TrimSpace(values[0])
+	if token == "" || len(token) > 4096 {
+		return false
+	}
+	return subtle.ConstantTimeCompare(store.HashAccessToken(token), session.CSRFTokenHash) == 1
+}
+
+func (s *Server) hasTrustedFamilyOrigin(r *http.Request) bool {
+	values := r.Header.Values("Origin")
+	if len(values) != 1 {
+		return false
+	}
+	_, ok := s.origins[strings.TrimSpace(values[0])]
+	return ok
+}
+
+func (s *Server) randomToken() (string, error) {
+	return deviceprovisioning.GenerateOpaqueToken(s.config.Random)
+}
+
+func (s *Server) randomUUID() (string, error) {
+	return deviceprovisioning.GenerateUUID(s.config.Random)
+}
+
+type deviceProvisionInput struct {
+	ActivationCode string `json:"activationCode"`
+	DeviceID       string `json:"deviceId"`
+	DeviceNonce    string `json:"deviceNonce"`
 }
 
 type measurementInput struct {

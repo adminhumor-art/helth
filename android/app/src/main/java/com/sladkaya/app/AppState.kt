@@ -11,6 +11,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 
 data class DiagnosticReadingUi(
+    val eventId: String,
+    val sensorId: String,
     val family: SensorFamily,
     val sensorTimeEpochMs: Long,
     val phoneTimeEpochMs: Long,
@@ -44,6 +46,7 @@ object AppState {
     private var demoGeneration = 0L
     private var diagnosticGeneration = 0L
     private var productGeneration = 0L
+    private var activeProductBindingId: String? = null
     private var pendingDiagnosticReading: DiagnosticReadingUi? = null
     val state = mutable.asStateFlow()
 
@@ -72,9 +75,25 @@ object AppState {
     }
 
     fun onProductStarting(readings: List<GlucoseReading>): Long = synchronized(demoLock) {
+        startProductSession(publicationBindingId = null, readings = readings)
+    }
+
+    fun onProductStarting(
+        publicationBindingId: String,
+        readings: List<GlucoseReading>,
+    ): Long = synchronized(demoLock) {
+        require(PRODUCT_BINDING_ID.matches(publicationBindingId))
+        startProductSession(publicationBindingId, readings)
+    }
+
+    private fun startProductSession(
+        publicationBindingId: String?,
+        readings: List<GlucoseReading>,
+    ): Long {
         demoGeneration += 1
         diagnosticGeneration += 1
         productGeneration += 1
+        activeProductBindingId = publicationBindingId
         pendingDiagnosticReading = null
         val history = readings.filter(GlucoseReading::isEligibleForProductPublication)
             .distinctBy { it.eventId }
@@ -90,7 +109,7 @@ object AppState {
                 diagnostic = DiagnosticUiState(),
             )
         }
-        productGeneration
+        return productGeneration
     }
 
     fun onProductReading(
@@ -139,6 +158,19 @@ object AppState {
             true
         }
 
+    fun onProductAlarmDelivery(
+        publicationBindingId: String,
+        activeAlarms: Set<AlarmKind>,
+    ): Boolean = synchronized(demoLock) {
+        if (activeProductBindingId != publicationBindingId || mutable.value.simulatorMode ||
+            mutable.value.diagnostic.active
+        ) {
+            return@synchronized false
+        }
+        mutable.update { it.copy(activeAlarms = activeAlarms) }
+        true
+    }
+
     fun onDriverState(state: SensorDriverState) {
         mutable.update { it.copy(driverState = state) }
     }
@@ -169,6 +201,7 @@ object AppState {
         demoGeneration += 1
         diagnosticGeneration += 1
         productGeneration += 1
+        activeProductBindingId = null
         pendingDiagnosticReading = null
         mutable.update {
             it.copy(
@@ -187,6 +220,7 @@ object AppState {
         demoGeneration += 1
         diagnosticGeneration += 1
         productGeneration += 1
+        activeProductBindingId = null
         pendingDiagnosticReading = null
         mutable.update {
             it.copy(
@@ -242,6 +276,8 @@ object AppState {
             return@synchronized false
         }
         val candidate = DiagnosticReadingUi(
+            eventId = reading.eventId,
+            sensorId = reading.sensorId,
             family = reading.sensorFamily,
             sensorTimeEpochMs = reading.sensorTimeEpochMs,
             phoneTimeEpochMs = reading.phoneTimeEpochMs,
@@ -269,6 +305,7 @@ object AppState {
         demoGeneration += 1
         diagnosticGeneration += 1
         productGeneration += 1
+        activeProductBindingId = null
         pendingDiagnosticReading = null
         mutable.update {
             it.copy(
@@ -281,4 +318,6 @@ object AppState {
             )
         }
     }
+
+    private val PRODUCT_BINDING_ID = Regex("^[0-9a-f]{64}$")
 }

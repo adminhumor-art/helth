@@ -2,8 +2,19 @@ package com.sladkaya.app.service
 
 internal object SensorServiceActions {
     const val START = "com.sladkaya.app.action.START_SENSOR"
+    const val ENSURE_SENSOR = "com.sladkaya.app.action.ENSURE_SENSOR"
     const val START_DIAGNOSTIC = "com.sladkaya.app.action.START_DIAGNOSTIC_SENSOR"
     const val START_DEMO = "com.sladkaya.app.action.START_DEMO"
+}
+
+internal object ProductSessionRequestPolicy {
+    fun shouldDispatch(action: String?, productSessionDesired: Boolean): Boolean =
+        action == SensorServiceActions.START || !productSessionDesired
+}
+
+internal object ProductAutomaticStartPolicy {
+    fun shouldEnsure(setupOpen: Boolean, diagnosticResumeActive: Boolean): Boolean =
+        !setupOpen && !diagnosticResumeActive
 }
 
 internal enum class SensorServiceStartMode {
@@ -48,6 +59,32 @@ internal object SensorBackgroundStartPolicy {
         hasMandatoryBlePermissions
 }
 
+internal enum class SensorBackgroundLaunchDecision {
+    Diagnostic,
+    Product,
+    None,
+}
+
+internal object SensorBackgroundLaunchPolicy {
+    fun decide(
+        hasConfirmedConfiguration: Boolean,
+        diagnosticWasRunning: Boolean,
+        hasPendingDiagnosticConfiguration: Boolean,
+        hasMandatoryBlePermissions: Boolean,
+    ): SensorBackgroundLaunchDecision = when {
+        SensorBackgroundStartPolicy.shouldResumeDiagnostic(
+            diagnosticWasRunning,
+            hasPendingDiagnosticConfiguration,
+            hasMandatoryBlePermissions,
+        ) -> SensorBackgroundLaunchDecision.Diagnostic
+        SensorBackgroundStartPolicy.shouldStart(
+            hasConfirmedConfiguration,
+            hasMandatoryBlePermissions,
+        ) -> SensorBackgroundLaunchDecision.Product
+        else -> SensorBackgroundLaunchDecision.None
+    }
+}
+
 internal object SensorServiceStopPolicy {
     fun canStop(diagnosticResumeStateCleared: Boolean): Boolean =
         diagnosticResumeStateCleared
@@ -57,7 +94,7 @@ internal object SensorServiceStopPolicy {
 internal class SensorServiceStartPolicy {
     fun select(
         action: String?,
-        hasConfirmedConfiguration: Boolean,
+        hasConfirmedConfiguration: Boolean?,
         hasPendingDiagnosticConfiguration: Boolean = false,
         diagnosticResumeIdentityMatches: Boolean = false,
     ): SensorServiceStartMode = when (action) {
@@ -69,14 +106,16 @@ internal class SensorServiceStartPolicy {
         } else {
             SensorServiceStartMode.SetupRequired
         }
-        SensorServiceActions.START -> if (hasConfirmedConfiguration) {
+        SensorServiceActions.START,
+        SensorServiceActions.ENSURE_SENSOR,
+        -> if (hasConfirmedConfiguration != false) {
             SensorServiceStartMode.ConfiguredSensor
         } else {
             SensorServiceStartMode.SetupRequired
         }
         null -> if (diagnosticResumeIdentityMatches && hasPendingDiagnosticConfiguration) {
             SensorServiceStartMode.DiagnosticSensor
-        } else if (hasConfirmedConfiguration) {
+        } else if (hasConfirmedConfiguration != false) {
             SensorServiceStartMode.ConfiguredSensor
         } else {
             SensorServiceStartMode.SetupRequired

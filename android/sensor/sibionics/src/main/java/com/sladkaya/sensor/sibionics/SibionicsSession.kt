@@ -3,8 +3,8 @@ package com.sladkaya.sensor.sibionics
 import com.sladkaya.core.model.SensorFamily
 import com.sladkaya.core.sensor.SensorConfiguration
 import com.sladkaya.sensor.sibionics.datahandle.DataHandleCommandResult
+import com.sladkaya.sensor.sibionics.datahandle.DataHandleGateway
 import com.sladkaya.sensor.sibionics.datahandle.DataHandleVariant
-import com.sladkaya.sensor.sibionics.datahandle.SibionicsDataHandle
 
 internal sealed interface SessionAction {
     data class Write(
@@ -30,7 +30,7 @@ internal interface Gs1CommandCodec {
 }
 
 internal class OfficialGs1CommandCodec(
-    private val dataHandle: SibionicsDataHandle,
+    private val dataHandle: DataHandleGateway,
 ) : Gs1CommandCodec {
     override fun authentication(protocolVariant: Int, bluetoothAddress: String): Gs1CommandResult {
         val variant = DataHandleVariant.entries.firstOrNull {

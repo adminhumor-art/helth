@@ -1,7 +1,6 @@
 package com.sladkaya.sensor.sibionics
 
-import com.sladkaya.core.data.ActiveProductPublicationConfiguration
-import com.sladkaya.core.data.ProductPublicationConfigurationReader
+import com.sladkaya.core.data.ActiveLocalSensorBinding
 import com.sladkaya.core.model.SensorFamily
 import java.util.concurrent.CancellationException
 
@@ -20,11 +19,11 @@ internal sealed interface Gs1ProductPermitIssueResult {
 }
 
 /**
- * Opaque snapshot issued only from the active durable approval and publication
- * binding. Ordinary onboarding data cannot construct this product capability.
+ * Opaque snapshot issued only from the active durable local sensor binding.
+ * Remote access is optional and ordinary onboarding data cannot construct this capability.
  */
 internal class Gs1ProductPermit private constructor(
-    internal val active: ActiveProductPublicationConfiguration,
+    internal val active: ActiveLocalSensorBinding,
     private val profileIdentity: ProfileIdentity,
 ) {
     internal fun belongsTo(profile: Gs1DiagnosticActivationProfile): Boolean =
@@ -32,7 +31,7 @@ internal class Gs1ProductPermit private constructor(
 
     companion object {
         internal fun verified(
-            active: ActiveProductPublicationConfiguration,
+            active: ActiveLocalSensorBinding,
             profile: Gs1DiagnosticActivationProfile,
         ): Gs1ProductPermit? {
             val approval = active.approval
@@ -68,8 +67,12 @@ internal class Gs1ProductPermit private constructor(
     }
 }
 
+internal fun interface Gs1ProductConfigurationReader {
+    suspend fun active(): ActiveLocalSensorBinding?
+}
+
 internal class Gs1ProductPermitIssuer(
-    private val reader: ProductPublicationConfigurationReader,
+    private val reader: Gs1ProductConfigurationReader,
 ) {
     suspend fun issue(
         profile: Gs1DiagnosticActivationProfile,

@@ -68,7 +68,10 @@ class SensorCoreDaoTest {
 
         val disposition = dao.commit(record().toEntityBundle())
 
-        assertEquals(listOf("raw", "result", "measurement", "outbox", "checkpoint"), dao.calls)
+        assertEquals(
+            listOf("raw", "result", "measurement", "outbox", "local-effect", "checkpoint"),
+            dao.calls,
+        )
         assertEquals(SensorCoreCommitDisposition.COMMITTED, disposition)
     }
 
@@ -86,6 +89,7 @@ class SensorCoreDaoTest {
     fun approvedNonPublishableStepAdvancesLineageWithoutMeasurementOrOutbox() = runBlocking {
         val dao = RecordingSensorCoreDao()
         val approvedContext = testPublicationContext().approvedCheckpointContext()
+        dao.deleteActiveRemotePublicationBinding(approvedContext.publicationBindingId)
         val stateOnly = record(
             sequence = 2,
             publishable = false,
@@ -97,6 +101,7 @@ class SensorCoreDaoTest {
         assertEquals(approvedContext.approvalId, dao.savedCheckpoint?.publicationApprovalId)
         assertEquals(null, dao.measurement(stateOnly.raw.eventId))
         assertEquals(null, dao.outboxByEvent(stateOnly.raw.eventId))
+        assertEquals(null, dao.localEffectByEvent(stateOnly.raw.eventId))
     }
 
     @Test
@@ -118,6 +123,27 @@ class SensorCoreDaoTest {
     }
 
     @Test
+    fun productMeasurementMustBeARealtimeAlarmEligibleSample() {
+        val historicalDao = RecordingSensorCoreDao()
+        val historical = record(historyDistance = 1).toEntityBundle()
+
+        assertThrows(SensorCoreConflictException::class.java) {
+            runBlocking { historicalDao.commit(historical) }
+        }
+        assertEquals(emptyList<String>(), historicalDao.calls)
+
+        val alarmIneligibleDao = RecordingSensorCoreDao()
+        val alarmIneligible = record().let { value ->
+            value.copy(result = value.result.copy(alarmEligible = false)).toEntityBundle()
+        }
+        assertThrows(SensorCoreConflictException::class.java) {
+            runBlocking { alarmIneligibleDao.commit(alarmIneligible) }
+        }
+
+        assertEquals(emptyList<String>(), alarmIneligibleDao.calls)
+    }
+
+    @Test
     fun exactRetryIsAcceptedWithoutReplacingTheSameCheckpoint() = runBlocking {
         val dao = RecordingSensorCoreDao()
         val bundle = record().toEntityBundle()
@@ -127,7 +153,7 @@ class SensorCoreDaoTest {
         val disposition = dao.commit(bundle)
 
         assertEquals(SensorCoreCommitDisposition.ALREADY_COMMITTED, disposition)
-        assertEquals(listOf("raw", "result", "measurement", "outbox"), dao.calls)
+        assertEquals(listOf("raw", "result", "measurement", "outbox", "local-effect"), dao.calls)
         assertEquals(2, dao.savedCheckpoint?.sequence)
     }
 
@@ -334,6 +360,58 @@ class SensorCoreDaoTest {
     }
 
     @Test
+    fun explicitPrototypeActivationApprovesExactDiagnosticAnchorAndLocalBindingTogether() =
+        runBlocking {
+            val dao = RecordingSensorCoreDao(productReady = false)
+            (1..46).forEach { sequence ->
+                dao.commit(
+                    record(
+                        sequence = sequence,
+                        publishable = false,
+                        algorithmErrorCode = null,
+                    ).toEntityBundle(),
+                )
+            }
+            val eventId = "sensor-a:event-46"
+            val raw = checkNotNull(dao.rawByEvent(eventId))
+            val anchor = PhysicalSensorDiagnosticAnchor(
+                protocol = checkNotNull(dao.protocolBinding("sensor-a")).toRecord(),
+                raw = raw.toPhysicalActivationRecord(),
+                result = checkNotNull(dao.resultByEvent(eventId)).toPhysicalActivationRecord(),
+                checkpoint = checkNotNull(dao.checkpoint("sensor-a")).toRecord(),
+            )
+            val approval = PhysicalSensorActivationIdentity.localPrototypeApproval(
+                anchor = anchor,
+                nativeBinarySetSha256 = "12".repeat(32),
+                nativeDatahandleBinarySetSha256 = "34".repeat(32),
+            )
+            val publicationBindingId =
+                PhysicalSensorActivationIdentity.localPublicationBindingId(approval.approvalId)
+
+            assertEquals(
+                SensorCoreCommitDisposition.COMMITTED,
+                dao.approveAndActivatePhysicalSensor(
+                    diagnosticEventId = eventId,
+                    approval = approval.toEntity(),
+                    publicationBindingId = publicationBindingId,
+                    expectedPreviousPublicationBindingId = null,
+                ),
+            )
+            assertEquals(
+                SensorCoreCommitDisposition.ALREADY_COMMITTED,
+                dao.approveAndActivatePhysicalSensor(
+                    diagnosticEventId = eventId,
+                    approval = approval.toEntity(),
+                    publicationBindingId = publicationBindingId,
+                    expectedPreviousPublicationBindingId = null,
+                ),
+            )
+            assertEquals(approval.toEntity(), dao.physicalApproval(approval.approvalId))
+            assertEquals(publicationBindingId, dao.activeSensorBinding()?.publicationBindingId)
+            assertEquals(approval.approvalId, dao.activeSensorBinding()?.approvalId)
+        }
+
+    @Test
     fun physicalBluetoothIdentityCannotChangeMidSensor() = runBlocking {
         val dao = RecordingSensorCoreDao()
         dao.commit(record(sequence = 2).toEntityBundle())
@@ -380,11 +458,16 @@ class SensorCoreDaoTest {
         dao.commit(record(sequence = 1, publishable = false).toEntityBundle())
         val approval = testPhysicalApproval(checkNotNull(dao.savedCheckpoint))
         dao.approvePhysicalSensor(approval.toEntity())
+        val binding = testPublicationBinding(approval)
         dao.commit(record(sequence = 2, publishable = false).toEntityBundle())
-        val binding = testPublicationBinding(approval).toEntity()
+        dao.activateLocalSensorBinding(
+            approvalId = approval.approvalId,
+            publicationBindingId = binding.publicationBindingId,
+            expectedPreviousPublicationBindingId = null,
+        )
 
         assertThrows(SensorCoreConflictException::class.java) {
-            runBlocking { dao.activatePublicationBinding(binding, null) }
+            runBlocking { dao.activatePublicationBinding(binding.toEntity(), null) }
         }
         assertEquals(null, dao.activePublicationBinding())
     }
@@ -403,10 +486,29 @@ class SensorCoreDaoTest {
 
         assertEquals(
             SensorCoreCommitDisposition.COMMITTED,
-            dao.activatePublicationBinding(rotated, previous.publicationBindingId),
+            dao.activatePublicationBinding(rotated, previous.remotePublicationBindingId),
         )
         assertEquals(rotated, dao.activePublicationBinding())
         assertEquals(approval.toEntity(), dao.physicalApproval(approval.approvalId))
+    }
+
+    @Test
+    fun malformedOrMissingRemoteRouteNeverHidesTheActiveLocalSensor() = runBlocking {
+        val dao = RecordingSensorCoreDao()
+        val expectedLocal = checkNotNull(dao.activeSensorBinding())
+        val repository = LocalSensorBindingRepository(dao)
+
+        dao.corruptActiveRemoteRoute()
+        val withCorruptRemote = checkNotNull(repository.active())
+        assertEquals(expectedLocal.publicationBindingId, withCorruptRemote.publicationBindingId)
+        assertEquals(expectedLocal.approvalId, withCorruptRemote.approval.approvalId)
+        assertEquals(null, withCorruptRemote.remotePublicationBinding)
+
+        dao.removeActiveRemoteRouteRecord()
+        val withMissingRemote = checkNotNull(repository.active())
+        assertEquals(expectedLocal.publicationBindingId, withMissingRemote.publicationBindingId)
+        assertEquals(expectedLocal.approvalId, withMissingRemote.approval.approvalId)
+        assertEquals(null, withMissingRemote.remotePublicationBinding)
     }
 
     @Test
@@ -435,9 +537,15 @@ class SensorCoreDaoTest {
         val approvalB = testPhysicalApproval(anchorB)
         dao.approvePhysicalSensor(approvalB.toEntity())
         val bindingB = testPublicationBinding(approvalB).copy(
+            publicationBindingId = "78".repeat(32),
             credentialId = "credential-b",
             expectedDeviceId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
             createdAtEpochMs = 1_700_000_064_000L,
+        )
+        dao.activateLocalSensorBinding(
+            approvalId = approvalB.approvalId,
+            publicationBindingId = bindingB.publicationBindingId,
+            expectedPreviousPublicationBindingId = null,
         )
         dao.activatePublicationBinding(bindingB.toEntity(), null)
         val contextB = ProductPublicationContext.verifiedRuntime(
@@ -490,6 +598,7 @@ class SensorCoreDaoTest {
             eventId = lease.eventId,
             approvalId = lease.approvalId,
             publicationBindingId = lease.publicationBindingId,
+            remotePublicationBindingId = lease.remotePublicationBindingId,
             httpsOrigin = lease.httpsOrigin,
             backendBindingId = lease.backendBindingId,
             credentialId = lease.credentialId,
@@ -611,6 +720,7 @@ class SensorCoreDaoTest {
         sensorTimeWasClamped: Boolean = false,
         addTimeSeconds: Int? = null,
         publishable: Boolean = true,
+        algorithmErrorCode: String? = if (publishable) null else "DIAGNOSTIC_ONLY",
         productContext: ProductPublicationContext? = testPublicationContext().takeIf { publishable },
         approvedCheckpointContext: ApprovedCheckpointContext? =
             productContext?.approvedCheckpointContext(),
@@ -654,7 +764,7 @@ class SensorCoreDaoTest {
             initializationMode = "STANDARD",
             publishable = publishable,
             alarmEligible = publishable,
-            algorithmErrorCode = if (publishable) null else "DIAGNOSTIC_ONLY",
+            algorithmErrorCode = algorithmErrorCode,
             publicationApprovalId = approvedCheckpointContext?.approvalId,
         )
         val checkpoint = SensorAlgorithmCheckpointRecord(
@@ -771,8 +881,12 @@ private class RecordingSensorCoreDao(
     private val approvals = mutableMapOf<String, PhysicalSensorApprovalEntity>()
     private val publicationBindings = mutableMapOf<String, ProductPublicationBindingEntity>()
     private var activePublication: ActiveSensorPublicationBindingEntity? = null
+    private val activeRemotePublications =
+        mutableMapOf<String, ActiveRemotePublicationBindingEntity>()
     private val outbox = mutableMapOf<String, UploadOutboxEntity>()
+    private val localEffects = mutableMapOf<String, LocalReadingEffectEntity>()
     private var nextOutboxId = 1L
+    private var nextLocalEffectId = 1L
 
     init {
         if (productReady) {
@@ -781,15 +895,37 @@ private class RecordingSensorCoreDao(
             val approval = testPhysicalApproval(anchor).toEntity()
             approvals[approval.approvalId] = approval
             val publication = testPublicationBinding(approval.toRecord()).toEntity()
-            publicationBindings[publication.publicationBindingId] = publication
+            publicationBindings[publication.remotePublicationBindingId] = publication
             activePublication = ActiveSensorPublicationBindingEntity(
                 ACTIVE_PUBLICATION_BINDING_SLOT,
                 publication.publicationBindingId,
+                approval.approvalId,
             )
+            activeRemotePublications[publication.publicationBindingId] =
+                ActiveRemotePublicationBindingEntity(
+                    publicationBindingId = publication.publicationBindingId,
+                    approvalId = approval.approvalId,
+                    remotePublicationBindingId = publication.remotePublicationBindingId,
+                )
         }
     }
     val savedCheckpoint: SensorAlgorithmCheckpointEntity?
         get() = checkpoints.values.singleOrNull()
+
+    fun corruptActiveRemoteRoute() {
+        val local = checkNotNull(activePublication)
+        val pointer = checkNotNull(activeRemotePublications[local.publicationBindingId])
+        val route = checkNotNull(publicationBindings[pointer.remotePublicationBindingId])
+        publicationBindings[pointer.remotePublicationBindingId] = route.copy(
+            httpsOrigin = "http://api.sladkaya.test",
+        )
+    }
+
+    fun removeActiveRemoteRouteRecord() {
+        val local = checkNotNull(activePublication)
+        val pointer = checkNotNull(activeRemotePublications[local.publicationBindingId])
+        publicationBindings.remove(pointer.remotePublicationBindingId)
+    }
 
     override suspend fun insertProtocolBinding(value: SensorProtocolBindingEntity): Long {
         val conflict = protocolBindings.containsKey(value.sensorId) ||
@@ -820,21 +956,60 @@ private class RecordingSensorCoreDao(
         approvals[approvalId]
 
     override suspend fun insertPublicationBinding(value: ProductPublicationBindingEntity): Long {
-        if (publicationBindings.containsKey(value.publicationBindingId)) return -1L
-        publicationBindings[value.publicationBindingId] = value
+        if (publicationBindings.containsKey(value.remotePublicationBindingId)) return -1L
+        publicationBindings[value.remotePublicationBindingId] = value
         return 1L
     }
 
     override suspend fun publicationBinding(
-        publicationBindingId: String,
-    ): ProductPublicationBindingEntity? = publicationBindings[publicationBindingId]
+        remotePublicationBindingId: String,
+    ): ProductPublicationBindingEntity? = publicationBindings[remotePublicationBindingId]
 
     override suspend fun activePublicationBinding(): ProductPublicationBindingEntity? =
-        activePublication?.let { publicationBindings[it.publicationBindingId] }
+        activePublication?.let { active ->
+            activeRemotePublications[active.publicationBindingId]
+                ?.takeIf { it.approvalId == active.approvalId }
+                ?.let { publicationBindings[it.remotePublicationBindingId] }
+        }
+
+    override suspend fun activeSensorBinding(): ActiveSensorPublicationBindingEntity? =
+        activePublication
 
     override suspend fun replaceActivePublicationBinding(value: ActiveSensorPublicationBindingEntity) {
         activePublication = value
     }
+
+    override suspend fun activeRemotePublicationBinding(
+        publicationBindingId: String,
+    ): ActiveRemotePublicationBindingEntity? = activeRemotePublications[publicationBindingId]
+
+    override suspend fun insertActiveRemotePublicationBinding(
+        value: ActiveRemotePublicationBindingEntity,
+    ): Long {
+        if (activeRemotePublications.containsKey(value.publicationBindingId)) return -1L
+        activeRemotePublications[value.publicationBindingId] = value
+        return 1L
+    }
+
+    override suspend fun updateActiveRemotePublicationBinding(
+        publicationBindingId: String,
+        approvalId: String,
+        remotePublicationBindingId: String,
+        expectedPreviousRemotePublicationBindingId: String,
+    ): Int {
+        val current = activeRemotePublications[publicationBindingId] ?: return 0
+        if (current.approvalId != approvalId ||
+            current.remotePublicationBindingId != expectedPreviousRemotePublicationBindingId
+        ) return 0
+        activeRemotePublications[publicationBindingId] = current.copy(
+            remotePublicationBindingId = remotePublicationBindingId,
+        )
+        return 1
+    }
+
+    override suspend fun deleteActiveRemotePublicationBinding(
+        publicationBindingId: String,
+    ): Int = if (activeRemotePublications.remove(publicationBindingId) != null) 1 else 0
 
     override suspend fun deleteActivePublicationBinding(
         expectedPublicationBindingId: String,
@@ -933,6 +1108,16 @@ private class RecordingSensorCoreDao(
     }
 
     override suspend fun outboxByEvent(eventId: String): UploadOutboxEntity? = outbox[eventId]
+
+    override suspend fun insertLocalEffect(value: LocalReadingEffectEntity): Long {
+        calls += "local-effect"
+        if (localEffects.containsKey(value.eventId)) return -1L
+        localEffects[value.eventId] = value.copy(effectId = nextLocalEffectId++)
+        return nextLocalEffectId - 1L
+    }
+
+    override suspend fun localEffectByEvent(eventId: String): LocalReadingEffectEntity? =
+        localEffects[eventId]
 
     override suspend fun outboxByLeaseToken(leaseToken: String): List<UploadOutboxEntity> =
         outbox.values.filter { it.leaseToken == leaseToken }.sortedBy { it.outboxId }
@@ -1037,6 +1222,7 @@ private class RecordingSensorCoreDao(
         eventId: String,
         approvalId: String,
         publicationBindingId: String,
+        remotePublicationBindingId: String,
         httpsOrigin: String,
         backendBindingId: String,
         credentialId: String,
@@ -1050,6 +1236,7 @@ private class RecordingSensorCoreDao(
         val value = outbox[eventId] ?: return 0
         if (value.state != "BLOCKED" || value.approvalId != approvalId ||
             value.publicationBindingId != publicationBindingId ||
+            value.remotePublicationBindingId != remotePublicationBindingId ||
             value.httpsOrigin != httpsOrigin ||
             value.backendBindingId != backendBindingId || value.credentialId != credentialId ||
             value.credentialRevision != credentialRevision ||
@@ -1167,6 +1354,7 @@ private fun testPublicationBinding(
     approval: PhysicalSensorApprovalRecord = testPhysicalApproval(),
 ) = ProductPublicationBindingRecord(
     approvalId = approval.approvalId,
+    publicationBindingId = "56".repeat(32),
     httpsOrigin = "https://api.sladkaya.test",
     backendBindingId = "backend-binding-a",
     credentialId = "credential-a",

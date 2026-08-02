@@ -15,7 +15,6 @@ import com.sladkaya.sensor.sibionics.Gs1MarketProfile
 import com.sladkaya.sensor.sibionics.Gs1PackageCodeInput
 import org.junit.After
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -68,21 +67,6 @@ class PendingDiagnosticGs1OnboardingStateStoreTest {
         assertEquals(
             Gs1OnboardingOpenError.STORAGE_UNAVAILABLE,
             (opened as Gs1OnboardingOpenResult.Failure).error,
-        )
-    }
-
-    @Test
-    fun pendingDraftNeverCreatesAConfirmedConfigurationMarker() {
-        val machine = openMachine(PendingDiagnosticGs1OnboardingStateStore(context))
-        machine.submitPackageCode(
-            SensorFamily.SIBIONICS_GS1,
-            Gs1PackageCodeInput.Manual("Ab1Zcd34"),
-        )
-
-        assertFalse(ConfirmedSensorConfigurationStore(context).hasConfirmedConfiguration())
-        assertFalse(
-            context.getSharedPreferences(CONFIRMED_PREFERENCES, Context.MODE_PRIVATE)
-                .contains("confirmed"),
         )
     }
 
@@ -144,7 +128,6 @@ class PendingDiagnosticGs1OnboardingStateStoreTest {
         assertTrue(store.clearDraft())
 
         assertEquals(null, store.load())
-        assertFalse(ConfirmedSensorConfigurationStore(context).hasConfirmedConfiguration())
     }
 
     private fun openMachine(
@@ -156,15 +139,17 @@ class PendingDiagnosticGs1OnboardingStateStoreTest {
     }
 
     private fun clearTestPreferences() {
-        listOf(PENDING_PREFERENCES, CONFIRMED_PREFERENCES).forEach { name ->
-            check(context.getSharedPreferences(name, Context.MODE_PRIVATE).edit().clear().commit())
-        }
+        check(
+            context.getSharedPreferences(PENDING_PREFERENCES, Context.MODE_PRIVATE)
+                .edit()
+                .clear()
+                .commit(),
+        )
     }
 
     private companion object {
         const val PENDING_PREFERENCES = "pending_diagnostic_gs1_onboarding"
         const val PENDING_KEY = "snapshot_current"
-        const val CONFIRMED_PREFERENCES = "confirmed_sensor_configuration"
     }
 }
 

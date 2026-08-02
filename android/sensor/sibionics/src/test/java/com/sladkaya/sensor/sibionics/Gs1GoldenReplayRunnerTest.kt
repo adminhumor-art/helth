@@ -74,17 +74,16 @@ class Gs1GoldenReplayRunnerTest {
     }
 
     @Test
-    fun factionTraceReplaysWithTheExactFactionSessionConfiguration() {
+    fun globalFactionDecodeTraceReplaysWithTheOfficialStandardSessionConfiguration() {
         val standard = syntheticGoldenTrace()
         val trace = standard.copy(
             sensitivityEvidence = standard.sensitivityEvidence.copy(
-                initializationMode = AlgorithmInitializationMode.FACTION,
                 encoding = SensitivityEncoding.FACTION,
             ),
         )
         val factory = RecordingSessionFactory(
             trace = trace,
-            initializationMode = AlgorithmInitializationMode.FACTION,
+            initializationMode = AlgorithmInitializationMode.STANDARD,
             sensitivityEncoding = SensitivityEncoding.FACTION,
         )
 
@@ -97,7 +96,7 @@ class Gs1GoldenReplayRunnerTest {
         assertEquals(2, result.report.matchedSamples)
         assertEquals(listOf(1, 2), factory.nativeControl.processedIndexes)
         assertEquals(
-            listOf(AlgorithmInitializationMode.FACTION, AlgorithmInitializationMode.FACTION),
+            listOf(AlgorithmInitializationMode.STANDARD, AlgorithmInitializationMode.STANDARD),
             factory.nativeControl.initializationModes,
         )
     }
