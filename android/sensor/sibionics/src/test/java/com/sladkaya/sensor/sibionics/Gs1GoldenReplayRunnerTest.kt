@@ -74,6 +74,69 @@ class Gs1GoldenReplayRunnerTest {
     }
 
     @Test
+    fun factionTraceReplaysWithTheExactFactionSessionConfiguration() {
+        val standard = syntheticGoldenTrace()
+        val trace = standard.copy(
+            sensitivityEvidence = standard.sensitivityEvidence.copy(
+                initializationMode = AlgorithmInitializationMode.FACTION,
+                encoding = SensitivityEncoding.FACTION,
+            ),
+        )
+        val factory = RecordingSessionFactory(
+            trace = trace,
+            initializationMode = AlgorithmInitializationMode.FACTION,
+            sensitivityEncoding = SensitivityEncoding.FACTION,
+        )
+
+        val result = runner(
+            RecordingVerifier(decodedPackets(trace)),
+            factory,
+        ).run(readyPlan(trace))
+
+        result as Gs1GoldenReplayResult.Matched
+        assertEquals(2, result.report.matchedSamples)
+        assertEquals(listOf(1, 2), factory.nativeControl.processedIndexes)
+        assertEquals(
+            listOf(AlgorithmInitializationMode.FACTION, AlgorithmInitializationMode.FACTION),
+            factory.nativeControl.initializationModes,
+        )
+    }
+
+    @Test
+    fun v115TraceReplaysThroughTheExactDecoderWithDurableTimeProvenance() {
+        val trace = syntheticV115GoldenTrace()
+        val factory = RecordingSessionFactory(trace)
+
+        val result = runner(
+            Gs1V115VerifiedPacketDecoder(),
+            factory,
+        ).run(readyPlan(trace))
+
+        result as Gs1GoldenReplayResult.Matched
+        assertEquals(3, result.report.matchedSamples)
+        assertEquals(2, result.report.contextsOpened)
+        assertEquals(listOf(1, 2, 3), factory.nativeControl.processedIndexes)
+        assertEquals(listOf(null, 1), factory.restoredIndexes)
+    }
+
+    @Test
+    fun v115TraceFailsClosedWhenReplayedThroughTheV120Decoder() {
+        val trace = syntheticV115GoldenTrace()
+        val factory = RecordingSessionFactory(trace)
+        val oppositeDecoder = Gs1VerifiedPacketDecoder(
+            nativeSplitter = Gs1NativeSplitter {
+                error("V115 bytes must be rejected before the V120 native splitter")
+            },
+        )
+
+        val result = runner(oppositeDecoder, factory).run(readyPlan(trace))
+
+        result as Gs1GoldenReplayResult.Failed
+        assertEquals(Gs1GoldenReplayFailure.DECODE_OUTCOME_MISMATCH, result.failure)
+        assertTrue(factory.nativeControl.processedIndexes.isEmpty())
+    }
+
+    @Test
     fun wrongExactSensitivityInputFailsHmacBindingEvenWhenMetadataOtherwiseMatches() {
         val trace = syntheticGoldenTrace()
         val factory = RecordingSessionFactory(
@@ -425,7 +488,10 @@ private class RecordingVerifier(
 ) : Gs1PacketVerifier {
     val packetHashes = mutableListOf<String>()
 
-    override fun decode(encryptedPacket: ByteArray): Gs1VerifiedPacketResult {
+    override fun decode(
+        encryptedPacket: ByteArray,
+        receivedAtEpochMs: Long,
+    ): Gs1VerifiedPacketResult {
         val hash = encryptedPacket.sha256()
         packetHashes += hash
         return Gs1VerifiedPacketResult.Success(
@@ -455,12 +521,12 @@ private class RecordingSessionFactory(
             coefficient = sensitivityCoefficient,
             encoding = sensitivityEncoding,
         )
-        val native = ReplayNative(nativeControl)
+        val native = ReplayNative(nativeControl, trace.algorithmProfile)
         return when (
             val opened = SibionicsAlgorithmSession.open(
                 profile = trace.algorithmProfile,
                 sensitivityToken = sensitivity.token,
-                initializationMode = AlgorithmInitializationMode.STANDARD,
+                initializationMode = initializationMode,
                 checkpoint = checkpoint,
                 native = native,
             )
@@ -516,13 +582,15 @@ private class ReplayNativeControl(
 ) {
     val processedIndexes = mutableListOf<Int>()
     val restoredStateIndexes = mutableListOf<Int?>()
+    val initializationModes = mutableListOf<AlgorithmInitializationMode>()
 }
 
 private class ReplayNative(
     private val control: ReplayNativeControl,
+    override val profile: AlgorithmProfile,
 ) : NativeAlgorithmApi {
-    override val profile = AlgorithmProfile.V116A
     override val binarySetId = "synthetic-binary-set-v1"
+    override val supportedInitializationModes = AlgorithmInitializationMode.entries.toSet()
     override val algorithmVersion = "synthetic-native-v1"
 
     override fun createContext(): NativeAlgorithmContext = ReplayContext()
@@ -531,7 +599,10 @@ private class ReplayNative(
         context: NativeAlgorithmContext,
         sensitivityToken: String,
         mode: AlgorithmInitializationMode,
-    ): Int = 1
+    ): Int {
+        control.initializationModes += mode
+        return 1
+    }
 
     override fun restoreState(context: NativeAlgorithmContext, state: ByteArray): Int {
         if (control.failRestore) return 0

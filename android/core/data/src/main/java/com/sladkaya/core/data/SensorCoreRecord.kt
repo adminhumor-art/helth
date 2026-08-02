@@ -18,6 +18,8 @@ class RawSensorSampleRecord(
     val temperatureRaw: Int,
     val historyDistance: Int,
     val transportVariant: Int,
+    val sensorTimeWasClamped: Boolean = false,
+    val addTimeSeconds: Int? = null,
 ) {
     private val packet = packet.copyOf()
 
@@ -31,6 +33,8 @@ class RawSensorSampleRecord(
         require(packet.size <= MAX_PACKET_BYTES)
         require(historyDistance >= 0)
         require(transportVariant >= 0)
+        require(addTimeSeconds == null || addTimeSeconds in 0..0xffff)
+        require(!sensorTimeWasClamped || addTimeSeconds != null)
         require(packetSha256 == this.packet.sha256())
     }
 
@@ -90,7 +94,7 @@ class SensorAlgorithmCheckpointRecord(
     val sensorFamily: SensorFamily,
     val transportVariant: Int,
     val transportProtocol: String,
-    val dataHandleBinarySetId: String,
+    val transportCodecId: String,
     val sequence: Int,
     val sensorTimeEpochMs: Long,
     val algorithmProfile: String,
@@ -114,7 +118,7 @@ class SensorAlgorithmCheckpointRecord(
         require(sensorFamily != SensorFamily.SIMULATOR)
         require(transportVariant >= 0)
         require(transportProtocol.isNotBlank())
-        require(dataHandleBinarySetId.isNotBlank())
+        require(transportCodecId.isNotBlank())
         require(sequence >= 0)
         require(sensorTimeEpochMs > 0)
         require(algorithmProfile.isNotBlank())
@@ -141,7 +145,7 @@ class SensorAlgorithmCheckpointRecord(
         sensorFamily: SensorFamily = this.sensorFamily,
         transportVariant: Int = this.transportVariant,
         transportProtocol: String = this.transportProtocol,
-        dataHandleBinarySetId: String = this.dataHandleBinarySetId,
+        transportCodecId: String = this.transportCodecId,
         sequence: Int = this.sequence,
         sensorTimeEpochMs: Long = this.sensorTimeEpochMs,
         algorithmProfile: String = this.algorithmProfile,
@@ -162,7 +166,7 @@ class SensorAlgorithmCheckpointRecord(
         sensorFamily = sensorFamily,
         transportVariant = transportVariant,
         transportProtocol = transportProtocol,
-        dataHandleBinarySetId = dataHandleBinarySetId,
+        transportCodecId = transportCodecId,
         sequence = sequence,
         sensorTimeEpochMs = sensorTimeEpochMs,
         algorithmProfile = algorithmProfile,
@@ -232,7 +236,7 @@ data class AtomicSensorCoreRecord(
 
 private val TOKEN_SOURCES = setOf("PACKAGE_CODE")
 private val SENSITIVITY_ENCODINGS = setOf("NORMAL", "FACTION")
-private val INITIALIZATION_MODES = setOf("STANDARD")
+private val INITIALIZATION_MODES = setOf("STANDARD", "FACTION")
 private val CANONICAL_BLUETOOTH_ADDRESS = Regex("^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$")
 private val ALGORITHM_STATE_SIZES = mapOf("V116A" to 2_480, "V115G" to 2_336)
 private const val CHECKPOINT_SCHEMA_VERSION = 1

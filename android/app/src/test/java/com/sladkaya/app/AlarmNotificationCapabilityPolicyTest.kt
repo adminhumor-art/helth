@@ -2,6 +2,8 @@ package com.sladkaya.app
 
 import android.app.NotificationManager
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AlarmNotificationCapabilityPolicyTest {
@@ -100,5 +102,15 @@ class AlarmNotificationCapabilityPolicyTest {
                 false,
             ),
         )
+    }
+
+    @Test
+    fun safetyWarningsSeparateLocalDeliveryFromTheStillRunningDataPath() {
+        assertTrue(AlarmSafetyUxCopy.NOTIFICATIONS_BLOCKED_DETAIL.contains("Локальная"))
+        assertTrue(AlarmSafetyUxCopy.NOTIFICATIONS_BLOCKED_DETAIL.contains("продолжа"))
+        assertFalse(AlarmSafetyUxCopy.NOTIFICATIONS_BLOCKED_DETAIL.contains("остановлен"))
+        assertTrue(AlarmSafetyUxCopy.EXACT_ALARM_BLOCKED_DETAIL.contains("тревог"))
+        assertTrue(AlarmSafetyUxCopy.EXACT_ALARM_BLOCKED_DETAIL.contains("виджет"))
+        assertTrue(AlarmSafetyUxCopy.EXACT_ALARM_BLOCKED_DETAIL.contains("продолжа"))
     }
 }

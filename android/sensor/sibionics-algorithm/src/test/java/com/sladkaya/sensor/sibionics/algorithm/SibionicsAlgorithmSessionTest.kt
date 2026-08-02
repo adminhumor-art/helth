@@ -97,7 +97,7 @@ class SibionicsAlgorithmSessionTest {
     }
 
     @Test
-    fun unverifiedFactionInitializationIsRejectedBeforeAnyNativeCall() {
+    fun factionInitializationIsRejectedWhenNativeProfileDoesNotDeclareIt() {
         val native = RecordingNativeAlgorithmApi(AlgorithmProfile.V116A)
 
         val result = SibionicsAlgorithmSession.open(
@@ -110,6 +110,84 @@ class SibionicsAlgorithmSessionTest {
 
         assertEquals(
             AlgorithmErrorCode.UNSUPPORTED_INITIALIZATION_MODE,
+            (result as AlgorithmOpenResult.Failure).error.code,
+        )
+        assertTrue(native.calls.isEmpty())
+    }
+
+    @Test
+    fun declaredFactionInitializationUsesExactModeAndSurvivesCheckpointRestore() {
+        val native = RecordingNativeAlgorithmApi(
+            profile = AlgorithmProfile.V116A,
+            initializationModes = setOf(
+                AlgorithmInitializationMode.STANDARD,
+                AlgorithmInitializationMode.FACTION,
+            ),
+        )
+        val saved = checkpoint(
+            profile = AlgorithmProfile.V116A,
+            state = ByteArray(AlgorithmProfile.V116A.stateSize) { (it * 13).toByte() },
+            initializationMode = AlgorithmInitializationMode.FACTION,
+        )
+
+        val result = SibionicsAlgorithmSession.open(
+            profile = AlgorithmProfile.V116A,
+            sensitivityToken = saved.sensitivityToken,
+            initializationMode = AlgorithmInitializationMode.FACTION,
+            checkpoint = saved,
+            native = native,
+        )
+
+        assertTrue(result is AlgorithmOpenResult.Success)
+        assertEquals(
+            listOf("create", "init:FACTION:ABCDEFGH", "restore:${saved.nativeState.size}"),
+            native.calls,
+        )
+    }
+
+    @Test
+    fun blankOrUnknownNativeVersionFailsBeforeContextCreation() {
+        listOf("", "   ", "unknown", "UNKNOWN").forEach { invalidVersion ->
+            val native = RecordingNativeAlgorithmApi(
+                profile = AlgorithmProfile.V116A,
+                version = invalidVersion,
+            )
+
+            val result = SibionicsAlgorithmSession.open(
+                profile = AlgorithmProfile.V116A,
+                sensitivityToken = SensitivityToken.packageCode("ABCDEFGH"),
+                initializationMode = AlgorithmInitializationMode.STANDARD,
+                checkpoint = null,
+                native = native,
+            )
+
+            assertEquals(
+                invalidVersion,
+                AlgorithmErrorCode.NATIVE_METADATA_FAILED,
+                (result as AlgorithmOpenResult.Failure).error.code,
+            )
+            assertTrue(native.calls.isEmpty())
+        }
+    }
+
+    @Test
+    fun checkpointFromAnotherAlgorithmVersionFailsBeforeContextCreation() {
+        val native = RecordingNativeAlgorithmApi(AlgorithmProfile.V116A)
+        val saved = checkpoint(
+            profile = AlgorithmProfile.V116A,
+            state = ByteArray(AlgorithmProfile.V116A.stateSize),
+        ).copy(algorithmVersion = "foreign-version")
+
+        val result = SibionicsAlgorithmSession.open(
+            profile = AlgorithmProfile.V116A,
+            sensitivityToken = saved.sensitivityToken,
+            initializationMode = saved.initializationMode,
+            checkpoint = saved,
+            native = native,
+        )
+
+        assertEquals(
+            AlgorithmErrorCode.ALGORITHM_VERSION_MISMATCH,
             (result as AlgorithmOpenResult.Failure).error.code,
         )
         assertTrue(native.calls.isEmpty())
@@ -156,6 +234,34 @@ class SibionicsAlgorithmSessionTest {
             (result as AlgorithmStepResult.Failure).error.code,
         )
         assertTrue(native.calls.isEmpty())
+    }
+
+    @Test
+    fun restoredV115ContextAcceptsIndividuallyClampedNondecreasingTime() {
+        val native = RecordingNativeAlgorithmApi(AlgorithmProfile.V115G)
+        val saved = checkpoint(
+            profile = AlgorithmProfile.V115G,
+            state = native.exportedState,
+            lastProcessedIndex = 1,
+            lastSensorTimeEpochSeconds = 1_700_000_000L,
+        )
+        val opened = SibionicsAlgorithmSession.open(
+            profile = AlgorithmProfile.V115G,
+            sensitivityToken = saved.sensitivityToken,
+            initializationMode = saved.initializationMode,
+            checkpoint = saved,
+            native = native,
+        ) as AlgorithmOpenResult.Success
+        native.calls.clear()
+
+        val result = opened.session.process(
+            input(index = 2, signal = 6.0).copy(
+                sensorTimeEpochSeconds = saved.lastSensorTimeEpochSeconds,
+            ),
+        )
+
+        assertTrue(result is AlgorithmStepResult.Success)
+        assertEquals(listOf("process:2", "state"), native.calls)
     }
 
     @Test
@@ -478,17 +584,19 @@ class SibionicsAlgorithmSessionTest {
         state: ByteArray,
         lastProcessedIndex: Int = 9,
         lastSensorTimeEpochSeconds: Long = 1_700_000_000L,
+        initializationMode: AlgorithmInitializationMode = AlgorithmInitializationMode.STANDARD,
     ): AlgorithmCheckpoint = AlgorithmCheckpoint(
         profile = profile,
         binarySetId = "test-${profile.name}",
         sensitivityToken = SensitivityToken.packageCode("ABCDEFGH"),
-        initializationMode = AlgorithmInitializationMode.STANDARD,
+        initializationMode = initializationMode,
         lastProcessedIndex = lastProcessedIndex,
         lastSensorTimeEpochSeconds = lastSensorTimeEpochSeconds,
         nativeState = state,
         nativeStateSha256 = sha256(state),
         displayOffsetMmolL = 0.0,
         schemaVersion = SibionicsAlgorithmSession.CHECKPOINT_SCHEMA_VERSION,
+        algorithmVersion = "test-${profile.name}-1",
     )
 }
 
@@ -496,8 +604,15 @@ private class TestNativeContext : NativeAlgorithmContext
 
 private class RecordingNativeAlgorithmApi(
     override val profile: AlgorithmProfile,
+    private val initializationModes: Set<AlgorithmInitializationMode> =
+        setOf(AlgorithmInitializationMode.STANDARD),
+    private val version: String = "test-${profile.name}-1",
 ) : NativeAlgorithmApi {
     override val binarySetId: String = "test-${profile.name}"
+    override val supportedInitializationModes: Set<AlgorithmInitializationMode>
+        get() = initializationModes
+    override val algorithmVersion: String
+        get() = version
     val calls = mutableListOf<String>()
     val results = ArrayDeque<NativeAlgorithmSnapshot>()
     var processFailure: Throwable? = null

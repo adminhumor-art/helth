@@ -13,6 +13,37 @@ import org.junit.Test
 
 class Gs1DiagnosticRuntimeTest {
     @Test
+    fun validatedEmptyEnvelopePublishesTransportProgressWithoutMedicalData() = runBlocking {
+        val committed = CompletableDeferred<Gs1DiagnosticRuntimeEvent.Committed>()
+        val runtime = Gs1DiagnosticRuntime(
+            scope = this,
+            opener = Gs1RuntimeCoreOpener {
+                Gs1RuntimeCoreOpenResult.Success(
+                    ScriptedRuntimeLease(
+                        ingest = {
+                            Gs1PacketProcessingResult.Completed(
+                                committedSamples = emptyList(),
+                                validatedTransportEnvelope = true,
+                            )
+                        },
+                    ),
+                )
+            },
+            eventSink = { if (it is Gs1DiagnosticRuntimeEvent.Committed) committed.complete(it) },
+        )
+        val generation = (runtime.start(profile()) as Gs1RuntimeStartResult.Started).generation
+
+        runtime.submit(generation, journaled(1))
+        val event = withTimeout(1_000) { committed.await() }
+
+        assertTrue(event.validatedTransportEnvelope)
+        assertTrue(event.samples.isEmpty())
+        assertTrue(event.diagnostics.isEmpty())
+        runtime.stop(generation)
+        Unit
+    }
+
+    @Test
     fun terminalIngressOutcomePrecedesDiagnosticPublicationAndKeepsReceiptIdentity() = runBlocking {
         val events = Collections.synchronizedList(mutableListOf<Gs1DiagnosticRuntimeEvent>())
         val runtime = Gs1DiagnosticRuntime(
@@ -283,7 +314,7 @@ class Gs1DiagnosticRuntimeTest {
     }
 
     @Test
-    fun stopWaitsForExactPendingRetryBeforeClosingNativeLease() = runBlocking {
+    fun stopCancelsPendingRetryClosesLeaseOnceAndLeavesDurableIngressForRecovery() = runBlocking {
         val retryStarted = CompletableDeferred<Unit>()
         val allowRetry = CompletableDeferred<Unit>()
         val lease = ScriptedRuntimeLease(
@@ -304,21 +335,19 @@ class Gs1DiagnosticRuntimeTest {
         runtime.submit(generation, journaled(1))
         withTimeout(1_000) { retryStarted.await() }
 
-        val stopping = async { runtime.stop() }
-        kotlinx.coroutines.yield()
-        assertTrue(!stopping.isCompleted)
-        assertTrue(!lease.closed.isCompleted)
+        val stopped = withTimeout(1_000) { runtime.stop() }
 
-        allowRetry.complete(Unit)
-        withTimeout(1_000) { stopping.await() }
+        assertEquals(Gs1RuntimeStopResult.PERSISTENCE_PENDING, stopped)
         assertTrue(lease.closed.isCompleted)
+        assertEquals(1, lease.closeCalls)
+        assertTrue(!allowRetry.isCompleted)
     }
 
     @Test
-    fun stopReturnsPersistencePendingInsteadOfHangingOrClosingMutatedCore() = runBlocking {
+    fun persistencePendingStopDoesNotBlockAReplayGeneration() = runBlocking {
         val retryStarted = CompletableDeferred<Unit>()
         val allowRetry = CompletableDeferred<Unit>()
-        val lease = ScriptedRuntimeLease(
+        val firstLease = ScriptedRuntimeLease(
             ingest = { Gs1PacketProcessingResult.PersistenceUnavailable("commit pending") },
             retry = {
                 retryStarted.complete(Unit)
@@ -326,9 +355,13 @@ class Gs1DiagnosticRuntimeTest {
                 completed(1)
             },
         )
+        val replayLease = ScriptedRuntimeLease(ingest = { completed(1) })
+        val leases = ArrayDeque(listOf(firstLease, replayLease))
         val runtime = Gs1DiagnosticRuntime(
             scope = this,
-            opener = Gs1RuntimeCoreOpener { Gs1RuntimeCoreOpenResult.Success(lease) },
+            opener = Gs1RuntimeCoreOpener {
+                Gs1RuntimeCoreOpenResult.Success(leases.removeFirst())
+            },
             eventSink = {},
             retryDelayMillis = 0,
             stopTimeoutMillis = 25,
@@ -340,14 +373,18 @@ class Gs1DiagnosticRuntimeTest {
         val firstStop = withTimeout(500) { runtime.stop() }
 
         assertEquals(Gs1RuntimeStopResult.PERSISTENCE_PENDING, firstStop)
-        assertTrue(!lease.closed.isCompleted)
-        val blockedStart = runtime.start(profile()) as Gs1RuntimeStartResult.Failed
-        assertEquals("PERSISTENCE_PENDING", blockedStart.code)
-
-        allowRetry.complete(Unit)
-        val secondStop = withTimeout(1_000) { runtime.stop() }
+        assertTrue(firstLease.closed.isCompleted)
+        assertEquals(1, firstLease.closeCalls)
+        val replay = runtime.start(profile()) as Gs1RuntimeStartResult.Started
+        assertEquals(
+            Gs1RuntimeSubmission.ACCEPTED,
+            runtime.submit(replay.generation, journaled(1)),
+        )
+        val secondStop = withTimeout(1_000) { runtime.stop(replay.generation) }
         assertEquals(Gs1RuntimeStopResult.DRAINED, secondStop)
-        assertTrue(lease.closed.isCompleted)
+        assertTrue(replayLease.closed.isCompleted)
+        assertEquals(1, replayLease.closeCalls)
+        assertTrue(!allowRetry.isCompleted)
     }
 
     @Test
@@ -433,6 +470,7 @@ class Gs1DiagnosticRuntimeTest {
 
 private class ScriptedRuntimeLease(
     override val initialNextIndex: Int = 1,
+    override val wireProfile: Gs1WireProfile = Gs1WireProfile.V120,
     private val ingest: suspend (ByteArray) -> Gs1PacketProcessingResult = {
         Gs1PacketProcessingResult.InvalidPacket(Gs1VerifiedPacketError.WIRE_PACKET_INVALID, null)
     },
@@ -443,10 +481,12 @@ private class ScriptedRuntimeLease(
     val packets = Collections.synchronizedList(mutableListOf<ByteArray>())
     val closed = CompletableDeferred<Unit>()
     @Volatile var retryCalls = 0
+    @Volatile var closeCalls = 0
 
-    override suspend fun ingest(packet: ByteArray): Gs1PacketProcessingResult {
-        packets += packet.copyOf()
-        return ingest.invoke(packet)
+    override suspend fun ingest(packet: DurablyJournaledGs1Packet): Gs1PacketProcessingResult {
+        val bytes = packet.encryptedPacketCopy()
+        packets += bytes
+        return ingest.invoke(bytes)
     }
 
     override suspend fun retryPending(): Gs1PacketProcessingResult {
@@ -455,6 +495,7 @@ private class ScriptedRuntimeLease(
     }
 
     override fun close() {
+        closeCalls += 1
         closed.complete(Unit)
     }
 }

@@ -34,6 +34,8 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -100,7 +102,9 @@ class Gs1DiagnosticGattDriver internal constructor(
     private val bluetoothManager: BluetoothManager? =
         appContext.getSystemService(BluetoothManager::class.java)
     private val codec = SibionicsPacketCodec()
-    private val dataHandle = SibionicsDataHandle()
+    private val v120CommandCodec: Gs1CommandCodec by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        OfficialGs1CommandCodec(SibionicsDataHandle())
+    }
     private val transportRegistry = Gs1GattTransportRegistry<BluetoothGatt>(
         disconnect = ::safeDisconnect,
         close = ::safeClose,
@@ -180,6 +184,7 @@ class Gs1DiagnosticGattDriver internal constructor(
                         profile = profile,
                         generation = core.generation,
                         initialCoreCursor = core.initialNextIndex,
+                        initialWireProfile = core.wireProfile,
                     )
                 ) {
                     is Gs1PendingIngressRecoveryResult.Completed -> recovery
@@ -235,8 +240,9 @@ class Gs1DiagnosticGattDriver internal constructor(
                         bluetoothAddress = profile.bluetoothAddress,
                         protocolVariant = profile.transportVariant,
                     ),
-                    gs1Commands = OfficialGs1CommandCodec(dataHandle),
+                    gs1CommandProvider = { v120CommandCodec },
                     initialNextIndex = recoveryCursor,
+                    initialWireProfile = completedRecovery.finalWireProfile,
                 )
                 val attempt = Attempt(
                     profile = profile,
@@ -299,7 +305,7 @@ class Gs1DiagnosticGattDriver internal constructor(
 
     suspend fun stop() {
         lifecycle.withLock {
-            desired.getAndSet(null)?.let { reconnectGate.stop(it.reconnectToken) }
+            requestStop()
             val attempt = active.getAndSet(null)
             val drained = if (attempt != null) {
                 stopAttemptLocked(attempt)
@@ -311,6 +317,18 @@ class Gs1DiagnosticGattDriver internal constructor(
             } else {
                 Gs1DiagnosticGattState.PersistencePending
             }
+        }
+    }
+
+    /**
+     * Synchronously revokes reconnect intent and closes the current GATT transport.
+     * The suspend [stop] call must still follow to drain and persist native state.
+     */
+    fun requestStop() {
+        desired.getAndSet(null)?.let { reconnectGate.stop(it.reconnectToken) }
+        active.get()?.let { attempt ->
+            attempt.stopRequested.set(true)
+            closeAttemptTransport(attempt)
         }
     }
 
@@ -662,25 +680,96 @@ class Gs1DiagnosticGattDriver internal constructor(
         }
         attempt.terminalFailure.current()?.let { return it }
         val exactPacket = journaled.encryptedPacketCopy()
-        return when (val packet = codec.decode(attempt.profile.family, exactPacket)) {
+        return when (attempt.session.wireProfile) {
+            Gs1WireProfile.UNRESOLVED -> processUnresolvedNotification(attempt, journaled)
+            Gs1WireProfile.V115 -> processV115Notification(attempt, journaled)
+            Gs1WireProfile.V120 -> processV120Notification(attempt, journaled, exactPacket)
+        }
+    }
+
+    private suspend fun processUnresolvedNotification(
+        attempt: Attempt,
+        journaled: DurablyJournaledGs1Packet,
+    ): GattEvent.Failure? = when (
+        val awaited = coreRuntime.submitAndAwait(attempt.coreGeneration, journaled)
+    ) {
+        Gs1RuntimeAwaitResult.StaleGeneration -> failure("STALE_CORE_GENERATION", null, false)
+        Gs1RuntimeAwaitResult.Closed -> failure("CORE_RUNTIME_CLOSED", null, true)
+        is Gs1RuntimeAwaitResult.Processed -> when (val result = awaited.result) {
+            is Gs1PacketProcessingResult.Completed -> {
+                val resolved = result.resolvedWireProfile
+                    ?: return failure(
+                        "PROTOCOL_RESOLUTION_MISSING",
+                        "Unresolved packet completed without a durable wire profile",
+                        false,
+                    )
+                execute(attempt, attempt.session.confirmWireProfile(resolved))
+            }
+            is Gs1PacketProcessingResult.InvalidPacket -> failure(
+                result.error.name,
+                result.detail,
+                false,
+            )
+            is Gs1PacketProcessingResult.Rejected -> failure(result.code, result.message, false)
+            is Gs1PacketProcessingResult.StorageConflict -> failure(
+                "STORAGE_CONFLICT",
+                result.reason,
+                false,
+            )
+            is Gs1PacketProcessingResult.Closed -> failure("CORE_CLOSED", result.reason, false)
+            is Gs1PacketProcessingResult.PersistenceUnavailable -> failure(
+                "CORE_PERSISTENCE_PENDING",
+                result.message,
+                true,
+            )
+            Gs1PacketProcessingResult.NoPendingCommit -> failure(
+                "PENDING_COMMIT_LOST",
+                null,
+                false,
+            )
+        }
+    }
+
+    private suspend fun processV115Notification(
+        attempt: Attempt,
+        journaled: DurablyJournaledGs1Packet,
+    ): GattEvent.Failure? {
+        val exactPacket = journaled.encryptedPacketCopy()
+        if (Gs1V115WireCodec.isV120Challenge(exactPacket)) {
+            return failure(
+                "WIRE_PROFILE_MISMATCH",
+                "V120 challenge arrived after V115 was durably bound",
+                false,
+            )
+        }
+        val decoded = Gs1V115WireCodec.decode(exactPacket, journaled.receivedAtEpochMs)
+        if (decoded is Gs1V115DecodeResult.Failure) {
+            return persistLiveOutcome(
+                Gs1DiagnosticRuntimeEvent.Finalized(
+                    generation = attempt.coreGeneration,
+                    ingressId = journaled.ingressId,
+                    receivedAtEpochMs = journaled.receivedAtEpochMs,
+                    disposition = Gs1RuntimeIngressDisposition.QUARANTINED,
+                    detail = "V115_${decoded.error.name}",
+                ),
+            ) ?: failure("INVALID_V115_SENSOR_PACKET", decoded.error.name, false)
+        }
+        return submitToCore(attempt, journaled)
+    }
+
+    private suspend fun processV120Notification(
+        attempt: Attempt,
+        journaled: DurablyJournaledGs1Packet,
+        exactPacket: ByteArray,
+    ): GattEvent.Failure? = when (
+        val packet = codec.decode(attempt.profile.family, exactPacket)
+    ) {
             is DecodedPacket.Gs1RawSamples -> {
                 val protocol = attempt.session.onPacket(packet)
                 if (protocol is SessionAction.Failure) {
                     failure("PROTOCOL_REJECTED_DATA", protocol.reason, false)
                 } else {
-                    when (coreRuntime.submit(attempt.coreGeneration, journaled)) {
-                        Gs1RuntimeSubmission.ACCEPTED -> {
-                            attempt.delayedWriteSequence = nextSequence(attempt.delayedWriteSequence)
-                            null
-                        }
-                        Gs1RuntimeSubmission.OVERFLOW -> failure(
-                            "CORE_MAILBOX_OVERFLOW", null, true,
-                        )
-                        Gs1RuntimeSubmission.STALE_GENERATION -> failure(
-                            "STALE_CORE_GENERATION", null, false,
-                        )
-                        Gs1RuntimeSubmission.CLOSED -> failure("CORE_RUNTIME_CLOSED", null, true)
-                    }
+                    submitToCore(attempt, journaled)
                 }
             }
 
@@ -711,6 +800,18 @@ class Gs1DiagnosticGattDriver internal constructor(
                 }
             }
         }
+
+    private fun submitToCore(
+        attempt: Attempt,
+        journaled: DurablyJournaledGs1Packet,
+    ): GattEvent.Failure? = when (coreRuntime.submit(attempt.coreGeneration, journaled)) {
+        Gs1RuntimeSubmission.ACCEPTED -> {
+            attempt.delayedWriteSequence = nextSequence(attempt.delayedWriteSequence)
+            null
+        }
+        Gs1RuntimeSubmission.OVERFLOW -> failure("CORE_MAILBOX_OVERFLOW", null, true)
+        Gs1RuntimeSubmission.STALE_GENERATION -> failure("STALE_CORE_GENERATION", null, false)
+        Gs1RuntimeSubmission.CLOSED -> failure("CORE_RUNTIME_CLOSED", null, true)
     }
 
     private suspend fun persistNotification(
@@ -735,6 +836,13 @@ class Gs1DiagnosticGattDriver internal constructor(
         }
         var retry = 0
         while (true) {
+            if (attempt.stopRequested.get() || !currentCoroutineContext().isActive) {
+                return Gs1DurableIngressResult.Failed(
+                    code = "INGRESS_PERSISTENCE_INTERRUPTED",
+                    detail = "Stop requested; the sensor transport is closed",
+                    retryable = true,
+                )
+            }
             when (val persisted = durableIngress.persist(captured)) {
                 is Gs1DurableIngressResult.Stored -> return persisted
                 is Gs1DurableIngressResult.Failed -> {
@@ -759,7 +867,19 @@ class Gs1DiagnosticGattDriver internal constructor(
         when (action) {
             is SessionAction.Write -> {
                 attempt.delayedWriteSequence = nextSequence(attempt.delayedWriteSequence)
-                enqueueCommand(attempt, action.bytes)
+                val plan = Gs1SessionWritePlanPolicy.plan(
+                    streaming = attempt.phase == GattPhase.STREAMING,
+                    action = action,
+                )
+                val failure = if (plan.enqueue) {
+                    enqueueCommand(attempt, action.bytes)
+                } else {
+                    failure("EMPTY_PROTOCOL_COMMAND", null, false)
+                }
+                if (failure == null && plan.armTransportSilenceWatchdogAfterEnqueue) {
+                    armTransportSilenceWatchdog(attempt)
+                }
+                failure
             }
             is SessionAction.WriteAfter -> {
                 when (val retry = attempt.deadlinePolicy.requestAuthRetry(elapsedClock())) {
@@ -890,36 +1010,45 @@ class Gs1DiagnosticGattDriver internal constructor(
                     false,
                 )
                 else -> {
-                    if (attempt.phase != GattPhase.STREAMING) {
-                        attempt.phase = GattPhase.STREAMING
-                        attempt.deadlinePolicy = attempt.deadlinePolicy.markStreaming()
-                    }
                     val assessment = Gs1DiagnosticCommitPolicy.assess(
                         diagnostics = event.diagnostics,
                         committedSampleCount = event.samples.size,
                         issueCount = event.issues.size,
+                        validatedTransportEnvelope = event.validatedTransportEnvelope,
                     )
-                    if (assessment.hasTransportProgress) {
-                        armTransportSilenceWatchdog(attempt)
-                    }
-                    assessment.latest?.let { mutableLatestDiagnostic.value = it }
-                    val issue = event.issues.lastOrNull()
-                    mutableState.value = if (issue != null) {
-                        Gs1DiagnosticGattState.DiagnosticDataRejected(
-                            sequence = issue.sequence,
-                            code = issue.code,
-                            detail = issue.message,
-                        )
-                    } else if (assessment.hasFreshDiagnostic) {
-                        reconnectGate.markStable(attempt.reconnectToken)
-                        Gs1DiagnosticGattState.StreamingDiagnostic
+                    val progressPlan = Gs1DiagnosticCommitProgressPolicy.plan(
+                        alreadyStreaming = attempt.phase == GattPhase.STREAMING,
+                        assessment = assessment,
+                    )
+                    if (!assessment.hasTransportProgress) {
+                        null
                     } else {
-                        Gs1DiagnosticGattState.DiagnosticDataNotFresh(
-                            sequence = assessment.latest?.sequence,
-                            quality = assessment.latest?.quality,
-                        )
+                        if (progressPlan.markStreaming) {
+                            attempt.phase = GattPhase.STREAMING
+                            attempt.deadlinePolicy = attempt.deadlinePolicy.markStreaming()
+                        }
+                        if (progressPlan.armSilenceWatchdog) {
+                            armTransportSilenceWatchdog(attempt)
+                        }
+                        assessment.latest?.let { mutableLatestDiagnostic.value = it }
+                        val issue = event.issues.lastOrNull()
+                        mutableState.value = if (issue != null) {
+                            Gs1DiagnosticGattState.DiagnosticDataRejected(
+                                sequence = issue.sequence,
+                                code = issue.code,
+                                detail = issue.message,
+                            )
+                        } else if (assessment.hasFreshDiagnostic) {
+                            reconnectGate.markStable(attempt.reconnectToken)
+                            Gs1DiagnosticGattState.StreamingDiagnostic
+                        } else {
+                            Gs1DiagnosticGattState.DiagnosticDataNotFresh(
+                                sequence = assessment.latest?.sequence,
+                                quality = assessment.latest?.quality,
+                            )
+                        }
+                        null
                     }
-                    null
                 }
             }
         }
@@ -972,10 +1101,15 @@ class Gs1DiagnosticGattDriver internal constructor(
     private suspend fun stopAttemptLocked(attempt: Attempt): Boolean {
         attempt.stopRequested.set(true)
         closeAttemptTransport(attempt)
-        return withTimeoutOrNull(ATTEMPT_STOP_TIMEOUT_MS) {
+        val drained = withTimeoutOrNull(ATTEMPT_STOP_TIMEOUT_MS) {
             attempt.job.join()
             true
         } == true
+        if (!drained) {
+            attempt.job.cancel()
+            attempt.job.join()
+        }
+        return drained
     }
 
     @SuppressLint("MissingPermission")

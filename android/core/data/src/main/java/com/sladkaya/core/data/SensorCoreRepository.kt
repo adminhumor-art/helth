@@ -9,6 +9,11 @@ sealed interface SensorCoreCommitResult {
 }
 
 interface SensorCoreStore {
+    suspend fun bindProtocol(record: SensorProtocolBindingRecord): SensorProtocolBindingCommitResult
+    suspend fun protocolBinding(sensorId: String): SensorProtocolBindingRecord?
+    suspend fun protocolBindingByBluetoothAddress(
+        bluetoothAddress: String,
+    ): SensorProtocolBindingRecord?
     suspend fun commit(record: AtomicSensorCoreRecord): SensorCoreCommitResult
     suspend fun checkpoint(sensorId: String): SensorAlgorithmCheckpointRecord?
     suspend fun checkpointByBluetoothAddress(
@@ -20,6 +25,31 @@ interface SensorCoreStore {
 class SensorCoreRepository private constructor(
     private val dao: SensorCoreDao,
 ) : SensorCoreStore {
+    override suspend fun bindProtocol(
+        record: SensorProtocolBindingRecord,
+    ): SensorProtocolBindingCommitResult = try {
+        when (dao.bindProtocol(record.toEntity())) {
+            SensorCoreCommitDisposition.COMMITTED -> SensorProtocolBindingCommitResult.Bound
+            SensorCoreCommitDisposition.ALREADY_COMMITTED -> SensorProtocolBindingCommitResult.AlreadyBound
+        }
+    } catch (conflict: SensorCoreConflictException) {
+        SensorProtocolBindingCommitResult.Conflict(
+            conflict.message ?: "Protocol binding conflicts with stored evidence",
+        )
+    }
+
+    override suspend fun protocolBinding(sensorId: String): SensorProtocolBindingRecord? {
+        require(sensorId.isNotBlank())
+        return dao.protocolBinding(sensorId)?.toRecord()
+    }
+
+    override suspend fun protocolBindingByBluetoothAddress(
+        bluetoothAddress: String,
+    ): SensorProtocolBindingRecord? {
+        require(CANONICAL_BLUETOOTH_ADDRESS.matches(bluetoothAddress))
+        return dao.protocolBindingByBluetoothAddress(bluetoothAddress)?.toRecord()
+    }
+
     override suspend fun commit(record: AtomicSensorCoreRecord): SensorCoreCommitResult = try {
         when (dao.commit(record.toEntityBundle())) {
             SensorCoreCommitDisposition.COMMITTED -> SensorCoreCommitResult.Committed

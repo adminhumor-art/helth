@@ -10,6 +10,8 @@ import com.sladkaya.sensor.sibionics.Gs1OnboardingOpenResult
 import com.sladkaya.sensor.sibionics.Gs1OnboardingRejectionReason
 import com.sladkaya.sensor.sibionics.Gs1OnboardingState
 import com.sladkaya.sensor.sibionics.Gs1OnboardingStateMachine
+import com.sladkaya.sensor.sibionics.Gs1DiscoveredAdvertisement
+import com.sladkaya.sensor.sibionics.Gs1MarketProfile
 import com.sladkaya.sensor.sibionics.Gs1PackageCodeInput
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -46,6 +48,7 @@ class PendingDiagnosticGs1OnboardingStateStoreTest {
 
         val discovering = restarted.state as Gs1OnboardingState.Discovering
         assertEquals(SensorFamily.SIBIONICS_GS1SB, discovering.request.family)
+        assertEquals(Gs1MarketProfile.GLOBAL, discovering.request.marketProfile)
         assertEquals("Ab1Zcd34", discovering.request.packageCode)
     }
 
@@ -109,6 +112,41 @@ class PendingDiagnosticGs1OnboardingStateStoreTest {
         assertEquals("Ab1Zcd34", restored.request.packageCode)
     }
 
+    @Test
+    fun serviceLoaderReturnsOnlyACompletePendingDiagnosticProfile() {
+        val store = PendingDiagnosticGs1OnboardingStateStore(context)
+        val machine = openMachine(store)
+        machine.submitPackageCode(
+            SensorFamily.SIBIONICS_GS1,
+            Gs1PackageCodeInput.Manual("Ab1Zcd34"),
+        )
+        assertEquals(null, store.loadPendingDiagnosticProfile())
+
+        machine.resolveAdvertisements(
+            listOf(Gs1DiscoveredAdvertisement("GS-Ab1Z", "AA:BB:CC:DD:EE:01")),
+        )
+
+        val profile = store.loadPendingDiagnosticProfile()
+        assertEquals("Ab1Zcd34", profile?.packageCode)
+        assertEquals(Gs1MarketProfile.GLOBAL, profile?.marketProfile)
+        assertEquals("AA:BB:CC:DD:EE:01", profile?.canonicalBluetoothAddress)
+    }
+
+    @Test
+    fun clearingDraftRemovesOnlyPendingDiagnosticState() {
+        val store = PendingDiagnosticGs1OnboardingStateStore(context)
+        val machine = openMachine(store)
+        machine.submitPackageCode(
+            SensorFamily.SIBIONICS_GS1,
+            Gs1PackageCodeInput.Manual("Ab1Zcd34"),
+        )
+
+        assertTrue(store.clearDraft())
+
+        assertEquals(null, store.load())
+        assertFalse(ConfirmedSensorConfigurationStore(context).hasConfirmedConfiguration())
+    }
+
     private fun openMachine(
         store: PendingDiagnosticGs1OnboardingStateStore,
     ): Gs1OnboardingStateMachine {
@@ -125,7 +163,16 @@ class PendingDiagnosticGs1OnboardingStateStoreTest {
 
     private companion object {
         const val PENDING_PREFERENCES = "pending_diagnostic_gs1_onboarding"
-        const val PENDING_KEY = "snapshot_v1"
+        const val PENDING_KEY = "snapshot_current"
         const val CONFIRMED_PREFERENCES = "confirmed_sensor_configuration"
     }
 }
+
+private fun Gs1OnboardingStateMachine.submitPackageCode(
+    family: SensorFamily,
+    input: Gs1PackageCodeInput,
+): Gs1OnboardingActionResult = submitPackageCode(
+    family = family,
+    input = input,
+    marketProfile = Gs1MarketProfile.GLOBAL,
+)

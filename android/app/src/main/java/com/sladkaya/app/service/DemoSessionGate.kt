@@ -1,5 +1,17 @@
 package com.sladkaya.app.service
 
+import java.util.concurrent.atomic.AtomicBoolean
+
+internal class DemoStartRequestGate {
+    private val claimed = AtomicBoolean(false)
+
+    fun claim(): Boolean = claimed.compareAndSet(false, true)
+
+    fun release() {
+        claimed.set(false)
+    }
+}
+
 /** Serializes demo side effects with invalidation so fail-closed always wins. */
 internal class DemoSessionGate {
     private val lock = Any()

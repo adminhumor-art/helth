@@ -22,6 +22,8 @@ internal data class RawSensorSampleEntity(
     val temperatureRaw: Int,
     val historyDistance: Int,
     val transportVariant: Int,
+    val sensorTimeWasClamped: Boolean,
+    val addTimeSeconds: Int?,
 )
 
 @Entity(
@@ -59,7 +61,7 @@ internal data class SensorAlgorithmCheckpointEntity(
     val sensorFamily: String,
     val transportVariant: Int,
     val transportProtocol: String,
-    val dataHandleBinarySetId: String,
+    val transportCodecId: String,
     val sequence: Int,
     val sensorTimeEpochMs: Long,
     val algorithmProfile: String,
@@ -73,6 +75,26 @@ internal data class SensorAlgorithmCheckpointEntity(
     val state: ByteArray,
     val stateSha256: String,
     val displayOffsetMmolL: Double,
+    val schemaVersion: Int,
+)
+
+@Entity(
+    tableName = "sensor_protocol_bindings",
+    indices = [Index(value = ["bluetoothAddress"], unique = true)],
+)
+internal data class SensorProtocolBindingEntity(
+    @PrimaryKey val sensorId: String,
+    val bluetoothAddress: String,
+    val sensorFamily: String,
+    val transportVariant: Int,
+    val sensitivityToken: String,
+    val wireProfile: String,
+    val transportProtocol: String,
+    val transportCodecId: String,
+    val algorithmProfile: String,
+    val sensitivityEncoding: String,
+    val evidenceKind: String,
+    val evidenceSha256: String,
     val schemaVersion: Int,
 )
 
@@ -118,6 +140,8 @@ internal fun RawSensorSampleRecord.toEntity() = RawSensorSampleEntity(
     temperatureRaw = temperatureRaw,
     historyDistance = historyDistance,
     transportVariant = transportVariant,
+    sensorTimeWasClamped = sensorTimeWasClamped,
+    addTimeSeconds = addTimeSeconds,
 )
 
 internal fun SensorAlgorithmResultRecord.toEntity() = SensorAlgorithmResultEntity(
@@ -150,7 +174,7 @@ internal fun SensorAlgorithmCheckpointRecord.toEntity() = SensorAlgorithmCheckpo
     sensorFamily = sensorFamily.wireName,
     transportVariant = transportVariant,
     transportProtocol = transportProtocol,
-    dataHandleBinarySetId = dataHandleBinarySetId,
+    transportCodecId = transportCodecId,
     sequence = sequence,
     sensorTimeEpochMs = sensorTimeEpochMs,
     algorithmProfile = algorithmProfile,
@@ -173,7 +197,7 @@ internal fun SensorAlgorithmCheckpointEntity.toRecord() = SensorAlgorithmCheckpo
     sensorFamily = SensorFamily.entries.first { it.wireName == sensorFamily },
     transportVariant = transportVariant,
     transportProtocol = transportProtocol,
-    dataHandleBinarySetId = dataHandleBinarySetId,
+    transportCodecId = transportCodecId,
     sequence = sequence,
     sensorTimeEpochMs = sensorTimeEpochMs,
     algorithmProfile = algorithmProfile,
@@ -187,6 +211,38 @@ internal fun SensorAlgorithmCheckpointEntity.toRecord() = SensorAlgorithmCheckpo
     state = state.copyOf(),
     stateSha256 = stateSha256,
     displayOffsetMmolL = displayOffsetMmolL,
+    schemaVersion = schemaVersion,
+)
+
+internal fun SensorProtocolBindingRecord.toEntity() = SensorProtocolBindingEntity(
+    sensorId = sensorId,
+    bluetoothAddress = bluetoothAddress,
+    sensorFamily = sensorFamily.wireName,
+    transportVariant = transportVariant,
+    sensitivityToken = sensitivityToken,
+    wireProfile = wireProfile,
+    transportProtocol = transportProtocol,
+    transportCodecId = transportCodecId,
+    algorithmProfile = algorithmProfile,
+    sensitivityEncoding = sensitivityEncoding,
+    evidenceKind = evidenceKind,
+    evidenceSha256 = evidenceSha256,
+    schemaVersion = schemaVersion,
+)
+
+internal fun SensorProtocolBindingEntity.toRecord() = SensorProtocolBindingRecord(
+    sensorId = sensorId,
+    bluetoothAddress = bluetoothAddress,
+    sensorFamily = SensorFamily.entries.first { it.wireName == sensorFamily },
+    transportVariant = transportVariant,
+    sensitivityToken = sensitivityToken,
+    wireProfile = wireProfile,
+    transportProtocol = transportProtocol,
+    transportCodecId = transportCodecId,
+    algorithmProfile = algorithmProfile,
+    sensitivityEncoding = sensitivityEncoding,
+    evidenceKind = evidenceKind,
+    evidenceSha256 = evidenceSha256,
     schemaVersion = schemaVersion,
 )
 

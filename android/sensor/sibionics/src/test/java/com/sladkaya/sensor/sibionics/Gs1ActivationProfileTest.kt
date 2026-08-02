@@ -25,8 +25,9 @@ class Gs1DiagnosticActivationProfileTest {
                 bluetoothAddress = "AA:01:B2:03:C4:05",
                 transportVariant = 0,
                 packageCode = "aB12cd34",
+                wireProfile = Gs1WireProfile.V120,
             ),
-            result.profile.coreConfiguration(),
+            result.profile.coreConfiguration(Gs1WireProfile.V120),
         )
     }
 

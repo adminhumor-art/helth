@@ -1,6 +1,7 @@
 package com.sladkaya.sensor.sibionics
 
 import com.sladkaya.core.model.SensorFamily
+import com.sladkaya.sensor.sibionics.algorithm.AlgorithmProfile
 import com.sladkaya.sensor.sibionics.algorithm.AlgorithmErrorCode
 import com.sladkaya.sensor.sibionics.algorithm.AlgorithmInitializationMode
 import com.sladkaya.sensor.sibionics.algorithm.SensitivityEncoding
@@ -36,15 +37,24 @@ internal class Gs1GoldenReplayPlanner {
         }
         if (!boundedAscii(trace.algorithmVersion, MAX_METADATA_CHARS)) return invalidField("algorithm version is invalid")
         if (!boundedAscii(trace.algorithmBinarySetId, MAX_METADATA_CHARS)) return invalidField("binary set id is invalid")
-        if (trace.transportProtocol != TRANSPORT_PROTOCOL) return invalidField("transport protocol is not GS1 V120")
-        if (trace.sensitivityEvidence.initializationMode != AlgorithmInitializationMode.STANDARD) {
-            return invalidField("only STANDARD initialization is accepted")
+        val wireProfile = when (trace.transportProtocol) {
+            V120_TRANSPORT_PROTOCOL -> if (trace.algorithmProfile == V120_ALGORITHM_PROFILE) {
+                GoldenWireProfile.V120
+            } else {
+                return invalidField("GS1 V120 trace requires the V116A algorithm profile")
+            }
+            V115_TRANSPORT_PROTOCOL -> if (trace.algorithmProfile == V115_ALGORITHM_PROFILE) {
+                GoldenWireProfile.V115
+            } else {
+                return invalidField("GS1 V115 trace requires the V115G algorithm profile")
+            }
+            else -> return invalidField("transport protocol is unsupported")
         }
         if (trace.sensitivityEvidence.tokenSource != SensitivityTokenSource.PACKAGE_CODE) {
             return invalidField("sensitivity token source is not the package code")
         }
-        if (trace.sensitivityEvidence.encoding != SensitivityEncoding.NORMAL) {
-            return invalidField("only NORMAL sensitivity encoding is accepted")
+        if (!trace.sensitivityEvidence.hasConsistentInitialization()) {
+            return invalidField("sensitivity encoding does not match initialization mode")
         }
         val coefficient = Float.fromBits(trace.sensitivityEvidence.coefficientBits)
         if (!coefficient.isFinite() || coefficient !in MIN_SENSITIVITY..MAX_SENSITIVITY) {
@@ -123,7 +133,11 @@ internal class Gs1GoldenReplayPlanner {
 
             when (notification.expectedDecode) {
                 Gs1GoldenDecodeExpectation.GS1_DATA -> {
-                    if (notification.expectedDecodeError != null || !notification.expectedDecrypted || notification.samples.isEmpty()) {
+                    val expectedDecrypted = wireProfile == GoldenWireProfile.V120
+                    if (notification.expectedDecodeError != null ||
+                        notification.expectedDecrypted != expectedDecrypted ||
+                        notification.samples.isEmpty()
+                    ) {
                         return invalidField("GS1 data expectation is incomplete at notification $position")
                     }
                 }
@@ -144,23 +158,62 @@ internal class Gs1GoldenReplayPlanner {
                     }
                 }
             }
-            if (notification.samples.size > MAX_SAMPLES_PER_NOTIFICATION) {
-                return invalidField("sample count exceeds V120 bounds at notification $position")
+            val maxSamples = when (wireProfile) {
+                GoldenWireProfile.V115 -> MAX_V115_SAMPLES_PER_NOTIFICATION
+                GoldenWireProfile.V120 -> MAX_V120_SAMPLES_PER_NOTIFICATION
+            }
+            if (notification.samples.size > maxSamples) {
+                return invalidField("sample count exceeds transport bounds at notification $position")
             }
             notification.samples.forEach { expected ->
                 val sample = expected.decoded
                 if (sample.index != expectedSampleIndex) {
                     return conflict("decoded sample index ${sample.index} conflicts with expected $expectedSampleIndex")
                 }
-                if (sample.sensorTimeEpochSeconds !in 1L..U32_MAX ||
+                if (sample.sensorTimeEpochSeconds <= 0L ||
                     sample.current !in U16_RANGE ||
                     sample.temperature !in U16_RANGE ||
                     sample.reindex !in U16_RANGE
                 ) {
-                    return invalidField("decoded sample is outside the V120 wire bounds at index ${sample.index}")
+                    return invalidField("decoded sample is outside transport bounds at index ${sample.index}")
                 }
-                if (previousSensorTime != null && sample.sensorTimeEpochSeconds != previousSensorTime!! + SAMPLE_SECONDS) {
-                    return conflict("decoded sample time is not exactly sequential at index ${sample.index}")
+                when (wireProfile) {
+                    GoldenWireProfile.V120 -> {
+                        if (sample.sensorTimeEpochSeconds > U32_MAX ||
+                            sample.addTimeSeconds != null ||
+                            sample.sensorTimeWasClamped
+                        ) {
+                            return invalidField("V120 sample contains invalid time provenance at index ${sample.index}")
+                        }
+                        if (previousSensorTime != null &&
+                            sample.sensorTimeEpochSeconds != previousSensorTime!! + SAMPLE_SECONDS
+                        ) {
+                            return conflict("V120 sample time is not exactly sequential at index ${sample.index}")
+                        }
+                    }
+
+                    GoldenWireProfile.V115 -> {
+                        val addTime = sample.addTimeSeconds
+                            ?: return invalidField("V115 sample lacks add-time provenance at index ${sample.index}")
+                        if (addTime !in U16_RANGE) {
+                            return invalidField("V115 add-time is outside uint16 at index ${sample.index}")
+                        }
+                        val receivedAtSeconds = notification.receivedAtEpochMs / MILLIS_PER_SECOND
+                        val reportedTime = receivedAtSeconds + addTime -
+                            sample.reindex.toLong() * SAMPLE_SECONDS
+                        val clamped = reportedTime > receivedAtSeconds
+                        val expectedTime = if (clamped) receivedAtSeconds else reportedTime
+                        if (sample.sensorTimeEpochSeconds != expectedTime ||
+                            sample.sensorTimeWasClamped != clamped
+                        ) {
+                            return invalidField("V115 sample time conflicts with receive-time provenance at index ${sample.index}")
+                        }
+                        if (previousSensorTime != null &&
+                            sample.sensorTimeEpochSeconds < previousSensorTime!!
+                        ) {
+                            return conflict("V115 sample time regresses at index ${sample.index}")
+                        }
+                    }
                 }
                 if (!sample.toAlgorithmInput().isValid()) {
                     return invalidField("decoded sample is outside algorithm input bounds at index ${sample.index}")
@@ -205,21 +258,37 @@ internal class Gs1GoldenReplayPlanner {
     private fun String.isSha256(): Boolean =
         length == SHA256_CHARS && all { it in '0'..'9' || it in 'a'..'f' }
 
+    private fun Gs1GoldenSensitivityEvidence.hasConsistentInitialization(): Boolean =
+        when (initializationMode) {
+            AlgorithmInitializationMode.STANDARD -> encoding == SensitivityEncoding.NORMAL
+            AlgorithmInitializationMode.FACTION -> encoding == SensitivityEncoding.FACTION
+        }
+
     private companion object {
         const val FORMAT_VERSION = 1
-        const val TRANSPORT_PROTOCOL = "GS1_V120"
+        const val V115_TRANSPORT_PROTOCOL = "GS1_V115"
+        const val V120_TRANSPORT_PROTOCOL = "GS1_V120"
         const val FIRST_SAMPLE_INDEX = 1
         const val SAMPLE_SECONDS = 60L
+        const val MILLIS_PER_SECOND = 1_000L
         const val MAX_PACKET_BYTES = 250
         const val MAX_NOTIFICATIONS = 10_000
-        const val MAX_SAMPLES_PER_NOTIFICATION = 29
+        const val MAX_V115_SAMPLES_PER_NOTIFICATION = 17
+        const val MAX_V120_SAMPLES_PER_NOTIFICATION = 29
         const val MAX_METADATA_CHARS = 128
         const val SHA256_CHARS = 64
         const val U32_MAX = 0xffff_ffffL
         const val MIN_SENSITIVITY = 0.8f
         const val MAX_SENSITIVITY = 2.5f
+        val V115_ALGORITHM_PROFILE = AlgorithmProfile.V115G
+        val V120_ALGORITHM_PROFILE = AlgorithmProfile.V116A
         val U16_RANGE = 0..0xffff
         val TRACE_ID = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
         val ATTEMPT_PSEUDONYM = Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+    }
+
+    private enum class GoldenWireProfile {
+        V115,
+        V120,
     }
 }

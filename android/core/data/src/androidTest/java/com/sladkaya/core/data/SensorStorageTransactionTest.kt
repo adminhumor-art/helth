@@ -294,6 +294,8 @@ class SensorStorageTransactionTest {
             temperatureRaw = 322,
             historyDistance = 0,
             transportVariant = 0,
+            sensorTimeWasClamped = false,
+            addTimeSeconds = null,
         )
         val result = SensorAlgorithmResultEntity(
             eventId = raw.eventId,
@@ -324,7 +326,7 @@ class SensorStorageTransactionTest {
             sensorFamily = raw.sensorFamily,
             transportVariant = raw.transportVariant,
             transportProtocol = "GS1_V120",
-            dataHandleBinarySetId = "datahandle-set",
+            transportCodecId = "transport-codec-test",
             sequence = raw.sequence,
             sensorTimeEpochMs = raw.sensorTimeEpochMs,
             algorithmProfile = result.algorithmProfile,

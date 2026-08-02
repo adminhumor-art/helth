@@ -63,7 +63,7 @@ internal object Gs1GoldenFixturePublicationGate {
 
     private const val SYNTHETIC_PREFIX = "synthetic-"
     private const val PINNED_SYNTHETIC_FIXTURE_SHA256 =
-        "8fd34810e448ce7a6c3fb0f6918a0b0786fd026f91662b958292887b37a0838b"
+        "83e03e263da0c7a27bcc081298989c78ebf6a96ed20966c0df5d0e5c7e75f3d9"
 }
 
 internal enum class Gs1GoldenMacPseudonymScheme {
@@ -356,6 +356,8 @@ internal class Gs1GoldenTraceCodec(
                     sample.decoded.current.toString(),
                     sample.decoded.temperature.toString(),
                     sample.decoded.reindex.toString(),
+                    sample.decoded.addTimeSeconds?.toString() ?: NONE,
+                    sample.decoded.sensorTimeWasClamped.asDigit(),
                 )
                 line(
                     "diagnostic",
@@ -423,6 +425,8 @@ internal class Gs1GoldenTraceCodec(
                                         current = sampleFields[3].strictInt(),
                                         temperature = sampleFields[4].strictInt(),
                                         reindex = sampleFields[5].strictInt(),
+                                        addTimeSeconds = sampleFields[6].nullableInt(),
+                                        sensorTimeWasClamped = sampleFields[7].strictBoolean(),
                                     ),
                                     diagnostic = Gs1GoldenExpectedDiagnostic(
                                         nativeGlucoseMmolLBits = diagnosticFields[1].strictUnsignedHexLong(),
@@ -531,7 +535,7 @@ internal class Gs1GoldenTraceCodec(
         const val MAX_NOTIFICATIONS = 10_000
         const val MAX_SAMPLES_PER_NOTIFICATION = 29
         const val NOTIFICATION_FIELDS = 11
-        const val SAMPLE_FIELDS = 6
+        const val SAMPLE_FIELDS = 8
         const val DIAGNOSTIC_FIELDS = 9
         const val NONE = "-"
         val HEADER_TERMINATOR = "\n\n".encodeToByteArray()
@@ -594,6 +598,8 @@ private fun String.strictLong(): Long {
     if (!matches(CANONICAL_INTEGER)) throw IllegalArgumentException("not canonical Long")
     return toLong()
 }
+
+private fun String.nullableInt(): Int? = if (this == "-") null else strictInt()
 
 private fun String.strictBoolean(): Boolean = when (this) {
     "0" -> false

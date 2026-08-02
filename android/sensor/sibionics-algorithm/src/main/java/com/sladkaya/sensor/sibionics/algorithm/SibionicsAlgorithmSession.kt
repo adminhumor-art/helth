@@ -44,10 +44,18 @@ class SibionicsAlgorithmSession private constructor(
         }
 
         val previousSensorTime = lastProcessedSensorTimeEpochSeconds
-        if (previousSensorTime != null && input.sensorTimeEpochSeconds != previousSensorTime + SECONDS_PER_SAMPLE) {
+        val validSensorTime = previousSensorTime == null || when (profile) {
+            AlgorithmProfile.V116A ->
+                input.sensorTimeEpochSeconds == previousSensorTime + SECONDS_PER_SAMPLE
+            // V115 event time is derived from durable receive time, addTime and
+            // history distance. Future records are clamped individually by the
+            // reference flow, so adjacent indexes can legitimately share time.
+            AlgorithmProfile.V115G -> input.sensorTimeEpochSeconds >= previousSensorTime
+        }
+        if (!validSensorTime) {
             return failure(
                 AlgorithmErrorCode.NON_SEQUENTIAL_SENSOR_TIME,
-                "Expected sensor time ${previousSensorTime + SECONDS_PER_SAMPLE}, received ${input.sensorTimeEpochSeconds}",
+                "Sensor time ${input.sensorTimeEpochSeconds} violates the ${profile.name} sequence contract",
             )
         }
 
@@ -252,10 +260,14 @@ class SibionicsAlgorithmSession private constructor(
             native: NativeAlgorithmApi,
         ): AlgorithmOpenResult {
             val metadata = try {
+                val algorithmVersion = native.algorithmVersion
+                require(algorithmVersion.isConcreteAlgorithmVersion()) {
+                    "Native algorithm version is absent or unknown"
+                }
                 NativeAlgorithmMetadata(
                     profile = native.profile,
                     binarySetId = native.binarySetId,
-                    algorithmVersion = native.algorithmVersion,
+                    algorithmVersion = algorithmVersion,
                     supportedInitializationModes = native.supportedInitializationModes.toSet(),
                 )
             } catch (cancelled: CancellationException) {
@@ -396,6 +408,12 @@ class SibionicsAlgorithmSession private constructor(
                     "Checkpoint belongs to a different algorithm initialization mode",
                 )
             }
+            if (checkpoint.algorithmVersion != metadata.algorithmVersion) {
+                return AlgorithmError(
+                    AlgorithmErrorCode.ALGORITHM_VERSION_MISMATCH,
+                    "Checkpoint belongs to a different native algorithm version",
+                )
+            }
             if (checkpoint.nativeState.size != profile.stateSize) {
                 return AlgorithmError(
                     AlgorithmErrorCode.STATE_SIZE_MISMATCH,
@@ -429,3 +447,6 @@ private data class NativeAlgorithmMetadata(
     val algorithmVersion: String,
     val supportedInitializationModes: Set<AlgorithmInitializationMode>,
 )
+
+internal fun String?.isConcreteAlgorithmVersion(): Boolean =
+    !isNullOrBlank() && !trim().equals("unknown", ignoreCase = true)

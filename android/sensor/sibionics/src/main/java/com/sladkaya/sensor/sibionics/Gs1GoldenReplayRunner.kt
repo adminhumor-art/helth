@@ -120,7 +120,10 @@ internal class Gs1GoldenReplayRunner(
                     activeAttempt = notification.attemptOrdinal
                 }
                 val decoded = try {
-                    decoder.decode(notification.encryptedPacketCopy())
+                    decoder.decode(
+                        notification.encryptedPacketCopy(),
+                        notification.receivedAtEpochMs,
+                    )
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (failure: LinkageError) {
@@ -407,8 +410,6 @@ internal class Gs1GoldenReplayRunner(
         val expected = trace.sensitivityEvidence
         val sensitivity = opened.sensitivity
         return when {
-            opened.initializationMode != AlgorithmInitializationMode.STANDARD ->
-                "session did not use STANDARD initialization"
             opened.initializationMode != expected.initializationMode ->
                 "session initialization mode differs from trace"
             !sensitivity.token.isValid() -> "session sensitivity input is invalid"

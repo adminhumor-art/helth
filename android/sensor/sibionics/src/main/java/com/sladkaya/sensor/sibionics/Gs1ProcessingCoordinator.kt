@@ -17,7 +17,6 @@ import com.sladkaya.sensor.sibionics.algorithm.AlgorithmOutput
 import com.sladkaya.sensor.sibionics.algorithm.AlgorithmStepResult
 import com.sladkaya.sensor.sibionics.algorithm.DecodedSensitivity
 import com.sladkaya.sensor.sibionics.algorithm.SibionicsAlgorithmSession
-import com.sladkaya.sensor.sibionics.datahandle.SibionicsDataHandle
 import java.security.MessageDigest
 import java.util.concurrent.CancellationException
 import kotlin.math.roundToInt
@@ -70,6 +69,8 @@ internal class Gs1ProcessingCoordinator(
     private val algorithm: SibionicsAlgorithmSession,
     private val sensitivity: DecodedSensitivity,
     private val store: SensorCoreStore,
+    private val transportProtocol: String,
+    private val transportCodecId: String,
     private val phoneClock: () -> Long = System::currentTimeMillis,
 ) : AutoCloseable, Gs1SampleProcessor {
     private val mutex = Mutex()
@@ -87,6 +88,7 @@ internal class Gs1ProcessingCoordinator(
     override suspend fun process(
         encryptedPacket: ByteArray,
         sample: DecodedGs1RawSample,
+        receivedAtEpochMs: Long,
     ): Gs1ProcessingResult = mutex.withLock {
         if (closed) return@withLock Gs1ProcessingResult.Closed("Sensor processing session is closed")
         if (pendingFailure != null) {
@@ -100,29 +102,7 @@ internal class Gs1ProcessingCoordinator(
             )
         }
 
-        val phoneTime = try {
-            phoneClock()
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (failure: LinkageError) {
-            return@withLock rejectAndRecord(
-                encryptedPacket = encryptedPacket,
-                sample = sample,
-                phoneTime = UNKNOWN_PHONE_TIME,
-                code = "PHONE_CLOCK_FAILED",
-                message = failure.message ?: "Phone clock could not be read",
-                nativeStateMayHaveChanged = false,
-            )
-        } catch (failure: Exception) {
-            return@withLock rejectAndRecord(
-                encryptedPacket = encryptedPacket,
-                sample = sample,
-                phoneTime = UNKNOWN_PHONE_TIME,
-                code = "PHONE_CLOCK_FAILED",
-                message = failure.message ?: "Phone clock could not be read",
-                nativeStateMayHaveChanged = false,
-            )
-        }
+        val phoneTime = receivedAtEpochMs
         if (encryptedPacket.isEmpty() || encryptedPacket.size > MAX_PACKET_BYTES) {
             return@withLock rejectAndRecord(
                 encryptedPacket = encryptedPacket,
@@ -252,6 +232,12 @@ internal class Gs1ProcessingCoordinator(
             }
         }
     }
+
+    /** Unit-test seam; production packet flow always supplies its durable ingress timestamp. */
+    internal suspend fun process(
+        encryptedPacket: ByteArray,
+        sample: DecodedGs1RawSample,
+    ): Gs1ProcessingResult = process(encryptedPacket, sample, phoneClock())
 
     override suspend fun retryPendingCommit(): Gs1ProcessingResult = mutex.withLock {
         if (pendingFailure != null) return@withLock commitPendingFailureLocked()
@@ -415,6 +401,8 @@ internal class Gs1ProcessingCoordinator(
             temperatureRaw = sample.temperature,
             historyDistance = sample.reindex,
             transportVariant = transportVariant,
+            sensorTimeWasClamped = sample.sensorTimeWasClamped,
+            addTimeSeconds = sample.addTimeSeconds,
         )
         val result = SensorAlgorithmResultRecord(
             eventId = eventId,
@@ -444,8 +432,8 @@ internal class Gs1ProcessingCoordinator(
             bluetoothAddress = bluetoothAddress,
             sensorFamily = family,
             transportVariant = transportVariant,
-            transportProtocol = TRANSPORT_PROTOCOL,
-            dataHandleBinarySetId = SibionicsDataHandle.BINARY_SET_ID,
+            transportProtocol = transportProtocol,
+            transportCodecId = transportCodecId,
             sequence = checkpoint.lastProcessedIndex,
             sensorTimeEpochMs = checkpoint.lastSensorTimeEpochSeconds * MILLIS_PER_SECOND,
             algorithmProfile = checkpoint.profile.name,

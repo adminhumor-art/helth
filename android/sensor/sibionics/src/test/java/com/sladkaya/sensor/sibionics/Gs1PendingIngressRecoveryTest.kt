@@ -18,6 +18,74 @@ class Gs1PendingIngressRecoveryTest {
     private val codec = SibionicsPacketCodec()
 
     @Test
+    fun unresolvedChallengeReturnsDurableV120ProfileForTheLiveSession() = runBlocking {
+        val challenge = byteArrayOf(0x23, 0xf7.toByte(), 0x6f, 0xd9.toByte(), 0xf4.toByte())
+        val journal = FakeRecoveryJournal(listOf(record(0, challenge)))
+        val result = recovery(journal) {
+            Gs1RuntimeAwaitResult.Processed(
+                Gs1PacketProcessingResult.Completed(
+                    committedSamples = emptyList(),
+                    resolvedWireProfile = Gs1WireProfile.V120,
+                ),
+            )
+        }.recover(
+            profile = profile(transportVariant = 2),
+            generation = 1L,
+            initialCoreCursor = 1,
+            initialWireProfile = Gs1WireProfile.UNRESOLVED,
+        ) as Gs1PendingIngressRecoveryResult.Completed
+
+        assertEquals(Gs1WireProfile.V120, result.finalWireProfile)
+        assertEquals(SensorPacketIngressOutcomeStatus.NON_DATA, journal.outcomes.single().status)
+    }
+
+    @Test
+    fun unresolvedV115DataReturnsDurableV115ProfileAndAdvancedCursor() = runBlocking {
+        val packet = v115Response(index = 1)
+        val journal = FakeRecoveryJournal(listOf(record(0, packet)))
+        val result = recovery(journal) {
+            val decoded = Gs1V115WireCodec.decode(packet, journal.records.single().receivedAtEpochMs)
+                as Gs1V115DecodeResult.Success
+            Gs1RuntimeAwaitResult.Processed(
+                Gs1PacketProcessingResult.Completed(
+                    committedSamples = decoded.records.map { it.sample },
+                    resolvedWireProfile = Gs1WireProfile.V115,
+                ),
+            )
+        }.recover(
+            profile = profile(transportVariant = 2),
+            generation = 1L,
+            initialCoreCursor = 1,
+            initialWireProfile = Gs1WireProfile.UNRESOLVED,
+        ) as Gs1PendingIngressRecoveryResult.Completed
+
+        assertEquals(2, result.finalCoreCursor)
+        assertEquals(Gs1WireProfile.V115, result.finalWireProfile)
+        assertEquals(SensorPacketIngressOutcomeStatus.CORE_COMMITTED, journal.outcomes.single().status)
+    }
+
+    @Test
+    fun challengeAlreadyCoveredByV120BindingIsNonDataAndNeverReplayed() = runBlocking {
+        val challenge = byteArrayOf(0x23, 0xf7.toByte(), 0x6f, 0xd9.toByte(), 0xf4.toByte())
+        val journal = FakeRecoveryJournal(listOf(record(0, challenge)))
+        var replayCalls = 0
+
+        val result = recovery(journal) {
+            replayCalls += 1
+            error("bound challenge must not enter the stateful core again")
+        }.recover(
+            profile = profile(transportVariant = 2),
+            generation = 1L,
+            initialCoreCursor = 1,
+            initialWireProfile = Gs1WireProfile.V120,
+        ) as Gs1PendingIngressRecoveryResult.Completed
+
+        assertEquals(Gs1WireProfile.V120, result.finalWireProfile)
+        assertEquals(0, replayCalls)
+        assertEquals(SensorPacketIngressOutcomeStatus.NON_DATA, journal.outcomes.single().status)
+    }
+
+    @Test
     fun orderedPendingEvidenceIsClassifiedReplayedExactlyAndMarked() = runBlocking {
         val acknowledgement = byteArrayOf(4, 0, 0, 0, 0xfc.toByte())
         val firstRaw = rawPacket(startIndex = 10, count = 1)
@@ -42,7 +110,12 @@ class Gs1PendingIngressRecoveryTest {
             )
         }
 
-        val result = recovery.recover(profile(), generation = 7L, initialCoreCursor = 10)
+        val result = recovery.recover(
+            profile(),
+            generation = 7L,
+            initialCoreCursor = 10,
+            initialWireProfile = Gs1WireProfile.V120,
+        )
             as Gs1PendingIngressRecoveryResult.Completed
 
         assertEquals(12, result.finalCoreCursor)
@@ -58,6 +131,34 @@ class Gs1PendingIngressRecoveryTest {
         )
         assertArrayEquals(firstRaw, replayed[0])
         assertArrayEquals(secondRaw, replayed[1])
+    }
+
+    @Test
+    fun finalDurableSensorIndexEndsRecoveryWithAnExplicitTerminalResult() = runBlocking {
+        val packet = rawPacket(startIndex = 0xffff, count = 1)
+        val journal = FakeRecoveryJournal(listOf(record(0, packet)))
+        var replayCalls = 0
+
+        val result = recovery(journal) { journaled ->
+            replayCalls += 1
+            val decoded = codec.decode(
+                SensorFamily.SIBIONICS_GS1,
+                journaled.encryptedPacketCopy(),
+            ) as DecodedPacket.Gs1RawSamples
+            Gs1RuntimeAwaitResult.Processed(
+                Gs1PacketProcessingResult.Completed(committedSamples = decoded.values),
+            )
+        }.recover(
+            profile(),
+            generation = 1L,
+            initialCoreCursor = 0xffff,
+            initialWireProfile = Gs1WireProfile.V120,
+        ) as Gs1PendingIngressRecoveryResult.Failed
+
+        assertEquals("SENSOR_SEQUENCE_EXHAUSTED", result.code)
+        assertTrue(!result.retryable)
+        assertEquals(1, replayCalls)
+        assertEquals(SensorPacketIngressOutcomeStatus.CORE_COMMITTED, journal.outcomes.single().status)
     }
 
     @Test
@@ -80,7 +181,12 @@ class Gs1PendingIngressRecoveryTest {
                     committedSamples = decoded.values,
                 ),
             )
-        }.recover(profile(), generation = 1L, initialCoreCursor = 10)
+        }.recover(
+            profile(),
+            generation = 1L,
+            initialCoreCursor = 10,
+            initialWireProfile = Gs1WireProfile.V120,
+        )
             as Gs1PendingIngressRecoveryResult.Completed
 
         assertEquals(12, result.finalCoreCursor)
@@ -95,7 +201,12 @@ class Gs1PendingIngressRecoveryTest {
             listOf(record(0, rawPacket(startIndex = 11, count = 1))),
         )
         val result = recovery(journal) { error("gap must not reach the core") }
-            .recover(profile(), generation = 1L, initialCoreCursor = 10)
+            .recover(
+                profile(),
+                generation = 1L,
+                initialCoreCursor = 10,
+                initialWireProfile = Gs1WireProfile.V120,
+            )
             as Gs1PendingIngressRecoveryResult.Completed
 
         assertEquals(10, result.finalCoreCursor)
@@ -117,7 +228,12 @@ class Gs1PendingIngressRecoveryTest {
         val result = recovery(journal) {
             replayCalls += 1
             error("unsupported protocol must stop recovery before replay")
-        }.recover(profile(), generation = 1L, initialCoreCursor = 10)
+        }.recover(
+            profile(),
+            generation = 1L,
+            initialCoreCursor = 10,
+            initialWireProfile = Gs1WireProfile.V120,
+        )
             as Gs1PendingIngressRecoveryResult.Completed
 
         assertEquals(10, result.finalCoreCursor)
@@ -138,7 +254,12 @@ class Gs1PendingIngressRecoveryTest {
         val journal = FakeRecoveryJournal(listOf(record(0, covered), record(1, invalid)))
 
         val result = recovery(journal) { error("neither record is replayable") }
-            .recover(profile(), generation = 1L, initialCoreCursor = 10)
+            .recover(
+                profile(),
+                generation = 1L,
+                initialCoreCursor = 10,
+                initialWireProfile = Gs1WireProfile.V120,
+            )
             as Gs1PendingIngressRecoveryResult.Completed
 
         assertEquals(10, result.finalCoreCursor)
@@ -158,7 +279,12 @@ class Gs1PendingIngressRecoveryTest {
         val journal = FakeRecoveryJournal(listOf(record(0, rawPacket(startIndex = 9, count = 2))))
 
         val result = recovery(journal) { error("partial overlap must not be replayed") }
-            .recover(profile(), generation = 1L, initialCoreCursor = 10)
+            .recover(
+                profile(),
+                generation = 1L,
+                initialCoreCursor = 10,
+                initialWireProfile = Gs1WireProfile.V120,
+            )
             as Gs1PendingIngressRecoveryResult.Completed
 
         assertEquals(Gs1PendingIngressRecoveryDisposition.PARTIAL_OVERLAP, result.blocked?.disposition)
@@ -175,7 +301,12 @@ class Gs1PendingIngressRecoveryTest {
                     message = "state mismatch",
                 ),
             )
-        }.recover(profile(), generation = 1L, initialCoreCursor = 10)
+        }.recover(
+            profile(),
+            generation = 1L,
+            initialCoreCursor = 10,
+            initialWireProfile = Gs1WireProfile.V120,
+        )
             as Gs1PendingIngressRecoveryResult.Failed
 
         assertEquals("RECOVERY_CORE_REJECTED", result.code)
@@ -199,7 +330,12 @@ class Gs1PendingIngressRecoveryTest {
         val result = recovery(journal) {
             replayCalls += 1
             completedReplay(index = 10)
-        }.recover(profile(), generation = 1L, initialCoreCursor = 10)
+        }.recover(
+            profile(),
+            generation = 1L,
+            initialCoreCursor = 10,
+            initialWireProfile = Gs1WireProfile.V120,
+        )
             as Gs1PendingIngressRecoveryResult.Failed
 
         assertEquals("RECOVERY_INGRESS_IDENTITY_MISMATCH", result.code)
@@ -218,7 +354,12 @@ class Gs1PendingIngressRecoveryTest {
                     detail = "strict verifier rejected compatibility decode",
                 ),
             )
-        }.recover(profile(), generation = 1L, initialCoreCursor = 10)
+        }.recover(
+            profile(),
+            generation = 1L,
+            initialCoreCursor = 10,
+            initialWireProfile = Gs1WireProfile.V120,
+        )
             as Gs1PendingIngressRecoveryResult.Completed
 
         assertEquals(10, result.finalCoreCursor)
@@ -240,9 +381,19 @@ class Gs1PendingIngressRecoveryTest {
             },
         )
         val first = recovery(journal) { error("ack is non-data") }
-            .recover(profile(), generation = 1L, initialCoreCursor = 10)
+            .recover(
+                profile(),
+                generation = 1L,
+                initialCoreCursor = 10,
+                initialWireProfile = Gs1WireProfile.V120,
+            )
         val second = recovery(journal) { error("ack is non-data") }
-            .recover(profile(), generation = 2L, initialCoreCursor = 10)
+            .recover(
+                profile(),
+                generation = 2L,
+                initialCoreCursor = 10,
+                initialWireProfile = Gs1WireProfile.V120,
+            )
 
         assertEquals("RECOVERY_OUTCOME_STORAGE_UNAVAILABLE", (first as Gs1PendingIngressRecoveryResult.Failed).code)
         assertTrue(second is Gs1PendingIngressRecoveryResult.Completed)
@@ -258,12 +409,12 @@ class Gs1PendingIngressRecoveryTest {
         replay = { _, packet -> replay(packet) },
     )
 
-    private fun profile(): Gs1DiagnosticActivationProfile =
+    private fun profile(transportVariant: Int = 0): Gs1DiagnosticActivationProfile =
         (Gs1DiagnosticActivationProfile.validate(
             sensorId = "sensor-a",
             family = SensorFamily.SIBIONICS_GS1,
             bluetoothAddress = "AA:BB:CC:DD:EE:FF",
-            transportVariant = 0,
+            transportVariant = transportVariant,
             packageCode = "ABCDEFGH",
         ) as Gs1DiagnosticActivationProfileValidation.Valid).profile
 
@@ -313,6 +464,15 @@ class Gs1PendingIngressRecoveryTest {
         plain.putU16Le(9 + count * 8, 0)
         plain[length] = SibionicsPacketCodec.checksum(plain, length)
         return codec.encryptForTest(plain)
+    }
+
+    private fun v115Response(index: Int): ByteArray {
+        val fields = listOf(index, 300, 20, 1_000, 0, 0, 0)
+        val record = fields.flatMap { value ->
+            listOf((value ushr 8).toByte(), value.toByte())
+        }.toByteArray()
+        val body = byteArrayOf(0xaa.toByte(), 0x55, 0x09, 0x01) + record
+        return body + (-body.sum()).toByte()
     }
 
     private fun ByteArray.putU16Le(offset: Int, value: Int) {

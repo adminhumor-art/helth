@@ -10,6 +10,35 @@ import androidx.room.Upsert
 @Dao
 internal abstract class SensorCoreDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
+    abstract suspend fun insertProtocolBinding(value: SensorProtocolBindingEntity): Long
+
+    @Query("SELECT * FROM sensor_protocol_bindings WHERE sensorId = :sensorId LIMIT 1")
+    abstract suspend fun protocolBinding(sensorId: String): SensorProtocolBindingEntity?
+
+    @Query(
+        "SELECT * FROM sensor_protocol_bindings " +
+            "WHERE bluetoothAddress = :bluetoothAddress LIMIT 1",
+    )
+    abstract suspend fun protocolBindingByBluetoothAddress(
+        bluetoothAddress: String,
+    ): SensorProtocolBindingEntity?
+
+    @Transaction
+    open suspend fun bindProtocol(value: SensorProtocolBindingEntity): SensorCoreCommitDisposition {
+        val physical = protocolBindingByBluetoothAddress(value.bluetoothAddress)
+        if (physical != null && physical.sensorId != value.sensorId) {
+            conflict("Bluetooth address is already bound to another protocol identity")
+        }
+        if (insertProtocolBinding(value) != INSERT_IGNORED) {
+            return SensorCoreCommitDisposition.COMMITTED
+        }
+        if (protocolBinding(value.sensorId) == value) {
+            return SensorCoreCommitDisposition.ALREADY_COMMITTED
+        }
+        conflict("Protocol binding is immutable and conflicts with stored evidence")
+    }
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
     abstract suspend fun insertRaw(value: RawSensorSampleEntity): Long
 
     @Query("SELECT * FROM sensor_raw_samples WHERE eventId = :eventId LIMIT 1")
@@ -64,6 +93,16 @@ internal abstract class SensorCoreDao {
 
     @Transaction
     open suspend fun commit(value: SensorCoreEntityBundle): SensorCoreCommitDisposition {
+        val protocolBinding = protocolBinding(value.checkpoint.sensorId)
+            ?: conflict("Protocol must be durably bound before the first core commit")
+        val physicalProtocolBinding = protocolBindingByBluetoothAddress(
+            value.checkpoint.bluetoothAddress,
+        )
+        if (physicalProtocolBinding != protocolBinding ||
+            !protocolBinding.matchesCheckpoint(value.checkpoint)
+        ) {
+            conflict("Core checkpoint does not match the durable protocol binding")
+        }
         val savedCheckpoint = checkpoint(value.checkpoint.sensorId)
         val physicalCheckpoint = checkpointByBluetoothAddress(value.checkpoint.bluetoothAddress)
         when {
@@ -82,8 +121,8 @@ internal abstract class SensorCoreDao {
                 value.checkpoint.sequence != savedCheckpoint.sequence + 1 ->
                 conflict("Checkpoint sequence gap")
             savedCheckpoint.sequence < value.checkpoint.sequence &&
-                value.checkpoint.sensorTimeEpochMs != savedCheckpoint.sensorTimeEpochMs + MILLIS_PER_SAMPLE ->
-                conflict("Checkpoint sensor time is not the next minute")
+                !savedCheckpoint.acceptsNextSensorTime(value.checkpoint) ->
+                conflict("Checkpoint sensor time violates its transport contract")
         }
 
         var wroteAnything = false
@@ -160,7 +199,17 @@ private fun RawSensorSampleEntity.sameAs(other: RawSensorSampleEntity): Boolean 
         currentRaw == other.currentRaw &&
         temperatureRaw == other.temperatureRaw &&
         historyDistance == other.historyDistance &&
-        transportVariant == other.transportVariant
+        transportVariant == other.transportVariant &&
+        sensorTimeWasClamped == other.sensorTimeWasClamped &&
+        addTimeSeconds == other.addTimeSeconds
+
+private fun SensorAlgorithmCheckpointEntity.acceptsNextSensorTime(
+    next: SensorAlgorithmCheckpointEntity,
+): Boolean = if (transportProtocol == "GS1_V115") {
+    next.sensorTimeEpochMs >= sensorTimeEpochMs
+} else {
+    next.sensorTimeEpochMs == sensorTimeEpochMs + 60_000L
+}
 
 private fun SensorAlgorithmCheckpointEntity.sameAs(other: SensorAlgorithmCheckpointEntity): Boolean =
     sensorId == other.sensorId &&
@@ -168,7 +217,7 @@ private fun SensorAlgorithmCheckpointEntity.sameAs(other: SensorAlgorithmCheckpo
         sensorFamily == other.sensorFamily &&
         transportVariant == other.transportVariant &&
         transportProtocol == other.transportProtocol &&
-        dataHandleBinarySetId == other.dataHandleBinarySetId &&
+        transportCodecId == other.transportCodecId &&
         sequence == other.sequence &&
         sensorTimeEpochMs == other.sensorTimeEpochMs &&
         algorithmProfile == other.algorithmProfile &&
@@ -192,7 +241,7 @@ private fun SensorAlgorithmCheckpointEntity.hasSameImmutableProvenanceAs(
         sensorFamily == other.sensorFamily &&
         transportVariant == other.transportVariant &&
         transportProtocol == other.transportProtocol &&
-        dataHandleBinarySetId == other.dataHandleBinarySetId &&
+        transportCodecId == other.transportCodecId &&
         algorithmProfile == other.algorithmProfile &&
         algorithmVersion == other.algorithmVersion &&
         binarySetId == other.binarySetId &&
@@ -202,6 +251,19 @@ private fun SensorAlgorithmCheckpointEntity.hasSameImmutableProvenanceAs(
         sensitivityEncoding == other.sensitivityEncoding &&
         initializationMode == other.initializationMode &&
         schemaVersion == other.schemaVersion
+
+private fun SensorProtocolBindingEntity.matchesCheckpoint(
+    checkpoint: SensorAlgorithmCheckpointEntity,
+): Boolean = sensorId == checkpoint.sensorId &&
+    bluetoothAddress == checkpoint.bluetoothAddress &&
+    sensorFamily == checkpoint.sensorFamily &&
+    transportVariant == checkpoint.transportVariant &&
+    sensitivityToken == checkpoint.sensitivityToken &&
+    transportProtocol == checkpoint.transportProtocol &&
+    transportCodecId == checkpoint.transportCodecId &&
+    algorithmProfile == checkpoint.algorithmProfile &&
+    sensitivityEncoding == checkpoint.sensitivityEncoding &&
+    schemaVersion == checkpoint.schemaVersion
 
 private fun MeasurementEntity.hasSameMedicalDataAs(other: MeasurementEntity): Boolean =
     eventId == other.eventId &&

@@ -8,4 +8,5 @@
     <string name="widget_demo_no_fresh_data">ДЕМО · нет свежих данных</string>
     <string name="widget_demo_open_app">ДЕМО · откройте приложение</string>
     <string name="widget_setup_required">Требуется настройка датчика</string>
+    <string name="data_matrix_scanner_instruction">Наведите камеру на DataMatrix с 8-символьным кодом датчика</string>
 </resources>

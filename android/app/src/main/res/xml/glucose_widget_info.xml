@@ -7,6 +7,6 @@
     android:minHeight="96dp"
     android:previewLayout="@layout/glucose_widget"
     android:resizeMode="horizontal|vertical"
-    android:updatePeriodMillis="0"
+    android:updatePeriodMillis="1800000"
     android:widgetCategory="home_screen"
     tools:targetApi="s" />

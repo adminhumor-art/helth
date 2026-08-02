@@ -71,7 +71,7 @@ data class AlgorithmCheckpoint(
     val nativeStateSha256: String,
     val displayOffsetMmolL: Double,
     val schemaVersion: Int,
-    val algorithmVersion: String = "unknown",
+    val algorithmVersion: String,
 )
 
 data class AlgorithmWarnings(
@@ -100,6 +100,7 @@ enum class AlgorithmErrorCode {
     BINARY_SET_MISMATCH,
     SENSITIVITY_TOKEN_MISMATCH,
     INITIALIZATION_MODE_MISMATCH,
+    ALGORITHM_VERSION_MISMATCH,
     STATE_SIZE_MISMATCH,
     STATE_HASH_MISMATCH,
     NATIVE_CREATE_FAILED,

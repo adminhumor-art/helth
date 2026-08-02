@@ -16,7 +16,6 @@ interface NativeAlgorithmApi {
     val supportedInitializationModes: Set<AlgorithmInitializationMode>
         get() = setOf(AlgorithmInitializationMode.STANDARD)
     val algorithmVersion: String
-        get() = "unknown"
 
     fun createContext(): NativeAlgorithmContext
     fun initialize(

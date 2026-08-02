@@ -7,6 +7,7 @@ import com.sladkaya.core.data.SensorCoreStore
 import com.sladkaya.core.data.SensorFailureCommitResult
 import com.sladkaya.core.data.SensorIngestionFailureRecord
 import com.sladkaya.core.model.SensorFamily
+import com.sladkaya.core.sensor.SensorConfiguration
 import com.sladkaya.sensor.sibionics.algorithm.AlgorithmInitializationMode
 import com.sladkaya.sensor.sibionics.algorithm.AlgorithmInput
 import com.sladkaya.sensor.sibionics.algorithm.AlgorithmProfile
@@ -21,7 +22,9 @@ import com.sladkaya.sensor.sibionics.algorithm.SibionicsAlgorithmSession
 import com.sladkaya.sensor.sibionics.datahandle.SibionicsDataHandle
 import java.security.MessageDigest
 import java.util.concurrent.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -106,23 +109,124 @@ class Gs1CoreFactoryTest {
     }
 
     @Test
-    fun factionOnlyEncodingIsRecordedAsUnsupportedNotUsedAsInitBranch() = runBlocking {
+    fun factionEncodingUsesExactInitAndRemainsPinnedInTheBindingTuple() = runBlocking {
         val native = FactoryNative()
+        val configuration = configuration()
+        val store = FactoryStore()
+        val factionBinding = binding(configuration, Gs1WireProfile.V120)
+            .copy(sensitivityEncoding = "FACTION")
         val factory = Gs1CoreFactory(
-            store = FactoryStore(),
+            store = store,
             decodeSensitivity = { token ->
                 SensitivityDecodeResult.Success(DecodedSensitivity(token, 1.58f, SensitivityEncoding.FACTION))
             },
             nativeProvider = { native },
         )
 
-        val result = factory.open(configuration())
-
-        assertEquals(
-            Gs1CoreOpenError.UNSUPPORTED_SENSITIVITY_ENCODING,
-            (result as Gs1CoreOpenResult.Failure).error,
+        val result = factory.open(
+            configuration,
+            factionBinding,
         )
-        assertTrue(native.calls.isEmpty())
+
+        assertTrue(result is Gs1CoreOpenResult.Success)
+        assertEquals(listOf("create", "init:FACTION:ABCDEFGH"), native.calls)
+        result as Gs1CoreOpenResult.Success
+        val processed = result.coordinator.process(
+            encryptedPacket = byteArrayOf(1),
+            sample = DecodedGs1RawSample(
+                index = 1,
+                sensorTimeEpochSeconds = 1_900_000_000L,
+                current = 50,
+                temperature = 321,
+                reindex = 0,
+            ),
+            receivedAtEpochMs = 1_900_000_000_000L,
+        )
+        assertTrue(processed.toString(), processed is Gs1ProcessingResult.Diagnostic)
+        assertEquals("FACTION", store.records.single().checkpoint.sensitivityEncoding)
+        assertEquals("FACTION", store.records.single().checkpoint.initializationMode)
+
+        val restoredNative = FactoryNative()
+        val restoredFactory = Gs1CoreFactory(
+            store = FactoryStore(
+                savedCheckpoint = store.records.single().checkpoint,
+                initialProtocolBinding = factionBinding,
+            ),
+            decodeSensitivity = { token ->
+                SensitivityDecodeResult.Success(
+                    DecodedSensitivity(token, 1.58f, SensitivityEncoding.FACTION),
+                )
+            },
+            nativeProvider = { restoredNative },
+        )
+        val reopened = restoredFactory.open(configuration, factionBinding)
+            as Gs1CoreOpenResult.Success
+        assertEquals(2, reopened.nextSensorIndex)
+        assertEquals(
+            listOf("create", "init:FACTION:ABCDEFGH", "restore:2480"),
+            restoredNative.calls,
+        )
+    }
+
+    @Test
+    fun v115gFactionCommitAndReopenKeepTheExactDurableTuple() = runBlocking {
+        val configuration = configuration(
+            transportVariant = 2,
+            wireProfile = Gs1WireProfile.V115,
+        )
+        val factionBinding = binding(configuration, Gs1WireProfile.V115)
+            .copy(sensitivityEncoding = "FACTION")
+        val native = FactoryNative(AlgorithmProfile.V115G)
+        val store = FactoryStore(initialProtocolBinding = factionBinding)
+        val factory = Gs1CoreFactory(
+            store = store,
+            decodeSensitivity = { token ->
+                SensitivityDecodeResult.Success(
+                    DecodedSensitivity(token, 1.58f, SensitivityEncoding.FACTION),
+                )
+            },
+            nativeProvider = { native },
+        )
+        val opened = factory.open(configuration, factionBinding) as Gs1CoreOpenResult.Success
+
+        val processed = opened.coordinator.process(
+            encryptedPacket = byteArrayOf(1),
+            sample = DecodedGs1RawSample(
+                index = 1,
+                sensorTimeEpochSeconds = 1_900_000_000L,
+                current = 50,
+                temperature = 321,
+                reindex = 0,
+            ),
+            receivedAtEpochMs = 1_900_000_000_000L,
+        )
+
+        assertTrue(processed.toString(), processed is Gs1ProcessingResult.Diagnostic)
+        val checkpoint = store.records.single().checkpoint
+        assertEquals("V115G", checkpoint.algorithmProfile)
+        assertEquals("FACTION", checkpoint.sensitivityEncoding)
+        assertEquals("FACTION", checkpoint.initializationMode)
+
+        val restoredNative = FactoryNative(AlgorithmProfile.V115G)
+        val restoredFactory = Gs1CoreFactory(
+            store = FactoryStore(
+                savedCheckpoint = checkpoint,
+                initialProtocolBinding = factionBinding,
+            ),
+            decodeSensitivity = { token ->
+                SensitivityDecodeResult.Success(
+                    DecodedSensitivity(token, 1.58f, SensitivityEncoding.FACTION),
+                )
+            },
+            nativeProvider = { restoredNative },
+        )
+        val reopened = restoredFactory.open(configuration, factionBinding)
+            as Gs1CoreOpenResult.Success
+        assertEquals(2, reopened.nextSensorIndex)
+        assertEquals(
+            listOf("create", "init:FACTION:ABCDEFGH", "restore:2336"),
+            restoredNative.calls,
+        )
     }
 
     @Test
@@ -172,6 +276,27 @@ class Gs1CoreFactoryTest {
             decodeSensitivity = {
                 SensitivityDecodeResult.Success(DecodedSensitivity(token, 1.43f, SensitivityEncoding.NORMAL))
             },
+            nativeProvider = { native },
+        )
+
+        val result = factory.open(configuration())
+
+        assertEquals(
+            Gs1CoreOpenError.CHECKPOINT_CALIBRATION_MISMATCH,
+            (result as Gs1CoreOpenResult.Failure).error,
+        )
+        assertTrue(native.calls.isEmpty())
+    }
+
+    @Test
+    fun checkpointFromAnotherAlgorithmVersionCannotRestoreNativeState() = runBlocking {
+        val native = FactoryNative()
+        val token = SensitivityToken.packageCode("ABCDEFGH")
+        val sensitivity = DecodedSensitivity(token, 1.42f, SensitivityEncoding.NORMAL)
+        val saved = checkpoint(native, sensitivity).copy(algorithmVersion = "foreign-version")
+        val factory = Gs1CoreFactory(
+            store = FactoryStore(savedCheckpoint = saved),
+            decodeSensitivity = { SensitivityDecodeResult.Success(sensitivity) },
             nativeProvider = { native },
         )
 
@@ -248,6 +373,19 @@ class Gs1CoreFactoryTest {
     fun coroutineCancellationIsNeverConvertedIntoStorageFailure() {
         runBlocking {
             val store = object : SensorCoreStore {
+                override suspend fun bindProtocol(
+                    record: com.sladkaya.core.data.SensorProtocolBindingRecord,
+                ): com.sladkaya.core.data.SensorProtocolBindingCommitResult =
+                    com.sladkaya.core.data.SensorProtocolBindingCommitResult.Bound
+
+                override suspend fun protocolBinding(
+                    sensorId: String,
+                ): com.sladkaya.core.data.SensorProtocolBindingRecord? = null
+
+                override suspend fun protocolBindingByBluetoothAddress(
+                    bluetoothAddress: String,
+                ): com.sladkaya.core.data.SensorProtocolBindingRecord? = null
+
                 override suspend fun commit(record: AtomicSensorCoreRecord): SensorCoreCommitResult =
                     SensorCoreCommitResult.Committed
 
@@ -329,17 +467,368 @@ class Gs1CoreFactoryTest {
         assertEquals(0, decoderCalls)
     }
 
+    @Test
+    fun chineseRuntimeCannotTouchCheckpointOrNativeBeforeDurableBinding() = runBlocking {
+        val store = FactoryStore()
+        val native = FactoryNative(AlgorithmProfile.V115G)
+        val factory = Gs1CoreFactory(
+            store = store,
+            decodeSensitivity = { token ->
+                SensitivityDecodeResult.Success(
+                    DecodedSensitivity(token, 1.42f, SensitivityEncoding.NORMAL),
+                )
+            },
+            nativeProvider = { native },
+        )
+
+        val profile = (Gs1DiagnosticActivationProfile.validate(
+            sensorId = "sensor-a",
+            family = SensorFamily.SIBIONICS_GS1,
+            bluetoothAddress = "AA:BB:CC:DD:EE:FF",
+            transportVariant = 2,
+            packageCode = "ABCDEFGH",
+        ) as Gs1DiagnosticActivationProfileValidation.Valid).profile
+        val result = FactoryGs1RuntimeCoreOpener(factory).open(profile)
+
+        assertTrue(result is Gs1RuntimeCoreOpenResult.Success)
+        assertEquals(
+            Gs1WireProfile.UNRESOLVED,
+            (result as Gs1RuntimeCoreOpenResult.Success).lease.wireProfile,
+        )
+        assertEquals(0, store.checkpointCalls)
+        assertTrue(native.calls.isEmpty())
+        result.lease.close()
+    }
+
+    @Test
+    fun globalRuntimeAlsoDefersStatefulCoreUntilValidatedSensorData() = runBlocking {
+        val store = FactoryStore()
+        val requestedProfiles = mutableListOf<AlgorithmProfile>()
+        val factory = Gs1CoreFactory(
+            store = store,
+            decodeSensitivity = { token ->
+                SensitivityDecodeResult.Success(
+                    DecodedSensitivity(token, 1.42f, SensitivityEncoding.NORMAL),
+                )
+            },
+            nativeProvider = { requested ->
+                requestedProfiles += requested
+                FactoryNative(requested)
+            },
+        )
+
+        val opened = FactoryGs1RuntimeCoreOpener(factory).open(activationProfile(0))
+            as Gs1RuntimeCoreOpenResult.Success
+
+        assertEquals(Gs1WireProfile.V120, opened.lease.wireProfile)
+        assertEquals(0, store.checkpointCalls)
+        assertTrue(requestedProfiles.isEmpty())
+        opened.lease.close()
+    }
+
+    @Test
+    fun exactChallengeBindsV120BeforeOpeningOnlyV116A() = runBlocking {
+        val store = FactoryStore()
+        val requestedProfiles = mutableListOf<AlgorithmProfile>()
+        val factory = Gs1CoreFactory(
+            store = store,
+            decodeSensitivity = { token ->
+                SensitivityDecodeResult.Success(
+                    DecodedSensitivity(token, 1.42f, SensitivityEncoding.NORMAL),
+                )
+            },
+            nativeProvider = { requested ->
+                requestedProfiles += requested
+                FactoryNative(requested)
+            },
+        )
+        val lease = (FactoryGs1RuntimeCoreOpener(factory).open(activationProfile(2))
+            as Gs1RuntimeCoreOpenResult.Success).lease
+
+        val result = lease.ingest(
+            DurablyJournaledGs1Packet(
+                ingressId = "challenge",
+                receivedAtEpochMs = 1_700_000_000_000L,
+                encryptedPacket = byteArrayOf(
+                    0x23,
+                    0xf7.toByte(),
+                    0x6f,
+                    0xd9.toByte(),
+                    0xf4.toByte(),
+                ),
+            ),
+        ) as Gs1PacketProcessingResult.Completed
+
+        assertEquals(Gs1WireProfile.V120, result.resolvedWireProfile)
+        assertEquals(listOf(AlgorithmProfile.V116A), requestedProfiles)
+        assertEquals("V120", store.savedProtocolBinding?.wireProfile)
+        assertEquals(1, store.checkpointCalls)
+        lease.close()
+    }
+
+    @Test
+    fun factionSensitivityIsBoundBeforeExactFactionInitAndCheckpointing() = runBlocking {
+        val store = FactoryStore()
+        val native = FactoryNative()
+        val factory = Gs1CoreFactory(
+            store = store,
+            decodeSensitivity = { token ->
+                SensitivityDecodeResult.Success(
+                    DecodedSensitivity(token, 1.58f, SensitivityEncoding.FACTION),
+                )
+            },
+            nativeProvider = { native },
+        )
+        val lease = (FactoryGs1RuntimeCoreOpener(factory).open(activationProfile(2))
+            as Gs1RuntimeCoreOpenResult.Success).lease
+
+        val result = lease.ingest(
+            DurablyJournaledGs1Packet(
+                ingressId = "faction-challenge",
+                receivedAtEpochMs = 1_700_000_000_000L,
+                encryptedPacket = byteArrayOf(
+                    0x23,
+                    0xf7.toByte(),
+                    0x6f,
+                    0xd9.toByte(),
+                    0xf4.toByte(),
+                ),
+            ),
+        ) as Gs1PacketProcessingResult.Completed
+
+        assertEquals(Gs1WireProfile.V120, result.resolvedWireProfile)
+        assertEquals("FACTION", store.savedProtocolBinding?.sensitivityEncoding)
+        assertEquals(listOf("create", "init:FACTION:ABCDEFGH"), native.calls)
+        assertEquals(1, store.checkpointCalls)
+        lease.close()
+    }
+
+    @Test
+    fun validatedV115EnvelopeBindsAndProcessesOnlyThroughV115G() = runBlocking {
+        val store = FactoryStore()
+        val requestedProfiles = mutableListOf<AlgorithmProfile>()
+        val factory = Gs1CoreFactory(
+            store = store,
+            decodeSensitivity = { token ->
+                SensitivityDecodeResult.Success(
+                    DecodedSensitivity(token, 1.42f, SensitivityEncoding.NORMAL),
+                )
+            },
+            nativeProvider = { requested ->
+                requestedProfiles += requested
+                FactoryNative(requested)
+            },
+        )
+        val lease = (FactoryGs1RuntimeCoreOpener(factory).open(activationProfile(2))
+            as Gs1RuntimeCoreOpenResult.Success).lease
+
+        val result = lease.ingest(
+            DurablyJournaledGs1Packet(
+                ingressId = "v115-data",
+                receivedAtEpochMs = 1_700_000_000_999L,
+                encryptedPacket = v115Response(index = 1),
+            ),
+        ) as Gs1PacketProcessingResult.Completed
+
+        assertEquals(Gs1WireProfile.V115, result.resolvedWireProfile)
+        assertEquals(listOf(AlgorithmProfile.V115G), requestedProfiles)
+        assertEquals("V115", store.savedProtocolBinding?.wireProfile)
+        assertEquals("GS1_V115", store.records.single().checkpoint.transportProtocol)
+        assertEquals("GS1_V115_WIRE_V1", store.records.single().checkpoint.transportCodecId)
+        lease.close()
+    }
+
+    @Test
+    fun firstEmptyV115EnvelopeReachesStreamingWatchdogWithoutMedicalData() = runBlocking {
+        val store = FactoryStore()
+        val factory = Gs1CoreFactory(
+            store = store,
+            decodeSensitivity = { token ->
+                SensitivityDecodeResult.Success(
+                    DecodedSensitivity(token, 1.42f, SensitivityEncoding.NORMAL),
+                )
+            },
+            nativeProvider = { requested -> FactoryNative(requested) },
+        )
+        val committedEvent = CompletableDeferred<Gs1DiagnosticRuntimeEvent.Committed>()
+        val runtime = Gs1DiagnosticRuntime(
+            scope = this,
+            opener = FactoryGs1RuntimeCoreOpener(factory),
+            eventSink = { event ->
+                if (event is Gs1DiagnosticRuntimeEvent.Committed) committedEvent.complete(event)
+            },
+        )
+        val profile = activationProfile(2)
+        val started = runtime.start(profile) as Gs1RuntimeStartResult.Started
+        val session = SibionicsSession(
+            family = profile.family,
+            configuration = SensorConfiguration(
+                sensorId = profile.sensorId,
+                bluetoothAddress = profile.bluetoothAddress,
+                protocolVariant = profile.transportVariant,
+            ),
+            initialNextIndex = started.initialNextIndex,
+            initialWireProfile = started.wireProfile,
+        )
+        assertTrue(session.initial(profile.bluetoothAddress) is SessionAction.Write)
+
+        try {
+            val outcome = runtime.submitAndAwait(
+                started.generation,
+                DurablyJournaledGs1Packet(
+                    ingressId = "empty-v115-first-bind",
+                    receivedAtEpochMs = 1_700_000_000_000L,
+                    encryptedPacket = v115EmptyResponse(),
+                ),
+            ) as Gs1RuntimeAwaitResult.Processed
+            val completed = outcome.result as Gs1PacketProcessingResult.Completed
+            assertEquals(Gs1WireProfile.V115, completed.resolvedWireProfile)
+            assertTrue(completed.validatedTransportEnvelope)
+            assertEquals(SessionAction.None, session.confirmWireProfile(Gs1WireProfile.V115))
+
+            val event = withTimeout(1_000L) { committedEvent.await() }
+            assertEquals(SessionAction.None, session.confirmDurablyCommitted(event.samples))
+            val assessment = Gs1DiagnosticCommitPolicy.assess(
+                diagnostics = event.diagnostics,
+                committedSampleCount = event.samples.size,
+                issueCount = event.issues.size,
+                validatedTransportEnvelope = event.validatedTransportEnvelope,
+            )
+            val progress = Gs1DiagnosticCommitProgressPolicy.plan(
+                alreadyStreaming = false,
+                assessment = assessment,
+            )
+
+            assertTrue(progress.markStreaming)
+            assertTrue(progress.armSilenceWatchdog)
+            assertTrue(event.samples.isEmpty())
+            assertTrue(event.diagnostics.isEmpty())
+            assertTrue(store.records.isEmpty())
+        } finally {
+            runtime.stop(started.generation)
+        }
+    }
+
+    @Test
+    fun exactV115BindingSelectsOnlyV115GAndPinsItsTransportTuple() = runBlocking {
+        val store = FactoryStore()
+        val native = FactoryNative(AlgorithmProfile.V115G)
+        val factory = Gs1CoreFactory(
+            store = store,
+            decodeSensitivity = { token ->
+                SensitivityDecodeResult.Success(
+                    DecodedSensitivity(token, 1.42f, SensitivityEncoding.NORMAL),
+                )
+            },
+            nativeProvider = { requested ->
+                assertEquals(AlgorithmProfile.V115G, requested)
+                native
+            },
+        )
+        val configuration = configuration(
+            transportVariant = 2,
+            wireProfile = Gs1WireProfile.V115,
+        )
+
+        val result = factory.open(configuration, binding(configuration, Gs1WireProfile.V115))
+
+        assertTrue(result is Gs1CoreOpenResult.Success)
+        assertTrue(native.calls.contains("init:STANDARD:ABCDEFGH"))
+    }
+
+    @Test
+    fun oppositeBindingTupleFailsBeforeCheckpointOrNative() = runBlocking {
+        val store = FactoryStore()
+        val native = FactoryNative(AlgorithmProfile.V115G)
+        val factory = Gs1CoreFactory(
+            store = store,
+            decodeSensitivity = { token ->
+                SensitivityDecodeResult.Success(
+                    DecodedSensitivity(token, 1.42f, SensitivityEncoding.NORMAL),
+                )
+            },
+            nativeProvider = { native },
+        )
+        val configuration = configuration(
+            transportVariant = 2,
+            wireProfile = Gs1WireProfile.V115,
+        )
+
+        val result = factory.open(configuration, binding(configuration, Gs1WireProfile.V120))
+
+        assertEquals(
+            Gs1CoreOpenError.PROTOCOL_BINDING_MISMATCH,
+            (result as Gs1CoreOpenResult.Failure).error,
+        )
+        assertEquals(0, store.checkpointCalls)
+        assertTrue(native.calls.isEmpty())
+    }
+
     private fun configuration(
         packageCode: String = "ABCDEFGH",
         transportVariant: Int = 0,
         bluetoothAddress: String = "AA:BB:CC:DD:EE:FF",
+        wireProfile: Gs1WireProfile = Gs1WireProfile.V120,
     ) = Gs1CoreConfiguration(
         sensorId = "sensor-a",
         family = SensorFamily.SIBIONICS_GS1,
         bluetoothAddress = bluetoothAddress,
         transportVariant = transportVariant,
         packageCode = packageCode,
+        wireProfile = wireProfile,
     )
+
+    private fun activationProfile(transportVariant: Int): Gs1DiagnosticActivationProfile =
+        (Gs1DiagnosticActivationProfile.validate(
+            sensorId = "sensor-a",
+            family = SensorFamily.SIBIONICS_GS1,
+            bluetoothAddress = "AA:BB:CC:DD:EE:FF",
+            transportVariant = transportVariant,
+            packageCode = "ABCDEFGH",
+        ) as Gs1DiagnosticActivationProfileValidation.Valid).profile
+
+    private fun v115Response(index: Int): ByteArray {
+        val fields = listOf(index, 300, 20, 1_000, 0, 0, 0)
+        val record = fields.flatMap { value ->
+            listOf((value ushr 8).toByte(), value.toByte())
+        }.toByteArray()
+        val body = byteArrayOf(0xaa.toByte(), 0x55, 0x09, 0x01) + record
+        return body + (-body.sum()).toByte()
+    }
+
+    private fun v115EmptyResponse(): ByteArray {
+        val body = byteArrayOf(0xaa.toByte(), 0x55, 0x09, 0x00)
+        return body + (-body.sum()).toByte()
+    }
+
+    private suspend fun Gs1CoreFactory.open(
+        configuration: Gs1CoreConfiguration,
+    ): Gs1CoreOpenResult = open(
+        configuration,
+        binding(configuration, configuration.wireProfile),
+    )
+
+    private fun binding(
+        configuration: Gs1CoreConfiguration,
+        wireProfile: Gs1WireProfile,
+    ): com.sladkaya.core.data.SensorProtocolBindingRecord {
+        val spec = Gs1WireProfiles.requireResolved(wireProfile)
+        return com.sladkaya.core.data.SensorProtocolBindingRecord(
+            sensorId = configuration.sensorId,
+            bluetoothAddress = configuration.bluetoothAddress,
+            sensorFamily = configuration.family,
+            transportVariant = configuration.transportVariant,
+            sensitivityToken = configuration.packageCode.takeIf { it.length == 8 } ?: "ABCDEFGH",
+            wireProfile = wireProfile.name,
+            transportProtocol = spec.transportProtocol,
+            transportCodecId = spec.transportCodecId,
+            algorithmProfile = spec.algorithmProfile.name,
+            sensitivityEncoding = "NORMAL",
+            evidenceKind = "TEST_EVIDENCE",
+            evidenceSha256 = "ab".repeat(32),
+            schemaVersion = 1,
+        )
+    }
 
     private fun checkpoint(
         native: FactoryNative,
@@ -352,7 +841,7 @@ class Gs1CoreFactoryTest {
             sensorFamily = SensorFamily.SIBIONICS_GS1,
             transportVariant = 0,
             transportProtocol = "GS1_V120",
-            dataHandleBinarySetId = SibionicsDataHandle.BINARY_SET_ID,
+            transportCodecId = SibionicsDataHandle.BINARY_SET_ID,
             sequence = 40,
             sensorTimeEpochMs = 1_700_000_000_000L,
             algorithmProfile = AlgorithmProfile.V116A.name,
@@ -378,9 +867,35 @@ class Gs1CoreFactoryTest {
 private class FactoryStore(
     private val savedCheckpoint: SensorAlgorithmCheckpointRecord? = null,
     private val physicalCheckpoint: SensorAlgorithmCheckpointRecord? = savedCheckpoint,
+    initialProtocolBinding: com.sladkaya.core.data.SensorProtocolBindingRecord? = null,
 ) : SensorCoreStore {
     var checkpointCalls = 0
     val records = mutableListOf<AtomicSensorCoreRecord>()
+    var savedProtocolBinding = initialProtocolBinding
+
+    override suspend fun bindProtocol(
+        record: com.sladkaya.core.data.SensorProtocolBindingRecord,
+    ): com.sladkaya.core.data.SensorProtocolBindingCommitResult {
+        val current = savedProtocolBinding
+        return when {
+            current == null -> {
+                savedProtocolBinding = record
+                com.sladkaya.core.data.SensorProtocolBindingCommitResult.Bound
+            }
+            current == record -> com.sladkaya.core.data.SensorProtocolBindingCommitResult.AlreadyBound
+            else -> com.sladkaya.core.data.SensorProtocolBindingCommitResult.Conflict("immutable")
+        }
+    }
+
+    override suspend fun protocolBinding(
+        sensorId: String,
+    ): com.sladkaya.core.data.SensorProtocolBindingRecord? =
+        savedProtocolBinding?.takeIf { it.sensorId == sensorId }
+
+    override suspend fun protocolBindingByBluetoothAddress(
+        bluetoothAddress: String,
+    ): com.sladkaya.core.data.SensorProtocolBindingRecord? =
+        savedProtocolBinding?.takeIf { it.bluetoothAddress == bluetoothAddress }
 
     override suspend fun commit(record: AtomicSensorCoreRecord): SensorCoreCommitResult {
         records += record
@@ -401,10 +916,12 @@ private class FactoryStore(
     ): SensorFailureCommitResult = SensorFailureCommitResult.Committed
 }
 
-private class FactoryNative : NativeAlgorithmApi {
-    override val profile = AlgorithmProfile.V116A
-    override val binarySetId = "v116a-test"
-    override val algorithmVersion = "1.1.6A-test"
+private class FactoryNative(
+    override val profile: AlgorithmProfile = AlgorithmProfile.V116A,
+    override val algorithmVersion: String = "test-${profile.name}-version",
+) : NativeAlgorithmApi {
+    override val binarySetId = "test-${profile.name}-binary-set"
+    override val supportedInitializationModes = AlgorithmInitializationMode.entries.toSet()
     val state = ByteArray(profile.stateSize) { (it * 7).toByte() }
     val calls = mutableListOf<String>()
 

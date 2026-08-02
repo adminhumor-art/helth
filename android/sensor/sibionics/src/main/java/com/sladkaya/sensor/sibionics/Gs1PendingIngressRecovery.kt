@@ -9,6 +9,7 @@ import java.util.concurrent.CancellationException
 internal sealed interface Gs1PendingIngressRecoveryResult {
     data class Completed(
         val finalCoreCursor: Int,
+        val finalWireProfile: Gs1WireProfile,
         val handledRecords: Int,
         val blocked: Gs1PendingIngressRecoveryEntry? = null,
     ) : Gs1PendingIngressRecoveryResult
@@ -33,8 +34,12 @@ internal class Gs1PendingIngressRecovery(
         profile: Gs1DiagnosticActivationProfile,
         generation: Long,
         initialCoreCursor: Int,
+        initialWireProfile: Gs1WireProfile,
     ): Gs1PendingIngressRecoveryResult {
         require(generation > 0L)
+        if (initialCoreCursor == CURSOR_AFTER_LAST_SENSOR_INDEX) {
+            return sequenceExhausted()
+        }
         val records = try {
             journal.pending(profile.sensorId, profile.bluetoothAddress)
         } catch (cancelled: CancellationException) {
@@ -47,8 +52,8 @@ internal class Gs1PendingIngressRecovery(
             )
         }
 
-        val planner = Gs1PendingIngressRecoveryPlanner(profile.family, codec)
         var cursor = initialCoreCursor
+        var wireProfile = initialWireProfile
         var handled = 0
         records.forEach { record ->
             if (record.sensorId != profile.sensorId ||
@@ -68,6 +73,11 @@ internal class Gs1PendingIngressRecovery(
             var replayEntry: Gs1PendingIngressRecoveryEntry? = null
             var blockedEntry: Gs1PendingIngressRecoveryEntry? = null
             recoveryScan@ for (record in remaining.toList()) {
+                val planner = Gs1PendingIngressRecoveryPlanner(
+                    profile.family,
+                    codec,
+                    wireProfile,
+                )
                 val entry = planner.plan(cursor, listOf(record)).single()
                 when (entry.disposition) {
                     Gs1PendingIngressRecoveryDisposition.NON_DATA -> {
@@ -98,6 +108,10 @@ internal class Gs1PendingIngressRecovery(
                         if (replayEntry == null) replayEntry = entry
                     }
 
+                    Gs1PendingIngressRecoveryDisposition.RESOLVE_EXACT -> {
+                        if (replayEntry == null) replayEntry = entry
+                    }
+
                     Gs1PendingIngressRecoveryDisposition.BLOCKED_BY_GAP,
                     Gs1PendingIngressRecoveryDisposition.PARTIAL_OVERLAP,
                     -> if (blockedEntry == null) blockedEntry = entry
@@ -115,6 +129,7 @@ internal class Gs1PendingIngressRecovery(
 
             val entry = replayEntry ?: return Gs1PendingIngressRecoveryResult.Completed(
                 finalCoreCursor = cursor,
+                finalWireProfile = wireProfile,
                 handledRecords = handled,
                 blocked = blockedEntry,
             )
@@ -138,12 +153,24 @@ internal class Gs1PendingIngressRecovery(
                 )
             }
             when (val validation = validateReplay(entry, replayResult)) {
-                ReplayValidation.Success -> {
-                    mark(entry, SensorPacketIngressOutcomeStatus.CORE_COMMITTED, detail = null)
+                is ReplayValidation.Success -> {
+                    mark(
+                        entry,
+                        if (entry.disposition == Gs1PendingIngressRecoveryDisposition.RESOLVE_EXACT) {
+                            SensorPacketIngressOutcomeStatus.NON_DATA
+                        } else {
+                            SensorPacketIngressOutcomeStatus.CORE_COMMITTED
+                        },
+                        detail = null,
+                    )
                         ?.let { return it }
                     cursor = entry.projectedCursorAfter
+                    validation.resolvedWireProfile?.let { wireProfile = it }
                     remaining.remove(record)
                     handled += 1
+                    if (cursor == CURSOR_AFTER_LAST_SENSOR_INDEX) {
+                        return sequenceExhausted()
+                    }
                 }
 
                 is ReplayValidation.Quarantine -> {
@@ -161,6 +188,7 @@ internal class Gs1PendingIngressRecovery(
         }
         return Gs1PendingIngressRecoveryResult.Completed(
             finalCoreCursor = cursor,
+            finalWireProfile = wireProfile,
             handledRecords = handled,
         )
     }
@@ -179,6 +207,20 @@ internal class Gs1PendingIngressRecovery(
 
         is Gs1RuntimeAwaitResult.Processed -> when (val core = result.result) {
             is Gs1PacketProcessingResult.Completed -> {
+                if (entry.disposition == Gs1PendingIngressRecoveryDisposition.RESOLVE_EXACT) {
+                    val resolved = core.resolvedWireProfile
+                    if (resolved == null || core.committedSamples.isNotEmpty()) {
+                        ReplayValidation.Failure(
+                            failed(
+                                "RECOVERY_PROTOCOL_RESOLUTION_MISMATCH",
+                                entry.record.ingressId,
+                                retryable = false,
+                            ),
+                        )
+                    } else {
+                        ReplayValidation.Success(resolved)
+                    }
+                } else {
                 val expectedFirst = checkNotNull(entry.firstIndex)
                 val expectedLast = checkNotNull(entry.lastIndex)
                 val indices = core.committedSamples.map { it.index }
@@ -195,7 +237,8 @@ internal class Gs1PendingIngressRecovery(
                         ),
                     )
                 } else {
-                    ReplayValidation.Success
+                    ReplayValidation.Success(core.resolvedWireProfile)
+                }
                 }
             }
 
@@ -271,13 +314,22 @@ internal class Gs1PendingIngressRecovery(
         retryable: Boolean,
     ) = Gs1PendingIngressRecoveryResult.Failed(code, detail, retryable)
 
+    private fun sequenceExhausted() = failed(
+        code = "SENSOR_SEQUENCE_EXHAUSTED",
+        detail = "Sensor sample sequence reached its terminal index",
+        retryable = false,
+    )
+
     private sealed interface ReplayValidation {
-        data object Success : ReplayValidation
+        data class Success(
+            val resolvedWireProfile: Gs1WireProfile? = null,
+        ) : ReplayValidation
         data class Quarantine(val detail: String) : ReplayValidation
         data class Failure(val result: Gs1PendingIngressRecoveryResult.Failed) : ReplayValidation
     }
 
     private companion object {
+        const val CURSOR_AFTER_LAST_SENSOR_INDEX = 0x1_0000
         const val MAX_OUTCOME_DETAIL_CHARS = 512
     }
 }

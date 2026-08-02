@@ -6,6 +6,10 @@ import com.sladkaya.sensor.sibionics.Gs1OnboardingSnapshot
 import com.sladkaya.sensor.sibionics.Gs1OnboardingSnapshotCodec
 import com.sladkaya.sensor.sibionics.Gs1OnboardingSnapshotDecodeResult
 import com.sladkaya.sensor.sibionics.Gs1OnboardingStateStore
+import com.sladkaya.sensor.sibionics.Gs1OnboardingOpenResult
+import com.sladkaya.sensor.sibionics.Gs1OnboardingState
+import com.sladkaya.sensor.sibionics.Gs1OnboardingStateMachine
+import com.sladkaya.sensor.sibionics.Gs1PendingDiagnosticProfile
 
 /**
  * Production persistence for an unconfirmed GS1/GS1Sb onboarding draft.
@@ -44,6 +48,18 @@ internal class PendingDiagnosticGs1OnboardingStateStore(context: Context) :
         true
     }
 
+    fun loadPendingDiagnosticProfile(): Gs1PendingDiagnosticProfile? =
+        when (val opened = Gs1OnboardingStateMachine.open(this)) {
+            is Gs1OnboardingOpenResult.Ready ->
+                (opened.machine.state as? Gs1OnboardingState.PendingDiagnostic)?.profile
+            is Gs1OnboardingOpenResult.Failure -> null
+        }
+
+    @SuppressLint("UseKtx")
+    fun clearDraft(): Boolean = synchronized(PROCESS_LOCK) {
+        preferences.edit().remove(KEY_SNAPSHOT).commit()
+    }
+
     private fun String.decodeSnapshot(): Gs1OnboardingSnapshot =
         when (val decoded = Gs1OnboardingSnapshotCodec.decode(this)) {
             is Gs1OnboardingSnapshotDecodeResult.Success -> decoded.snapshot
@@ -54,7 +70,7 @@ internal class PendingDiagnosticGs1OnboardingStateStore(context: Context) :
 
     private companion object {
         const val PREFERENCES = "pending_diagnostic_gs1_onboarding"
-        const val KEY_SNAPSHOT = "snapshot_v1"
+        const val KEY_SNAPSHOT = "snapshot_current"
         val PROCESS_LOCK = Any()
     }
 }

@@ -7,6 +7,19 @@ enum class Gs1PackageCodeSource {
     DATA_MATRIX,
 }
 
+/**
+ * Market identity selected by the user from the box or the manufacturer's app.
+ * It is deliberately independent from GS1/GS1Sb and from the package code.
+ */
+enum class Gs1MarketProfile(
+    val transportVariant: Int,
+) {
+    GLOBAL(0),
+    RUSSIAN(1),
+    CHINESE(2),
+    ECO_SPLIT(3),
+}
+
 sealed interface Gs1PackageCodeInput {
     val value: String
     val source: Gs1PackageCodeSource
@@ -43,6 +56,7 @@ enum class Gs1OnboardingProfileStatus {
 data class Gs1PendingDiagnosticProfile internal constructor(
     val sensorId: String,
     val family: SensorFamily,
+    val marketProfile: Gs1MarketProfile,
     val deviceName: String,
     val canonicalBluetoothAddress: String,
     val transportVariant: Int,
@@ -64,9 +78,10 @@ data class Gs1PendingDiagnosticProfile internal constructor(
     init {
         require(sensorId.isNotBlank() && sensorId.length <= MAX_SENSOR_ID_CHARS)
         require(family.isGs1Family())
+        require(marketProfile.supportsDiagnosticAttempt())
         require(deviceName.length >= 4)
         require(CANONICAL_BLUETOOTH_ADDRESS.matches(canonicalBluetoothAddress))
-        require(transportVariant == VERIFIED_TRANSPORT_VARIANT)
+        require(transportVariant == marketProfile.transportVariant)
         require(packageCode.isValidPackageCode())
     }
 
@@ -91,6 +106,7 @@ data class Gs1PendingDiagnosticProfile internal constructor(
 @ConsistentCopyVisibility
 data class Gs1OnboardingRequest internal constructor(
     val family: SensorFamily,
+    val marketProfile: Gs1MarketProfile,
     val packageCode: String,
     val source: Gs1PackageCodeSource,
 )
@@ -99,6 +115,8 @@ enum class Gs1OnboardingRejectionReason {
     INVALID_PACKAGE_CODE_LENGTH,
     INVALID_PACKAGE_CODE_CHARACTER,
     UNSUPPORTED_FAMILY,
+    MARKET_PROFILE_REQUIRED,
+    PROFILE_NOT_PHYSICALLY_VERIFIED,
     INVALID_TRANSITION,
     NO_MATCHING_CANDIDATE,
     MALFORMED_BLUETOOTH_ADDRESS,
@@ -112,9 +130,24 @@ enum class Gs1OnboardingRejectionReason {
 sealed interface Gs1OnboardingState {
     data object AwaitingPackageCode : Gs1OnboardingState
 
+    data class ProfileBlocked(
+        val request: Gs1OnboardingRequest,
+        val reason: Gs1OnboardingRejectionReason =
+            Gs1OnboardingRejectionReason.PROFILE_NOT_PHYSICALLY_VERIFIED,
+    ) : Gs1OnboardingState {
+        init {
+            require(reason == Gs1OnboardingRejectionReason.PROFILE_NOT_PHYSICALLY_VERIFIED)
+            require(!request.marketProfile.supportsDiagnosticAttempt())
+        }
+    }
+
     data class Discovering(
         val request: Gs1OnboardingRequest,
-    ) : Gs1OnboardingState
+    ) : Gs1OnboardingState {
+        init {
+            require(request.marketProfile.supportsDiagnosticAttempt())
+        }
+    }
 
     data class ResolutionBlocked(
         val request: Gs1OnboardingRequest,
@@ -122,6 +155,7 @@ sealed interface Gs1OnboardingState {
         val candidates: List<Gs1ResolvedAdvertisement> = emptyList(),
     ) : Gs1OnboardingState {
         init {
+            require(request.marketProfile.supportsDiagnosticAttempt())
             require(reason in CANDIDATE_RESOLUTION_REASONS)
             require(candidates.size <= MAX_ONBOARDING_CANDIDATES)
             require(
@@ -150,6 +184,7 @@ sealed interface Gs1OnboardingActionResult {
 
 enum class Gs1OnboardingStage {
     AWAITING_PACKAGE_CODE,
+    PROFILE_BLOCKED,
     DISCOVERING,
     RESOLUTION_BLOCKED,
     PENDING_DIAGNOSTIC,
@@ -161,6 +196,7 @@ data class Gs1OnboardingSnapshot(
     val schemaVersion: Int = CURRENT_ONBOARDING_SCHEMA_VERSION,
     val stage: Gs1OnboardingStage = Gs1OnboardingStage.AWAITING_PACKAGE_CODE,
     val family: SensorFamily? = null,
+    val marketProfile: Gs1MarketProfile? = null,
     val codeSource: Gs1PackageCodeSource? = null,
     val packageCode: String? = null,
     val rejectionReason: Gs1OnboardingRejectionReason? = null,
@@ -219,6 +255,7 @@ class Gs1OnboardingStateMachine private constructor(
     fun submitPackageCode(
         family: SensorFamily,
         input: Gs1PackageCodeInput,
+        marketProfile: Gs1MarketProfile?,
     ): Gs1OnboardingActionResult {
         if (currentState != Gs1OnboardingState.AwaitingPackageCode) {
             return rejected(Gs1OnboardingRejectionReason.INVALID_TRANSITION)
@@ -232,15 +269,16 @@ class Gs1OnboardingStateMachine private constructor(
         if (!input.value.all(Char::isAsciiLetterOrDigit)) {
             return rejected(Gs1OnboardingRejectionReason.INVALID_PACKAGE_CODE_CHARACTER)
         }
-        return advance(
-            Gs1OnboardingState.Discovering(
-                Gs1OnboardingRequest(
-                    family = family,
-                    packageCode = input.value,
-                    source = input.source,
-                ),
-            ),
+        val selectedMarket = marketProfile
+            ?: return rejected(Gs1OnboardingRejectionReason.MARKET_PROFILE_REQUIRED)
+        val request = Gs1OnboardingRequest(
+            family = family,
+            marketProfile = selectedMarket,
+            packageCode = input.value,
+            source = input.source,
         )
+        if (!selectedMarket.supportsDiagnosticAttempt()) return blockProfile(request)
+        return advance(Gs1OnboardingState.Discovering(request))
     }
 
     @Synchronized
@@ -261,7 +299,7 @@ class Gs1OnboardingStateMachine private constructor(
         } else {
             emptyList()
         }
-        if (advertisements.size > MAX_DISCOVERED_ADVERTISEMENTS) {
+        if (advertisements.size > GS1_MAX_DISCOVERED_ADVERTISEMENTS) {
             return if (stickyCandidates.isNotEmpty()) {
                 rejected(Gs1OnboardingRejectionReason.TOO_MANY_CANDIDATES)
             } else {
@@ -347,6 +385,17 @@ class Gs1OnboardingStateMachine private constructor(
 
     @Synchronized
     fun reset(): Gs1OnboardingActionResult = advance(Gs1OnboardingState.AwaitingPackageCode)
+
+    private fun blockProfile(request: Gs1OnboardingRequest): Gs1OnboardingActionResult {
+        val blocked = Gs1OnboardingState.ProfileBlocked(request)
+        return when (val persisted = advance(blocked)) {
+            is Gs1OnboardingActionResult.Advanced -> Gs1OnboardingActionResult.Rejected(
+                reason = blocked.reason,
+                state = persisted.state,
+            )
+            is Gs1OnboardingActionResult.Rejected -> persisted
+        }
+    }
 
     private fun blockResolution(
         request: Gs1OnboardingRequest,
@@ -445,8 +494,10 @@ class Gs1OnboardingStateMachine private constructor(
                     }
                 }
 
+                Gs1OnboardingStage.PROFILE_BLOCKED -> restoreProfileBlocked(snapshot)
+
                 Gs1OnboardingStage.DISCOVERING -> {
-                    val request = snapshot.validRequest() ?: return null
+                    val request = snapshot.validDiagnosticRequest() ?: return null
                     if (snapshot.rejectionReason == null &&
                         snapshot.candidates.isEmpty() &&
                         snapshot.selectedDeviceName == null &&
@@ -463,8 +514,22 @@ class Gs1OnboardingStateMachine private constructor(
             }
         }
 
-        private fun restoreBlocked(snapshot: Gs1OnboardingSnapshot): Gs1OnboardingState? {
+        private fun restoreProfileBlocked(snapshot: Gs1OnboardingSnapshot): Gs1OnboardingState? {
             val request = snapshot.validRequest() ?: return null
+            if (request.marketProfile.supportsDiagnosticAttempt() ||
+                snapshot.rejectionReason !=
+                Gs1OnboardingRejectionReason.PROFILE_NOT_PHYSICALLY_VERIFIED ||
+                snapshot.candidates.isNotEmpty() ||
+                snapshot.selectedDeviceName != null ||
+                snapshot.selectedBluetoothAddress != null
+            ) {
+                return null
+            }
+            return Gs1OnboardingState.ProfileBlocked(request)
+        }
+
+        private fun restoreBlocked(snapshot: Gs1OnboardingSnapshot): Gs1OnboardingState? {
+            val request = snapshot.validDiagnosticRequest() ?: return null
             val reason = snapshot.rejectionReason
                 ?.takeIf { it in CANDIDATE_RESOLUTION_REASONS }
                 ?: return null
@@ -494,7 +559,7 @@ class Gs1OnboardingStateMachine private constructor(
         }
 
         private fun restorePending(snapshot: Gs1OnboardingSnapshot): Gs1OnboardingState? {
-            val request = snapshot.validRequest() ?: return null
+            val request = snapshot.validDiagnosticRequest() ?: return null
             if (snapshot.rejectionReason != null || snapshot.candidates.isNotEmpty()) return null
             val name = snapshot.selectedDeviceName ?: return null
             val address = snapshot.selectedBluetoothAddress ?: return null
@@ -512,6 +577,11 @@ class Gs1OnboardingStateMachine private constructor(
 
 private fun Gs1OnboardingState.toSnapshot(revision: Long): Gs1OnboardingSnapshot = when (this) {
     Gs1OnboardingState.AwaitingPackageCode -> Gs1OnboardingSnapshot(revision = revision)
+    is Gs1OnboardingState.ProfileBlocked -> request.snapshot(
+        revision = revision,
+        stage = Gs1OnboardingStage.PROFILE_BLOCKED,
+        rejectionReason = reason,
+    )
     is Gs1OnboardingState.Discovering -> request.snapshot(
         revision = revision,
         stage = Gs1OnboardingStage.DISCOVERING,
@@ -526,6 +596,7 @@ private fun Gs1OnboardingState.toSnapshot(revision: Long): Gs1OnboardingSnapshot
         revision = revision,
         stage = Gs1OnboardingStage.PENDING_DIAGNOSTIC,
         family = profile.family,
+        marketProfile = profile.marketProfile,
         codeSource = profile.codeSource,
         packageCode = profile.packageCode,
         selectedDeviceName = profile.deviceName,
@@ -542,6 +613,7 @@ private fun Gs1OnboardingRequest.snapshot(
     revision = revision,
     stage = stage,
     family = family,
+    marketProfile = marketProfile,
     codeSource = source,
     packageCode = packageCode,
     rejectionReason = rejectionReason,
@@ -550,13 +622,18 @@ private fun Gs1OnboardingRequest.snapshot(
 
 private fun Gs1OnboardingSnapshot.validRequest(): Gs1OnboardingRequest? {
     val restoredFamily = family?.takeIf { it.isGs1Family() } ?: return null
+    val restoredMarket = marketProfile ?: return null
     val restoredSource = codeSource ?: return null
     val restoredCode = packageCode?.takeIf(String::isValidPackageCode) ?: return null
-    return Gs1OnboardingRequest(restoredFamily, restoredCode, restoredSource)
+    return Gs1OnboardingRequest(restoredFamily, restoredMarket, restoredCode, restoredSource)
 }
+
+private fun Gs1OnboardingSnapshot.validDiagnosticRequest(): Gs1OnboardingRequest? =
+    validRequest()?.takeIf { it.marketProfile.supportsDiagnosticAttempt() }
 
 private fun Gs1OnboardingSnapshot.hasNoRequestOrResolutionData(): Boolean =
     family == null &&
+        marketProfile == null &&
         codeSource == null &&
         packageCode == null &&
         rejectionReason == null &&
@@ -590,13 +667,14 @@ private fun pendingProfile(
         sensorId = sensorId,
         family = request.family,
         bluetoothAddress = resolved.canonicalBluetoothAddress,
-        transportVariant = VERIFIED_TRANSPORT_VARIANT,
+        transportVariant = request.marketProfile.transportVariant,
         packageCode = request.packageCode,
     )
     if (validation !is Gs1DiagnosticActivationProfileValidation.Valid) return null
     return Gs1PendingDiagnosticProfile(
         sensorId = validation.profile.sensorId,
         family = validation.profile.family,
+        marketProfile = request.marketProfile,
         canonicalBluetoothAddress = validation.profile.bluetoothAddress,
         transportVariant = validation.profile.transportVariant,
         packageCode = validation.profile.packageCode,
@@ -608,16 +686,19 @@ private fun pendingProfile(
 private fun SensorFamily.isGs1Family(): Boolean =
     this == SensorFamily.SIBIONICS_GS1 || this == SensorFamily.SIBIONICS_GS1SB
 
+private fun Gs1MarketProfile.supportsDiagnosticAttempt(): Boolean =
+    this == Gs1MarketProfile.GLOBAL || this == Gs1MarketProfile.CHINESE
+
 private fun String.isValidPackageCode(): Boolean =
     length == PACKAGE_CODE_LENGTH && all(Char::isAsciiLetterOrDigit)
 
 private fun Char.isAsciiLetterOrDigit(): Boolean =
     this in '0'..'9' || this in 'A'..'Z' || this in 'a'..'z'
 
+// The product has not shipped; this is the first and only onboarding schema.
 private const val CURRENT_ONBOARDING_SCHEMA_VERSION = 1
 private const val PACKAGE_CODE_LENGTH = 8
 private const val MAX_SENSOR_ID_CHARS = 128
-private const val VERIFIED_TRANSPORT_VARIANT = 0
 private val CANONICAL_BLUETOOTH_ADDRESS = Regex("^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$")
 private val CANDIDATE_RESOLUTION_REASONS = setOf(
     Gs1OnboardingRejectionReason.NO_MATCHING_CANDIDATE,
@@ -627,4 +708,3 @@ private val CANDIDATE_RESOLUTION_REASONS = setOf(
 )
 
 internal const val MAX_ONBOARDING_CANDIDATES = 64
-private const val MAX_DISCOVERED_ADVERTISEMENTS = 256

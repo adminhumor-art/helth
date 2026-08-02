@@ -13,6 +13,76 @@ class SensorServiceStartPolicyTest {
             policy.select(
                 action = SensorServiceActions.START,
                 hasConfirmedConfiguration = false,
+                hasPendingDiagnosticConfiguration = false,
+            ),
+        )
+    }
+
+    @Test
+    fun diagnosticStartRequiresItsDedicatedActionAndPendingProfile() {
+        assertEquals(
+            SensorServiceStartMode.DiagnosticSensor,
+            policy.select(
+                action = SensorServiceActions.START_DIAGNOSTIC,
+                hasConfirmedConfiguration = false,
+                hasPendingDiagnosticConfiguration = true,
+                diagnosticResumeIdentityMatches = true,
+            ),
+        )
+        assertEquals(
+            SensorServiceStartMode.SetupRequired,
+            policy.select(
+                action = SensorServiceActions.START_DIAGNOSTIC,
+                hasConfirmedConfiguration = false,
+                hasPendingDiagnosticConfiguration = false,
+                diagnosticResumeIdentityMatches = true,
+            ),
+        )
+    }
+
+    @Test
+    fun redeliveredDiagnosticCannotRestartAfterStopOrProfileChange() {
+        assertEquals(
+            SensorServiceStartMode.SetupRequired,
+            policy.select(
+                action = SensorServiceActions.START_DIAGNOSTIC,
+                hasConfirmedConfiguration = false,
+                hasPendingDiagnosticConfiguration = true,
+                diagnosticResumeIdentityMatches = false,
+            ),
+        )
+    }
+
+    @Test
+    fun pendingDiagnosticProfileCannotEnableOrdinaryProductStart() {
+        assertEquals(
+            SensorServiceStartMode.SetupRequired,
+            policy.select(
+                action = SensorServiceActions.START,
+                hasConfirmedConfiguration = false,
+                hasPendingDiagnosticConfiguration = true,
+            ),
+        )
+    }
+
+    @Test
+    fun nullIntentCanResumeOnlyAnExplicitlyRunningDiagnosticSession() {
+        assertEquals(
+            SensorServiceStartMode.DiagnosticSensor,
+            policy.select(
+                action = null,
+                hasConfirmedConfiguration = false,
+                hasPendingDiagnosticConfiguration = true,
+                diagnosticResumeIdentityMatches = true,
+            ),
+        )
+        assertEquals(
+            SensorServiceStartMode.SetupRequired,
+            policy.select(
+                action = null,
+                hasConfirmedConfiguration = false,
+                hasPendingDiagnosticConfiguration = true,
+                diagnosticResumeIdentityMatches = false,
             ),
         )
     }
@@ -26,6 +96,7 @@ class SensorServiceStartPolicyTest {
                     policy.select(
                         action = action,
                         hasConfirmedConfiguration = hasConfirmedConfiguration,
+                        hasPendingDiagnosticConfiguration = true,
                     ),
                 )
             }
@@ -39,6 +110,7 @@ class SensorServiceStartPolicyTest {
             policy.select(
                 action = SensorServiceActions.START_DEMO,
                 hasConfirmedConfiguration = false,
+                hasPendingDiagnosticConfiguration = false,
             ),
         )
     }
@@ -50,6 +122,7 @@ class SensorServiceStartPolicyTest {
             policy.select(
                 action = SensorServiceActions.START,
                 hasConfirmedConfiguration = true,
+                hasPendingDiagnosticConfiguration = false,
             ),
         )
     }
@@ -61,6 +134,7 @@ class SensorServiceStartPolicyTest {
             policy.select(
                 action = SensorServiceActions.START_DEMO,
                 hasConfirmedConfiguration = true,
+                hasPendingDiagnosticConfiguration = true,
             ),
         )
     }
@@ -70,6 +144,93 @@ class SensorServiceStartPolicyTest {
         assertEquals(true, SensorBackgroundStartPolicy.shouldStart(true, true))
         assertEquals(false, SensorBackgroundStartPolicy.shouldStart(false, true))
         assertEquals(false, SensorBackgroundStartPolicy.shouldStart(true, false))
+    }
+
+    @Test
+    fun diagnosticBackgroundResumeRequiresIntentPendingProfileAndPermission() {
+        assertEquals(
+            true,
+            SensorBackgroundStartPolicy.shouldResumeDiagnostic(
+                diagnosticWasRunning = true,
+                hasPendingDiagnosticConfiguration = true,
+                hasMandatoryBlePermissions = true,
+            ),
+        )
+        assertEquals(
+            false,
+            SensorBackgroundStartPolicy.shouldResumeDiagnostic(false, true, true),
+        )
+        assertEquals(
+            false,
+            SensorBackgroundStartPolicy.shouldResumeDiagnostic(true, false, true),
+        )
+        assertEquals(
+            false,
+            SensorBackgroundStartPolicy.shouldResumeDiagnostic(true, true, false),
+        )
+    }
+
+    @Test
+    fun productAndDemoRequireAlarmReadinessButDiagnosticDoesNotPublishOrBlockOnIt() {
+        assertEquals(
+            false,
+            AlarmMonitoringStartGate.canStart(
+                SensorServiceStartMode.ConfiguredSensor,
+                alarmReady = false,
+            ),
+        )
+        assertEquals(
+            false,
+            AlarmMonitoringStartGate.canStart(
+                SensorServiceStartMode.Demo,
+                alarmReady = false,
+            ),
+        )
+        assertEquals(
+            true,
+            AlarmMonitoringStartGate.canStart(
+                SensorServiceStartMode.DiagnosticSensor,
+                alarmReady = false,
+            ),
+        )
+        assertEquals(
+            true,
+            AlarmMonitoringStartGate.canStart(
+                SensorServiceStartMode.SetupRequired,
+                alarmReady = false,
+            ),
+        )
+    }
+
+    @Test
+    fun explicitStopRequiresDurableDiagnosticResumeMarkerClear() {
+        assertEquals(true, SensorServiceStopPolicy.canStop(diagnosticResumeStateCleared = true))
+        assertEquals(false, SensorServiceStopPolicy.canStop(diagnosticResumeStateCleared = false))
+    }
+
+    @Test
+    fun runtimeReadinessRevocationStopsDemoButKeepsProductAndDiagnosticDataPathsAlive() {
+        assertEquals(
+            false,
+            AlarmMonitoringRuntimeGate.canContinue(
+                SensorServiceStartMode.Demo,
+                alarmReady = false,
+            ),
+        )
+        assertEquals(
+            true,
+            AlarmMonitoringRuntimeGate.canContinue(
+                SensorServiceStartMode.ConfiguredSensor,
+                alarmReady = false,
+            ),
+        )
+        assertEquals(
+            true,
+            AlarmMonitoringRuntimeGate.canContinue(
+                SensorServiceStartMode.DiagnosticSensor,
+                alarmReady = false,
+            ),
+        )
     }
 
 }

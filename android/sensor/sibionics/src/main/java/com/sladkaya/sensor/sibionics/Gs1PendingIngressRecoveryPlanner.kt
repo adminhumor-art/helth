@@ -7,6 +7,7 @@ internal enum class Gs1PendingIngressRecoveryDisposition {
     NON_DATA,
     QUARANTINE_INVALID,
     ALREADY_COVERED,
+    RESOLVE_EXACT,
     REPLAY_EXACT,
     BLOCKED_BY_GAP,
     PARTIAL_OVERLAP,
@@ -41,6 +42,7 @@ internal data class Gs1PendingIngressRecoveryEntry(
 internal class Gs1PendingIngressRecoveryPlanner(
     private val family: SensorFamily,
     private val codec: SibionicsPacketCodec,
+    private val wireProfile: Gs1WireProfile,
 ) {
     init {
         require(family == SensorFamily.SIBIONICS_GS1 || family == SensorFamily.SIBIONICS_GS1SB)
@@ -76,7 +78,80 @@ internal class Gs1PendingIngressRecoveryPlanner(
             )
         }
 
-        return when (val decoded = codec.decode(family, record.encryptedPacketCopy())) {
+        val bytes = record.encryptedPacketCopy()
+        if (wireProfile == Gs1WireProfile.UNRESOLVED) {
+            if (Gs1V115WireCodec.isV120Challenge(bytes)) {
+                return entry(
+                    record,
+                    Gs1PendingIngressRecoveryDisposition.RESOLVE_EXACT,
+                    projectedCursor,
+                    detail = "EXACT_V120_CHALLENGE",
+                )
+            }
+            return when (
+                val decoded = Gs1V115WireCodec.decode(bytes, record.receivedAtEpochMs)
+            ) {
+                is Gs1V115DecodeResult.Success -> if (decoded.records.isEmpty()) {
+                    entry(
+                        record,
+                        Gs1PendingIngressRecoveryDisposition.RESOLVE_EXACT,
+                        projectedCursor,
+                        detail = "VALIDATED_V115_ENVELOPE",
+                    )
+                } else {
+                    classifyRaw(record, decoded.records.map { it.sample }, projectedCursor)
+                }
+                is Gs1V115DecodeResult.Failure -> entry(
+                    record,
+                    Gs1PendingIngressRecoveryDisposition.UNSUPPORTED_PROTOCOL,
+                    projectedCursor,
+                    detail = "Unresolved packet is neither an exact challenge nor a valid V115 envelope",
+                )
+            }
+        }
+        if (wireProfile == Gs1WireProfile.V115) {
+            if (Gs1V115WireCodec.isV120Challenge(bytes)) {
+                return entry(
+                    record,
+                    Gs1PendingIngressRecoveryDisposition.UNSUPPORTED_PROTOCOL,
+                    projectedCursor,
+                    detail = "V120 evidence conflicts with durable V115 binding",
+                )
+            }
+            return when (
+                val decoded = Gs1V115WireCodec.decode(bytes, record.receivedAtEpochMs)
+            ) {
+                is Gs1V115DecodeResult.Success -> classifyRaw(
+                    record,
+                    decoded.records.map { it.sample },
+                    projectedCursor,
+                )
+                is Gs1V115DecodeResult.Failure -> entry(
+                    record,
+                    Gs1PendingIngressRecoveryDisposition.QUARANTINE_INVALID,
+                    projectedCursor,
+                    detail = "V115_${decoded.error.name}",
+                )
+            }
+        }
+        if (Gs1V115WireCodec.isV120Challenge(bytes)) {
+            return entry(
+                record,
+                Gs1PendingIngressRecoveryDisposition.NON_DATA,
+                projectedCursor,
+                detail = "V120 binding already covers the exact protocol challenge",
+            )
+        }
+        val oppositeV115 = Gs1V115WireCodec.decode(bytes, record.receivedAtEpochMs)
+        if (oppositeV115 is Gs1V115DecodeResult.Success) {
+            return entry(
+                record,
+                Gs1PendingIngressRecoveryDisposition.UNSUPPORTED_PROTOCOL,
+                projectedCursor,
+                detail = "V115 evidence conflicts with durable V120 binding",
+            )
+        }
+        return when (val decoded = codec.decode(family, bytes)) {
             is DecodedPacket.Invalid -> entry(
                 record = record,
                 disposition = Gs1PendingIngressRecoveryDisposition.QUARANTINE_INVALID,

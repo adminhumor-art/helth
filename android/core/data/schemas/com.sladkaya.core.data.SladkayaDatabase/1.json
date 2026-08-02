@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "database": {
     "version": 1,
-    "identityHash": "faa6adae43f8abb07b61f3aeb55316aa",
+    "identityHash": "2f731a3cc8c34e37864beb20301b038a",
     "entities": [
       {
         "tableName": "measurements",
@@ -83,7 +83,7 @@
       },
       {
         "tableName": "sensor_raw_samples",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`eventId` TEXT NOT NULL, `sensorId` TEXT NOT NULL, `sensorFamily` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `sensorTimeEpochMs` INTEGER NOT NULL, `phoneTimeEpochMs` INTEGER NOT NULL, `packet` BLOB NOT NULL, `packetSha256` TEXT NOT NULL, `currentRaw` INTEGER NOT NULL, `temperatureRaw` INTEGER NOT NULL, `historyDistance` INTEGER NOT NULL, `transportVariant` INTEGER NOT NULL, PRIMARY KEY(`eventId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`eventId` TEXT NOT NULL, `sensorId` TEXT NOT NULL, `sensorFamily` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `sensorTimeEpochMs` INTEGER NOT NULL, `phoneTimeEpochMs` INTEGER NOT NULL, `packet` BLOB NOT NULL, `packetSha256` TEXT NOT NULL, `currentRaw` INTEGER NOT NULL, `temperatureRaw` INTEGER NOT NULL, `historyDistance` INTEGER NOT NULL, `transportVariant` INTEGER NOT NULL, `sensorTimeWasClamped` INTEGER NOT NULL, `addTimeSeconds` INTEGER, PRIMARY KEY(`eventId`))",
         "fields": [
           {
             "fieldPath": "eventId",
@@ -156,6 +156,17 @@
             "columnName": "transportVariant",
             "affinity": "INTEGER",
             "notNull": true
+          },
+          {
+            "fieldPath": "sensorTimeWasClamped",
+            "columnName": "sensorTimeWasClamped",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "addTimeSeconds",
+            "columnName": "addTimeSeconds",
+            "affinity": "INTEGER"
           }
         ],
         "primaryKey": {
@@ -328,7 +339,7 @@
       },
       {
         "tableName": "sensor_algorithm_checkpoints",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`sensorId` TEXT NOT NULL, `bluetoothAddress` TEXT NOT NULL, `sensorFamily` TEXT NOT NULL, `transportVariant` INTEGER NOT NULL, `transportProtocol` TEXT NOT NULL, `dataHandleBinarySetId` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `sensorTimeEpochMs` INTEGER NOT NULL, `algorithmProfile` TEXT NOT NULL, `algorithmVersion` TEXT NOT NULL, `binarySetId` TEXT NOT NULL, `sensitivityToken` TEXT NOT NULL, `sensitivityTokenSource` TEXT NOT NULL, `sensitivityCoefficient` REAL NOT NULL, `sensitivityEncoding` TEXT NOT NULL, `initializationMode` TEXT NOT NULL, `state` BLOB NOT NULL, `stateSha256` TEXT NOT NULL, `displayOffsetMmolL` REAL NOT NULL, `schemaVersion` INTEGER NOT NULL, PRIMARY KEY(`sensorId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`sensorId` TEXT NOT NULL, `bluetoothAddress` TEXT NOT NULL, `sensorFamily` TEXT NOT NULL, `transportVariant` INTEGER NOT NULL, `transportProtocol` TEXT NOT NULL, `transportCodecId` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `sensorTimeEpochMs` INTEGER NOT NULL, `algorithmProfile` TEXT NOT NULL, `algorithmVersion` TEXT NOT NULL, `binarySetId` TEXT NOT NULL, `sensitivityToken` TEXT NOT NULL, `sensitivityTokenSource` TEXT NOT NULL, `sensitivityCoefficient` REAL NOT NULL, `sensitivityEncoding` TEXT NOT NULL, `initializationMode` TEXT NOT NULL, `state` BLOB NOT NULL, `stateSha256` TEXT NOT NULL, `displayOffsetMmolL` REAL NOT NULL, `schemaVersion` INTEGER NOT NULL, PRIMARY KEY(`sensorId`))",
         "fields": [
           {
             "fieldPath": "sensorId",
@@ -361,8 +372,8 @@
             "notNull": true
           },
           {
-            "fieldPath": "dataHandleBinarySetId",
-            "columnName": "dataHandleBinarySetId",
+            "fieldPath": "transportCodecId",
+            "columnName": "transportCodecId",
             "affinity": "TEXT",
             "notNull": true
           },
@@ -684,11 +695,112 @@
             "ingressId"
           ]
         }
+      },
+      {
+        "tableName": "sensor_protocol_bindings",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`sensorId` TEXT NOT NULL, `bluetoothAddress` TEXT NOT NULL, `sensorFamily` TEXT NOT NULL, `transportVariant` INTEGER NOT NULL, `sensitivityToken` TEXT NOT NULL, `wireProfile` TEXT NOT NULL, `transportProtocol` TEXT NOT NULL, `transportCodecId` TEXT NOT NULL, `algorithmProfile` TEXT NOT NULL, `sensitivityEncoding` TEXT NOT NULL, `evidenceKind` TEXT NOT NULL, `evidenceSha256` TEXT NOT NULL, `schemaVersion` INTEGER NOT NULL, PRIMARY KEY(`sensorId`))",
+        "fields": [
+          {
+            "fieldPath": "sensorId",
+            "columnName": "sensorId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bluetoothAddress",
+            "columnName": "bluetoothAddress",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sensorFamily",
+            "columnName": "sensorFamily",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "transportVariant",
+            "columnName": "transportVariant",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sensitivityToken",
+            "columnName": "sensitivityToken",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "wireProfile",
+            "columnName": "wireProfile",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "transportProtocol",
+            "columnName": "transportProtocol",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "transportCodecId",
+            "columnName": "transportCodecId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "algorithmProfile",
+            "columnName": "algorithmProfile",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sensitivityEncoding",
+            "columnName": "sensitivityEncoding",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "evidenceKind",
+            "columnName": "evidenceKind",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "evidenceSha256",
+            "columnName": "evidenceSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "schemaVersion",
+            "columnName": "schemaVersion",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "sensorId"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_sensor_protocol_bindings_bluetoothAddress",
+            "unique": true,
+            "columnNames": [
+              "bluetoothAddress"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_sensor_protocol_bindings_bluetoothAddress` ON `${TABLE_NAME}` (`bluetoothAddress`)"
+          }
+        ]
       }
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'faa6adae43f8abb07b61f3aeb55316aa')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '2f731a3cc8c34e37864beb20301b038a')"
     ]
   }
 }

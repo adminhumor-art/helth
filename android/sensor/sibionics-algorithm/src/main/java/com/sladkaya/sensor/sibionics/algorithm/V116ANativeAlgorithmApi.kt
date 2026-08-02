@@ -15,8 +15,15 @@ class V116ANativeAlgorithmApi(
     override val profile = AlgorithmProfile.V116A
     override val binarySetId: String = binarySet.id
     override val algorithmVersion: String by lazy {
-        NativeAlgorithmLibraryV116A.getAlgorithmVersion() ?: "unknown"
+        requireNotNull(NativeAlgorithmLibraryV116A.getAlgorithmVersion()) {
+            "v116A returned a null algorithm version"
+        }.also {
+            require(it.isConcreteAlgorithmVersion()) {
+                "v116A returned a blank or unknown algorithm version"
+            }
+        }
     }
+    override val supportedInitializationModes = AlgorithmInitializationMode.entries.toSet()
 
     override fun createContext(): NativeAlgorithmContext = V116AContext(
         requireNotNull(NativeAlgorithmLibraryV116A.getAlgorithmContextFromNative()) {
@@ -32,7 +39,11 @@ class V116ANativeAlgorithmApi(
         AlgorithmInitializationMode.STANDARD ->
             NativeAlgorithmLibraryV116A.initAlgorithmContext(context.unwrap(), 0, sensitivityToken)
         AlgorithmInitializationMode.FACTION ->
-            error("Faction initialization is not enabled by the verified application flow")
+            NativeAlgorithmLibraryV116A.initAlgorithmContextFaction(
+                context.unwrap(),
+                0,
+                sensitivityToken,
+            )
     }
 
     override fun restoreState(context: NativeAlgorithmContext, state: ByteArray): Int {

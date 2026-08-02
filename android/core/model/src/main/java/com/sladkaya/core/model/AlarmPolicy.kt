@@ -28,14 +28,30 @@ class AlarmPolicy(
     ): AlarmChanges {
         val readingIsFresh = reading.quality == ReadingQuality.VALID &&
             isFresh(reading, nowEpochMs)
-        if (readingIsFresh) {
-            val latestBaseline = minOf(latestFreshSensorTime, latestFreshPhoneTime)
-            val readingBaseline = minOf(reading.sensorTimeEpochMs, reading.phoneTimeEpochMs)
-            if (phoneClockMovedBackwards || readingBaseline >= latestBaseline) {
+        val hasBaseline = latestFreshSensorTime != 0L && latestFreshPhoneTime != 0L
+        val canChangeThresholdAlarms = when {
+            !readingIsFresh -> false
+            phoneClockMovedBackwards -> {
                 phoneClockMovedBackwards = false
                 latestFreshSensorTime = reading.sensorTimeEpochMs
                 latestFreshPhoneTime = reading.phoneTimeEpochMs
+                false
             }
+            !hasBaseline -> {
+                latestFreshSensorTime = reading.sensorTimeEpochMs
+                latestFreshPhoneTime = reading.phoneTimeEpochMs
+                true
+            }
+            reading.sensorTimeEpochMs > latestFreshSensorTime &&
+                reading.phoneTimeEpochMs >= latestFreshPhoneTime -> {
+                latestFreshSensorTime = reading.sensorTimeEpochMs
+                latestFreshPhoneTime = reading.phoneTimeEpochMs
+                true
+            }
+            else -> false
+        }
+        if (!canChangeThresholdAlarms) {
+            return AlarmChanges(emptySet(), emptySet(), open.toSet())
         }
         val desired = if (readingIsFresh) {
             setOfNotNull(

@@ -17,6 +17,13 @@ internal enum class AlarmNotificationCapability {
     BLOCKED_CHANNEL,
 }
 
+internal object AlarmSafetyUxCopy {
+    const val NOTIFICATIONS_BLOCKED_DETAIL =
+        "Локальная звуковая тревога недоступна. Получение данных может продолжаться, но на телефон нельзя полагаться как на будильник."
+    const val EXACT_ALARM_BLOCKED_DETAIL =
+        "Без точных таймеров повтор тревоги может задержаться, а виджет скроет значение. Получение данных продолжается."
+}
+
 internal object AlarmNotificationCapabilityPolicy {
     fun evaluate(
         sdkInt: Int,

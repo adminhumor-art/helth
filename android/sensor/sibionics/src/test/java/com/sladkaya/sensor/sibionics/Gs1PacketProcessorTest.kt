@@ -10,6 +10,92 @@ import org.junit.Test
 
 class Gs1PacketProcessorTest {
     @Test
+    fun verifiedEmptyEnvelopeIsTransportProgressWithoutCoreOrMedicalData() = runBlocking {
+        val core = ScriptedGs1SampleProcessor()
+        val processor = processor(core, emptyList())
+
+        val result = processor.ingest(byteArrayOf(1), RECEIVED_AT)
+            as Gs1PacketProcessingResult.Completed
+
+        assertTrue(result.validatedTransportEnvelope)
+        assertTrue(result.committedSamples.isEmpty())
+        assertTrue(result.diagnostics.isEmpty())
+        assertTrue(core.processedSamples.isEmpty())
+    }
+
+    @Test
+    fun v115HistoryToCurrentBatchUsesExactAddTimeClampInsteadOfInventingMinuteSpacing() = runBlocking {
+        val receivedAt = 1_700_000_000_999L
+        val samples = listOf(
+            DecodedGs1RawSample(
+                index = 1,
+                sensorTimeEpochSeconds = 1_699_999_970L,
+                current = 50,
+                temperature = 321,
+                reindex = 1,
+                sensorTimeWasClamped = false,
+                addTimeSeconds = 30,
+            ),
+            DecodedGs1RawSample(
+                index = 2,
+                sensorTimeEpochSeconds = 1_700_000_000L,
+                current = 51,
+                temperature = 322,
+                reindex = 0,
+                sensorTimeWasClamped = true,
+                addTimeSeconds = 30,
+            ),
+        )
+        val core = ScriptedGs1SampleProcessor(
+            processResults = ArrayDeque(listOf(diagnostic(1), diagnostic(2))),
+        )
+        val processor = processor(core, samples, wireProfile = Gs1WireProfile.V115)
+
+        val result = processor.ingest(byteArrayOf(1), receivedAt)
+            as Gs1PacketProcessingResult.Completed
+
+        assertEquals(listOf(1, 2), result.committedSamples.map { it.index })
+        assertEquals(
+            listOf(1_699_999_970L, 1_700_000_000L),
+            core.processedSamples.map { it.sensorTimeEpochSeconds },
+        )
+        assertEquals(listOf(false, true), core.processedSamples.map { it.sensorTimeWasClamped })
+        assertEquals(listOf(30, 30), core.processedSamples.map { it.addTimeSeconds })
+    }
+
+    @Test
+    fun v115DecreasingTimeIsRejectedWithItsActualNondecreasingContract() = runBlocking {
+        val receivedAt = 1_700_000_000_999L
+        val samples = listOf(
+            DecodedGs1RawSample(
+                index = 1,
+                sensorTimeEpochSeconds = 1_700_000_000L,
+                current = 50,
+                temperature = 321,
+                reindex = 1,
+                addTimeSeconds = 60,
+            ),
+            DecodedGs1RawSample(
+                index = 2,
+                sensorTimeEpochSeconds = 1_699_999_940L,
+                current = 51,
+                temperature = 322,
+                reindex = 1,
+                addTimeSeconds = 0,
+            ),
+        )
+        val core = ScriptedGs1SampleProcessor()
+        val processor = processor(core, samples, wireProfile = Gs1WireProfile.V115)
+
+        val result = processor.ingest(byteArrayOf(1), receivedAt)
+            as Gs1PacketProcessingResult.Rejected
+
+        assertEquals("BATCH_SEQUENCE_INVALID", result.code)
+        assertTrue(result.message.contains("nondecreasing", ignoreCase = true))
+        assertTrue(core.processedSamples.isEmpty())
+    }
+
+    @Test
     fun verifiedBatchIsCommittedInOrderAndReturnsOnlyDiagnostics() = runBlocking {
         val first = sample(1)
         val second = sample(2)
@@ -22,9 +108,10 @@ class Gs1PacketProcessorTest {
         val packet = byteArrayOf(4, 8, 15, 16, 23, 42)
         val processor = processor(core, listOf(first, second))
 
-        val result = processor.ingest(packet) as Gs1PacketProcessingResult.Completed
+        val result = processor.ingest(packet, RECEIVED_AT) as Gs1PacketProcessingResult.Completed
 
         assertEquals(listOf(1, 2), core.processedSamples.map { it.index })
+        assertEquals(listOf(RECEIVED_AT, RECEIVED_AT), core.receivedAtValues)
         core.packets.forEach { assertArrayEquals(packet, it) }
         assertEquals(listOf(1, 2), result.committedSamples.map { it.index })
         assertEquals(listOf(1L, 2L), result.diagnostics.map { it.sequence })
@@ -44,7 +131,7 @@ class Gs1PacketProcessorTest {
         )
         val processor = processor(core, listOf(sample(1), sample(2)))
 
-        val result = processor.ingest(byteArrayOf(1)) as Gs1PacketProcessingResult.Completed
+        val result = processor.ingest(byteArrayOf(1), RECEIVED_AT) as Gs1PacketProcessingResult.Completed
 
         assertEquals(listOf(1, 2), result.committedSamples.map { it.index })
         assertEquals(listOf(2L), result.diagnostics.map { it.sequence })
@@ -76,7 +163,7 @@ class Gs1PacketProcessorTest {
         )
         val processor = processor(core, listOf(sample(1)))
 
-        val result = processor.ingest(byteArrayOf(1)) as Gs1PacketProcessingResult.Completed
+        val result = processor.ingest(byteArrayOf(1), RECEIVED_AT) as Gs1PacketProcessingResult.Completed
 
         assertEquals(listOf(1), result.committedSamples.map { it.index })
         assertEquals(listOf(108), result.diagnostics.map { it.glucoseMgDl })
@@ -91,8 +178,8 @@ class Gs1PacketProcessorTest {
         core.processResults += diagnostic(2)
         val processor = processor(core, listOf(sample(1), sample(2)))
 
-        val uncertain = processor.ingest(byteArrayOf(7))
-        val blocked = processor.ingest(byteArrayOf(8))
+        val uncertain = processor.ingest(byteArrayOf(7), RECEIVED_AT)
+        val blocked = processor.ingest(byteArrayOf(8), RECEIVED_AT + 1)
         val recovered = processor.retryPending() as Gs1PacketProcessingResult.Completed
 
         assertTrue(uncertain is Gs1PacketProcessingResult.PersistenceUnavailable)
@@ -112,7 +199,7 @@ class Gs1PacketProcessorTest {
         )
         val processor = processor(core, listOf(sample(1), sample(2)))
 
-        val result = processor.ingest(byteArrayOf(1)) as Gs1PacketProcessingResult.Rejected
+        val result = processor.ingest(byteArrayOf(1), RECEIVED_AT) as Gs1PacketProcessingResult.Rejected
 
         assertEquals("NON_SEQUENTIAL_INDEX", result.code)
         assertEquals(listOf(1), core.processedSamples.map { it.index })
@@ -123,12 +210,13 @@ class Gs1PacketProcessorTest {
         val core = ScriptedGs1SampleProcessor()
         val processor = Gs1PacketProcessor(
             core = core,
-            decoder = Gs1PacketVerifier {
+            decoder = Gs1PacketVerifier { _, _ ->
                 Gs1VerifiedPacketResult.Failure(Gs1VerifiedPacketError.PARSER_PARITY_MISMATCH)
             },
+            wireProfile = Gs1WireProfile.V120,
         )
 
-        val result = processor.ingest(byteArrayOf(9))
+        val result = processor.ingest(byteArrayOf(9), RECEIVED_AT)
 
         assertTrue(result is Gs1PacketProcessingResult.InvalidPacket)
         assertTrue(core.processedSamples.isEmpty())
@@ -146,7 +234,7 @@ class Gs1PacketProcessorTest {
         )
         val processor = processor(core, listOf(sample(1), sample(3)))
 
-        val result = processor.ingest(byteArrayOf(1)) as Gs1PacketProcessingResult.Rejected
+        val result = processor.ingest(byteArrayOf(1), RECEIVED_AT) as Gs1PacketProcessingResult.Rejected
 
         assertEquals("BATCH_SEQUENCE_INVALID", result.code)
         assertTrue(core.processedSamples.isEmpty())
@@ -160,7 +248,7 @@ class Gs1PacketProcessorTest {
         )
         val processor = Gs1PacketProcessor(
             core = core,
-            decoder = Gs1PacketVerifier {
+            decoder = Gs1PacketVerifier { _, _ ->
                 Gs1VerifiedPacketResult.Success(
                     samples = listOf(sample(41)),
                     nativeRecords = emptyList(),
@@ -168,9 +256,10 @@ class Gs1PacketProcessorTest {
                 )
             },
             initialExpectedIndex = 41,
+            wireProfile = Gs1WireProfile.V120,
         )
 
-        val result = processor.ingest(byteArrayOf(1)) as Gs1PacketProcessingResult.Completed
+        val result = processor.ingest(byteArrayOf(1), RECEIVED_AT) as Gs1PacketProcessingResult.Completed
 
         assertEquals(listOf(41), result.committedSamples.map { it.index })
         assertEquals(listOf(41), core.processedSamples.map { it.index })
@@ -188,7 +277,7 @@ class Gs1PacketProcessorTest {
         )
         val processor = processor(core, listOf(sample(1), sample(2)))
 
-        val result = processor.ingest(byteArrayOf(1)) as Gs1PacketProcessingResult.StorageConflict
+        val result = processor.ingest(byteArrayOf(1), RECEIVED_AT) as Gs1PacketProcessingResult.StorageConflict
 
         assertEquals(listOf(1), result.committedSamples.map { it.index })
         assertEquals(listOf(1L), result.diagnostics.map { it.sequence })
@@ -210,7 +299,7 @@ class Gs1PacketProcessorTest {
         )
         val processor = processor(core, listOf(sample(1), sample(2)))
 
-        val result = processor.ingest(byteArrayOf(1)) as Gs1PacketProcessingResult.StorageConflict
+        val result = processor.ingest(byteArrayOf(1), RECEIVED_AT) as Gs1PacketProcessingResult.StorageConflict
 
         assertEquals(listOf(1), result.committedSamples.map { it.index })
         assertEquals(listOf("INVALID_GLUCOSE"), result.committedIssues.map { it.code })
@@ -219,11 +308,13 @@ class Gs1PacketProcessorTest {
     private fun processor(
         core: ScriptedGs1SampleProcessor,
         samples: List<DecodedGs1RawSample>,
+        wireProfile: Gs1WireProfile = Gs1WireProfile.V120,
     ) = Gs1PacketProcessor(
         core = core,
-        decoder = Gs1PacketVerifier {
+        decoder = Gs1PacketVerifier { _, _ ->
             Gs1VerifiedPacketResult.Success(samples, nativeRecords = emptyList(), decrypted = true)
         },
+        wireProfile = wireProfile,
     )
 
     private fun sample(index: Int) = DecodedGs1RawSample(
@@ -247,6 +338,10 @@ class Gs1PacketProcessorTest {
             sequence = index.toLong(),
         ),
     )
+
+    private companion object {
+        const val RECEIVED_AT = 1_700_000_061_123L
+    }
 }
 
 private class ScriptedGs1SampleProcessor(
@@ -254,14 +349,17 @@ private class ScriptedGs1SampleProcessor(
     private val retryResults: ArrayDeque<Gs1ProcessingResult> = ArrayDeque(),
 ) : Gs1SampleProcessor {
     val packets = mutableListOf<ByteArray>()
+    val receivedAtValues = mutableListOf<Long>()
     val processedSamples = mutableListOf<DecodedGs1RawSample>()
     var retryCalls = 0
 
     override suspend fun process(
         encryptedPacket: ByteArray,
         sample: DecodedGs1RawSample,
+        receivedAtEpochMs: Long,
     ): Gs1ProcessingResult {
         packets += encryptedPacket.copyOf()
+        receivedAtValues += receivedAtEpochMs
         processedSamples += sample
         return processResults.removeFirst()
     }

@@ -8,6 +8,85 @@ import org.junit.Test
 
 class Gs1OnboardingStateMachineTest {
     @Test
+    fun validCodeWithoutAnExplicitMarketProfileCannotStartDiscovery() {
+        val machine = openMachine(RecordingOnboardingStateStore())
+
+        val result = machine.submitPackageCode(
+            SensorFamily.SIBIONICS_GS1,
+            Gs1PackageCodeInput.Manual("Ab1Zcd34"),
+            marketProfile = null,
+        )
+
+        assertEquals(
+            Gs1OnboardingRejectionReason.MARKET_PROFILE_REQUIRED,
+            (result as Gs1OnboardingActionResult.Rejected).reason,
+        )
+        assertEquals(Gs1OnboardingState.AwaitingPackageCode, machine.state)
+    }
+
+    @Test
+    fun unsupportedMarketProfilesArePersistedBlockedBeforeDiscovery() {
+        listOf(
+            Gs1MarketProfile.RUSSIAN,
+            Gs1MarketProfile.ECO_SPLIT,
+        ).forEach { marketProfile ->
+            val store = RecordingOnboardingStateStore()
+            val machine = openMachine(store)
+
+            val result = machine.submitPackageCode(
+                SensorFamily.SIBIONICS_GS1,
+                Gs1PackageCodeInput.Manual("Ab1Zcd34"),
+                marketProfile = marketProfile,
+            )
+
+            assertEquals(
+                Gs1OnboardingRejectionReason.PROFILE_NOT_PHYSICALLY_VERIFIED,
+                (result as Gs1OnboardingActionResult.Rejected).reason,
+            )
+            val blocked = machine.state as Gs1OnboardingState.ProfileBlocked
+            assertEquals(marketProfile, blocked.request.marketProfile)
+            assertEquals(
+                marketProfile,
+                (openMachine(store).state as Gs1OnboardingState.ProfileBlocked)
+                    .request.marketProfile,
+            )
+        }
+    }
+
+    @Test
+    fun globalAndChineseBoxesUseOneDiagnosticFlowWithInternalProtocolResolution() {
+        listOf(Gs1MarketProfile.GLOBAL, Gs1MarketProfile.CHINESE).forEach { marketProfile ->
+            val store = RecordingOnboardingStateStore()
+            val machine = openMachine(store)
+
+            val submitted = machine.submitPackageCode(
+                SensorFamily.SIBIONICS_GS1,
+                Gs1PackageCodeInput.Manual("Ab1Zcd34"),
+                marketProfile = marketProfile,
+            )
+            assertTrue(submitted is Gs1OnboardingActionResult.Advanced)
+            assertEquals(
+                marketProfile,
+                (machine.state as Gs1OnboardingState.Discovering).request.marketProfile,
+            )
+
+            val resolved = machine.resolveAdvertisements(
+                listOf(Gs1DiscoveredAdvertisement("GS-Ab1Z", "AA:BB:CC:DD:EE:02")),
+            )
+            assertTrue(resolved is Gs1OnboardingActionResult.Advanced)
+            val pending = machine.state as Gs1OnboardingState.PendingDiagnostic
+            assertEquals(marketProfile, pending.profile.marketProfile)
+            assertEquals(marketProfile.transportVariant, pending.profile.transportVariant)
+            assertFalse(pending.profile.eligibleForProductPublication)
+            assertEquals(
+                marketProfile,
+                (openMachine(store).state as Gs1OnboardingState.PendingDiagnostic)
+                    .profile.marketProfile,
+            )
+        }
+    }
+
+    @Test
     fun manualAndDataMatrixInputsPreserveTheExactEightCharacterCode() {
         listOf(
             Gs1PackageCodeInput.Manual("Ab1Zcd34") to Gs1PackageCodeSource.MANUAL,
@@ -21,6 +100,7 @@ class Gs1OnboardingStateMachineTest {
             val state = machine.state as Gs1OnboardingState.Discovering
             assertEquals("Ab1Zcd34", state.request.packageCode)
             assertEquals(expectedSource, state.request.source)
+            assertEquals(Gs1MarketProfile.GLOBAL, state.request.marketProfile)
         }
     }
 
@@ -87,6 +167,7 @@ class Gs1OnboardingStateMachineTest {
         assertEquals("Ab1Zcd34", profile.packageCode)
         assertEquals(Gs1PackageCodeSource.MANUAL, profile.codeSource)
         assertEquals(SensorFamily.SIBIONICS_GS1, profile.family)
+        assertEquals(Gs1MarketProfile.GLOBAL, profile.marketProfile)
         assertEquals("AA:BB:CC:DD:EE:02", profile.canonicalBluetoothAddress)
         assertFalse(profile.physicalEvidenceVerified)
         assertFalse(profile.eligibleForConfirmedConfiguration)
@@ -515,6 +596,15 @@ class Gs1OnboardingStateMachineTest {
         return (opened as Gs1OnboardingOpenResult.Ready).machine
     }
 }
+
+private fun Gs1OnboardingStateMachine.submitPackageCode(
+    family: SensorFamily,
+    input: Gs1PackageCodeInput,
+): Gs1OnboardingActionResult = submitPackageCode(
+    family = family,
+    input = input,
+    marketProfile = Gs1MarketProfile.GLOBAL,
+)
 
 private class RecordingOnboardingStateStore(
     restored: Gs1OnboardingSnapshot? = null,

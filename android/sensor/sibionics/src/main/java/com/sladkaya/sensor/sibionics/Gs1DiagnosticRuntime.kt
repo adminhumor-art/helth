@@ -8,6 +8,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -15,7 +16,8 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 internal interface Gs1RuntimeCoreLease : AutoCloseable {
     val initialNextIndex: Int
-    suspend fun ingest(packet: ByteArray): Gs1PacketProcessingResult
+    val wireProfile: Gs1WireProfile
+    suspend fun ingest(packet: DurablyJournaledGs1Packet): Gs1PacketProcessingResult
     suspend fun retryPending(): Gs1PacketProcessingResult
 }
 
@@ -32,6 +34,7 @@ internal sealed interface Gs1RuntimeStartResult {
     data class Started(
         val generation: Long,
         val initialNextIndex: Int,
+        val wireProfile: Gs1WireProfile,
     ) : Gs1RuntimeStartResult
 
     data class Failed(val code: String, val detail: String? = null) : Gs1RuntimeStartResult
@@ -82,6 +85,7 @@ internal sealed interface Gs1DiagnosticRuntimeEvent {
         val samples: List<DecodedGs1RawSample>,
         val diagnostics: List<Gs1DiagnosticReading>,
         val issues: List<Gs1PacketProcessingResult.CommittedIssue> = emptyList(),
+        val validatedTransportEnvelope: Boolean = false,
     ) : Gs1DiagnosticRuntimeEvent
 
     data class Failed(
@@ -119,12 +123,7 @@ internal class Gs1DiagnosticRuntime(
     suspend fun start(profile: Gs1DiagnosticActivationProfile): Gs1RuntimeStartResult =
         lifecycle.withLock {
             current?.let { previous ->
-                if (stopAndJoin(previous) == Gs1RuntimeStopResult.PERSISTENCE_PENDING) {
-                    return@withLock Gs1RuntimeStartResult.Failed(
-                        code = "PERSISTENCE_PENDING",
-                        detail = "The previous native state is still waiting for durable storage",
-                    )
-                }
+                stopAndJoin(previous)
                 if (current === previous) current = null
             }
 
@@ -158,6 +157,7 @@ internal class Gs1DiagnosticRuntime(
             Gs1RuntimeStartResult.Started(
                 generation = generation.id,
                 initialNextIndex = generation.lease.initialNextIndex,
+                wireProfile = generation.lease.wireProfile,
             )
         }
 
@@ -216,7 +216,7 @@ internal class Gs1DiagnosticRuntime(
                 return@withLock Gs1RuntimeStopResult.STALE_GENERATION
             }
             val result = stopAndJoin(active)
-            if (result == Gs1RuntimeStopResult.DRAINED && current === active) {
+            if (current === active) {
                 current = null
             }
             result
@@ -224,16 +224,30 @@ internal class Gs1DiagnosticRuntime(
 
     private suspend fun stopAndJoin(generation: Generation): Gs1RuntimeStopResult {
         generation.accepting.set(false)
+        generation.stopRequested.set(true)
         generation.mailbox.close()
+        if (generation.retryingPersistence.get()) {
+            generation.persistenceAbandoned.set(true)
+            generation.job.cancel(
+                CancellationException(
+                    "Core persistence retry stopped; durable ingress remains pending",
+                ),
+            )
+        }
         val drained = withTimeoutOrNull(stopTimeoutMillis) {
             generation.job.join()
             true
         } == true
-        return if (drained) {
-            Gs1RuntimeStopResult.DRAINED
-        } else {
-            Gs1RuntimeStopResult.PERSISTENCE_PENDING
+        if (!drained) {
+            if (generation.retryingPersistence.get()) {
+                generation.persistenceAbandoned.set(true)
+            }
+            generation.job.cancel()
+            generation.job.join()
         }
+        return if (generation.persistenceAbandoned.get()) {
+            Gs1RuntimeStopResult.PERSISTENCE_PENDING
+        } else Gs1RuntimeStopResult.DRAINED
     }
 
     private suspend fun runGeneration(generation: Generation) {
@@ -248,9 +262,16 @@ internal class Gs1DiagnosticRuntime(
                     submission.receipt?.let(generation.pendingReceipts::remove)
                     continue
                 }
-                var result = generation.lease.ingest(submission.packet.encryptedPacketCopy())
+                var result = generation.lease.ingest(submission.packet)
                 var retryAttempt = 0
                 while (result is Gs1PacketProcessingResult.PersistenceUnavailable) {
+                    if (generation.stopRequested.get()) {
+                        generation.persistenceAbandoned.set(true)
+                        throw CancellationException(
+                            "Core persistence retry stopped; durable ingress remains pending",
+                        )
+                    }
+                    generation.retryingPersistence.set(true)
                     retryAttempt += 1
                     eventSink(
                         Gs1DiagnosticRuntimeEvent.RetryingPersistence(
@@ -259,8 +280,16 @@ internal class Gs1DiagnosticRuntime(
                         ),
                     )
                     if (retryDelayMillis > 0) delay(retryDelayMillis)
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                    if (generation.stopRequested.get()) {
+                        generation.persistenceAbandoned.set(true)
+                        throw CancellationException(
+                            "Core persistence retry stopped; durable ingress remains pending",
+                        )
+                    }
                     result = generation.lease.retryPending()
                 }
+                generation.retryingPersistence.set(false)
                 eventSink(
                     Gs1DiagnosticRuntimeEvent.Finalized(
                         generation = generation.id,
@@ -328,6 +357,7 @@ internal class Gs1DiagnosticRuntime(
                     result.committedSamples,
                     result.diagnostics,
                     result.committedIssues,
+                    result.validatedTransportEnvelope,
                 )
                 true
             }
@@ -422,14 +452,18 @@ internal class Gs1DiagnosticRuntime(
         samples: List<DecodedGs1RawSample>,
         diagnostics: List<Gs1DiagnosticReading>,
         issues: List<Gs1PacketProcessingResult.CommittedIssue> = emptyList(),
+        validatedTransportEnvelope: Boolean = false,
     ) {
-        if (samples.isEmpty() && diagnostics.isEmpty() && issues.isEmpty()) return
+        if (samples.isEmpty() && diagnostics.isEmpty() && issues.isEmpty() &&
+            !validatedTransportEnvelope
+        ) return
         eventSink(
             Gs1DiagnosticRuntimeEvent.Committed(
                 generation = generation,
                 samples = samples.toList(),
                 diagnostics = diagnostics.toList(),
                 issues = issues.toList(),
+                validatedTransportEnvelope = validatedTransportEnvelope,
             ),
         )
     }
@@ -440,6 +474,9 @@ internal class Gs1DiagnosticRuntime(
         val mailbox: Channel<RuntimeSubmission>,
         val accepting: AtomicBoolean = AtomicBoolean(true),
         val overflowed: AtomicBoolean = AtomicBoolean(false),
+        val stopRequested: AtomicBoolean = AtomicBoolean(false),
+        val retryingPersistence: AtomicBoolean = AtomicBoolean(false),
+        val persistenceAbandoned: AtomicBoolean = AtomicBoolean(false),
         val pendingReceipts: MutableSet<CompletableDeferred<Gs1RuntimeAwaitResult>> =
             ConcurrentHashMap.newKeySet(),
     ) {
@@ -461,8 +498,29 @@ internal class Gs1DiagnosticRuntime(
 internal class FactoryGs1RuntimeCoreOpener(
     private val factory: Gs1CoreFactory,
 ) : Gs1RuntimeCoreOpener {
-    override suspend fun open(profile: Gs1DiagnosticActivationProfile): Gs1RuntimeCoreOpenResult =
-        when (val opened = factory.open(profile.coreConfiguration())) {
+    override suspend fun open(profile: Gs1DiagnosticActivationProfile): Gs1RuntimeCoreOpenResult {
+        return when (val resolution = factory.inspectProtocol(profile)) {
+            is Gs1ProtocolResolution.Failure -> Gs1RuntimeCoreOpenResult.Failure(
+                code = resolution.code,
+                detail = resolution.detail,
+            )
+            Gs1ProtocolResolution.Unresolved -> Gs1RuntimeCoreOpenResult.Success(
+                ResolvingGs1RuntimeCoreLease(profile, factory, Gs1WireProfile.UNRESOLVED),
+            )
+            is Gs1ProtocolResolution.Resolved -> if (resolution.binding == null) {
+                Gs1RuntimeCoreOpenResult.Success(
+                    ResolvingGs1RuntimeCoreLease(profile, factory, resolution.wireProfile),
+                )
+            } else {
+                openResolved(profile, resolution)
+            }
+        }
+    }
+
+    private suspend fun openResolved(
+        profile: Gs1DiagnosticActivationProfile,
+        resolution: Gs1ProtocolResolution.Resolved,
+    ): Gs1RuntimeCoreOpenResult = when (val opened = factory.openBound(profile, resolution)) {
             is Gs1CoreOpenResult.Failure -> Gs1RuntimeCoreOpenResult.Failure(
                 code = opened.error.name,
                 detail = opened.detail,
@@ -472,22 +530,195 @@ internal class FactoryGs1RuntimeCoreOpener(
                 FactoryGs1RuntimeCoreLease(
                     coordinator = opened.coordinator,
                     initialNextIndex = opened.nextSensorIndex,
+                    wireProfile = resolution.wireProfile,
                 ),
             )
         }
 }
 
+private class ResolvingGs1RuntimeCoreLease(
+    private val profile: Gs1DiagnosticActivationProfile,
+    private val factory: Gs1CoreFactory,
+    initialWireProfile: Gs1WireProfile,
+    private val v120Verifier: Gs1PacketVerifier = Gs1VerifiedPacketDecoder(),
+    private val v115Verifier: Gs1PacketVerifier = Gs1V115VerifiedPacketDecoder(),
+) : Gs1RuntimeCoreLease {
+    override val initialNextIndex: Int = 1
+    override var wireProfile: Gs1WireProfile = initialWireProfile
+        private set
+    private var delegate: FactoryGs1RuntimeCoreLease? = null
+    private var pending: PendingResolution? = null
+    private var closed = false
+
+    override suspend fun ingest(packet: DurablyJournaledGs1Packet): Gs1PacketProcessingResult {
+        if (closed) return Gs1PacketProcessingResult.Closed("GS1 protocol resolver is closed")
+        delegate?.let { return it.ingest(packet) }
+        if (pending != null) {
+            return Gs1PacketProcessingResult.PersistenceUnavailable(
+                "Protocol evidence is waiting for a durable binding",
+            )
+        }
+        val classified = classify(packet)
+        if (classified is ResolutionClassification.Failure) return classified.result
+        classified as ResolutionClassification.Evidence
+        pending = PendingResolution(packet, classified)
+        return resolvePending()
+    }
+
+    override suspend fun retryPending(): Gs1PacketProcessingResult {
+        delegate?.let { return it.retryPending() }
+        if (pending == null) return Gs1PacketProcessingResult.NoPendingCommit
+        return resolvePending()
+    }
+
+    override fun close() {
+        if (closed) return
+        closed = true
+        delegate?.close()
+        delegate = null
+    }
+
+    private fun classify(packet: DurablyJournaledGs1Packet): ResolutionClassification {
+        val bytes = packet.encryptedPacketCopy()
+        if (wireProfile == Gs1WireProfile.UNRESOLVED) {
+            if (Gs1V115WireCodec.isV120Challenge(bytes)) {
+                return ResolutionClassification.Evidence(
+                    Gs1WireProfile.V120,
+                    "EXACT_V120_CHALLENGE",
+                    processPacketAfterOpen = false,
+                )
+            }
+            return when (val decoded = v115Verifier.decode(bytes, packet.receivedAtEpochMs)) {
+                is Gs1VerifiedPacketResult.Success -> ResolutionClassification.Evidence(
+                    Gs1WireProfile.V115,
+                    "VALIDATED_V115_ENVELOPE",
+                    processPacketAfterOpen = decoded.samples.isNotEmpty(),
+                    validatedTransportEnvelope = decoded.samples.isEmpty(),
+                )
+                is Gs1VerifiedPacketResult.Failure -> ResolutionClassification.Failure(
+                    Gs1PacketProcessingResult.InvalidPacket(decoded.error, decoded.detail),
+                )
+            }
+        }
+        if (wireProfile != Gs1WireProfile.V120) {
+            return ResolutionClassification.Failure(
+                Gs1PacketProcessingResult.Closed("Unexpected unresolved protocol state"),
+            )
+        }
+        return when (val decoded = v120Verifier.decode(bytes, packet.receivedAtEpochMs)) {
+            is Gs1VerifiedPacketResult.Success -> if (decoded.samples.isEmpty()) {
+                ResolutionClassification.Failure(
+                    Gs1PacketProcessingResult.InvalidPacket(
+                        Gs1VerifiedPacketError.NOT_GS1_DATA,
+                        "V120 binding requires validated sensor data",
+                    ),
+                )
+            } else {
+                ResolutionClassification.Evidence(
+                    Gs1WireProfile.V120,
+                    "VALIDATED_V120_DATA",
+                    processPacketAfterOpen = true,
+                )
+            }
+            is Gs1VerifiedPacketResult.Failure -> ResolutionClassification.Failure(
+                Gs1PacketProcessingResult.InvalidPacket(decoded.error, decoded.detail),
+            )
+        }
+    }
+
+    private suspend fun resolvePending(): Gs1PacketProcessingResult {
+        val value = pending ?: return Gs1PacketProcessingResult.NoPendingCommit
+        val bytes = value.packet.encryptedPacketCopy()
+        val bound = factory.bindProtocolEvidence(
+            profile = profile,
+            wireProfile = value.evidence.wireProfile,
+            evidenceKind = value.evidence.evidenceKind,
+            evidence = bytes,
+        )
+        if (bound is Gs1ProtocolResolution.Failure) {
+            if (bound.retryable) {
+                return Gs1PacketProcessingResult.PersistenceUnavailable(
+                    bound.detail ?: bound.code,
+                )
+            }
+            pending = null
+            closed = true
+            return Gs1PacketProcessingResult.Closed(bound.detail ?: bound.code)
+        }
+        bound as Gs1ProtocolResolution.Resolved
+        val opened = factory.openBound(profile, bound)
+        if (opened is Gs1CoreOpenResult.Failure) {
+            if (opened.error == Gs1CoreOpenError.STORAGE_UNAVAILABLE) {
+                return Gs1PacketProcessingResult.PersistenceUnavailable(
+                    opened.detail ?: opened.error.name,
+                )
+            }
+            pending = null
+            closed = true
+            return Gs1PacketProcessingResult.Closed(opened.detail ?: opened.error.name)
+        }
+        opened as Gs1CoreOpenResult.Success
+        wireProfile = bound.wireProfile
+        val lease = FactoryGs1RuntimeCoreLease(
+            coordinator = opened.coordinator,
+            initialNextIndex = opened.nextSensorIndex,
+            wireProfile = bound.wireProfile,
+        )
+        delegate = lease
+        pending = null
+        if (!value.evidence.processPacketAfterOpen) {
+            return Gs1PacketProcessingResult.Completed(
+                committedSamples = emptyList(),
+                resolvedWireProfile = bound.wireProfile,
+                validatedTransportEnvelope = value.evidence.validatedTransportEnvelope,
+            )
+        }
+        return lease.ingest(value.packet).withResolvedWireProfile(bound.wireProfile)
+    }
+
+    private fun Gs1PacketProcessingResult.withResolvedWireProfile(
+        profile: Gs1WireProfile,
+    ): Gs1PacketProcessingResult = if (this is Gs1PacketProcessingResult.Completed) {
+        copy(resolvedWireProfile = profile)
+    } else {
+        this
+    }
+
+    private data class PendingResolution(
+        val packet: DurablyJournaledGs1Packet,
+        val evidence: ResolutionClassification.Evidence,
+    )
+
+    private sealed interface ResolutionClassification {
+        data class Evidence(
+            val wireProfile: Gs1WireProfile,
+            val evidenceKind: String,
+            val processPacketAfterOpen: Boolean,
+            val validatedTransportEnvelope: Boolean = false,
+        ) : ResolutionClassification
+
+        data class Failure(val result: Gs1PacketProcessingResult) : ResolutionClassification
+    }
+}
+
 private class FactoryGs1RuntimeCoreLease(
     private val coordinator: Gs1ProcessingCoordinator,
     override val initialNextIndex: Int,
+    override val wireProfile: Gs1WireProfile,
 ) : Gs1RuntimeCoreLease {
     private val processor = Gs1PacketProcessor(
         core = coordinator,
+        decoder = when (wireProfile) {
+            Gs1WireProfile.V115 -> Gs1V115VerifiedPacketDecoder()
+            Gs1WireProfile.V120 -> Gs1VerifiedPacketDecoder()
+            Gs1WireProfile.UNRESOLVED -> error("Resolved core lease requires a wire profile")
+        },
         initialExpectedIndex = initialNextIndex,
+        wireProfile = wireProfile,
     )
 
-    override suspend fun ingest(packet: ByteArray): Gs1PacketProcessingResult =
-        processor.ingest(packet)
+    override suspend fun ingest(packet: DurablyJournaledGs1Packet): Gs1PacketProcessingResult =
+        processor.ingest(packet.encryptedPacketCopy(), packet.receivedAtEpochMs)
 
     override suspend fun retryPending(): Gs1PacketProcessingResult =
         processor.retryPending()

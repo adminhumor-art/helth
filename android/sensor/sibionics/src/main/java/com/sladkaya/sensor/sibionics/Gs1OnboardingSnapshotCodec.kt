@@ -38,6 +38,7 @@ object Gs1OnboardingSnapshotCodec {
                 output.writeInt(snapshot.schemaVersion)
                 output.writeUTF(snapshot.stage.name)
                 output.writeNullableEnum(snapshot.family)
+                output.writeNullableEnum(snapshot.marketProfile)
                 output.writeNullableEnum(snapshot.codeSource)
                 output.writeNullableString(snapshot.packageCode)
                 output.writeNullableEnum(snapshot.rejectionReason)
@@ -97,6 +98,7 @@ object Gs1OnboardingSnapshotCodec {
                 val schemaVersion = input.readInt()
                 val stage = input.readEnum<Gs1OnboardingStage>()
                 val family = input.readNullableEnum<SensorFamily>()
+                val marketProfile = input.readNullableEnum<Gs1MarketProfile>()
                 val codeSource = input.readNullableEnum<Gs1PackageCodeSource>()
                 val packageCode = input.readNullableString()
                 val rejectionReason = input.readNullableEnum<Gs1OnboardingRejectionReason>()
@@ -116,6 +118,7 @@ object Gs1OnboardingSnapshotCodec {
                     schemaVersion = schemaVersion,
                     stage = stage,
                     family = family,
+                    marketProfile = marketProfile,
                     codeSource = codeSource,
                     packageCode = packageCode,
                     rejectionReason = rejectionReason,
@@ -138,6 +141,7 @@ object Gs1OnboardingSnapshotCodec {
         MessageDigest.getInstance("SHA-256").digest(bytes)
 
     private const val MAGIC = 0x4753314f
+    // The product has not shipped; this is the first and only persisted format.
     private const val CODEC_VERSION = 1
     private const val SHA256_BYTES = 32
     private const val MAX_PAYLOAD_BYTES = 64 * 1024

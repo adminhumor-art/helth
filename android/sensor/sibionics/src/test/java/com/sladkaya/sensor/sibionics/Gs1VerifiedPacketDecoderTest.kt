@@ -21,7 +21,7 @@ class Gs1VerifiedPacketDecoderTest {
             ),
         )
 
-        val result = Gs1VerifiedPacketDecoder(codec, native).decode(packet)
+        val result = Gs1VerifiedPacketDecoder(codec, native).decode(packet, RECEIVED_AT)
 
         val verified = result as Gs1VerifiedPacketResult.Success
         assertEquals(DecodedGs1RawSample(41, 1_700_000_000L, 58, 247, 3), verified.samples.single())
@@ -38,7 +38,7 @@ class Gs1VerifiedPacketDecoderTest {
             ),
         )
 
-        val result = Gs1VerifiedPacketDecoder(codec, native).decode(packet)
+        val result = Gs1VerifiedPacketDecoder(codec, native).decode(packet, RECEIVED_AT)
 
         assertEquals(
             Gs1VerifiedPacketError.PARSER_PARITY_MISMATCH,
@@ -50,7 +50,10 @@ class Gs1VerifiedPacketDecoderTest {
     fun invalidWirePacketFailsBeforeCallingNativeCode() {
         val native = FakeGs1Splitter(Gs1DataSplitResult.Failure(DataHandleError.SPLIT_FAILED))
 
-        val result = Gs1VerifiedPacketDecoder(codec, native).decode(byteArrayOf(1, 2, 3))
+        val result = Gs1VerifiedPacketDecoder(codec, native).decode(
+            byteArrayOf(1, 2, 3),
+            RECEIVED_AT,
+        )
 
         assertTrue(result is Gs1VerifiedPacketResult.Failure)
         assertEquals(0, native.calls)
@@ -62,7 +65,7 @@ class Gs1VerifiedPacketDecoderTest {
             Gs1DataSplitResult.Failure(DataHandleError.MALFORMED_NATIVE_PAYLOAD),
         )
 
-        val result = Gs1VerifiedPacketDecoder(codec, native).decode(packet())
+        val result = Gs1VerifiedPacketDecoder(codec, native).decode(packet(), RECEIVED_AT)
 
         assertEquals(
             Gs1VerifiedPacketError.NATIVE_SPLIT_FAILED,
@@ -86,7 +89,7 @@ class Gs1VerifiedPacketDecoderTest {
             Gs1DataSplitResult.Success(records = emptyList(), decrypted = true),
         )
 
-        val result = Gs1VerifiedPacketDecoder(codec, native).decode(packet)
+        val result = Gs1VerifiedPacketDecoder(codec, native).decode(packet, RECEIVED_AT)
 
         assertTrue(result is Gs1VerifiedPacketResult.Success)
         assertTrue((result as Gs1VerifiedPacketResult.Success).samples.isEmpty())
@@ -108,7 +111,7 @@ class Gs1VerifiedPacketDecoderTest {
                 Gs1DataSplitResult.Failure(DataHandleError.SPLIT_FAILED),
             )
 
-            val result = Gs1VerifiedPacketDecoder(codec, native).decode(malformed)
+            val result = Gs1VerifiedPacketDecoder(codec, native).decode(malformed, RECEIVED_AT)
 
             assertEquals(
                 Gs1VerifiedPacketError.WIRE_PACKET_INVALID,
@@ -172,6 +175,10 @@ class Gs1VerifiedPacketDecoderTest {
 
     private fun ByteArray.putU32Le(offset: Int, value: Long) {
         repeat(4) { byte -> this[offset + byte] = (value ushr (byte * 8)).toByte() }
+    }
+
+    private companion object {
+        const val RECEIVED_AT = 1_700_000_001_000L
     }
 }
 

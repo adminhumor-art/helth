@@ -1,6 +1,6 @@
 # Журнал разработки «Сладкой»
 
-Обновлено: 1 августа 2026 года.
+Обновлено: 2 августа 2026 года.
 
 Проект ещё не выпускался. Первая и единственная текущая схема — Room `v1` и
 PostgreSQL `schema/initial.sql`; обе сразу описывают актуальную модель.
@@ -88,11 +88,53 @@ initialization mode, token source и sensitivity binding. В Git разрешё�
 физического датчика считается закрытым чувствительным evidence и исключена из
 репозитория.
 
+## Итерация готовности к первому международному или китайскому датчику
+
+Сначала добавлены падающие проверки, затем закрыты найденные разрывы:
+
+- международный и китайский рынок теперь проходят один диагностический
+  onboarding; внутренний wire-профиль не показывается пользователю и
+  определяется по точному ответу датчика;
+- на всех production-boundary wire-профиль обязателен явно: скрытого V120 по
+  умолчанию больше нет;
+- V115 имеет собственный строгий codec, один стартовый запрос истории и дальше
+  принимает sensor-driven notifications без нового запроса после commit;
+- сохранена reference-compatible MTU-граница: без request/reassembly, один
+  callback — один envelope; single-record V120/V115 закреплены тестами как
+  20/19 байт, а actual MTU/размеры войдут в private capture первого Samsung;
+- точное V115-время хранит receive-time/add-time/clamp provenance и допускает
+  реальные равные или неминутные интервалы без искусственной коррекции;
+- пустой корректный envelope считается только transport progress, завершает
+  handshake и запускает silence-watchdog, но не создаёт показание;
+- `NORMAL` и `FACTION` вызывают разные точные native entry point. Полная tuple
+  калибровки сохраняется через result/checkpoint/Room и проверена при reopen для
+  V115G и V116A;
+- версия алгоритма стала обязательной реальной native metadata; отсутствующая,
+  пустая, `unknown` или чужая версия закрывает открытие;
+- recovery возвращает окончательно определённый профиль live GATT, а stop во
+  время persistence retry быстро закрывает lease ровно один раз, сохраняя
+  durable ingress для следующего поколения;
+- recovery после подтверждённого индекса `0xffff` завершает поток явным
+  `SENSOR_SEQUENCE_EXHAUSTED`, не пытаясь создать недопустимую следующую сессию;
+- golden/replay поддерживает обе точные пары `GS1_V115/V115G` и
+  `GS1_V120/V116A`; V115 trace сохраняет receive-time/add-time/future-clamp,
+  проверяет максимум 17 samples и отклоняет V120 decoder до native processing;
+- первый корректный пустой V115 envelope завершает transport handshake и
+  запускает silence-watchdog, оставаясь пустым диагностическим результатом без
+  медицинской записи.
+
+JVM unit-наборы сенсора, алгоритма и core/data прошли; ARM instrumentation smoke
+обоих режимов и обоих алгоритмических профилей компилируется. Его runtime-запуск
+и сравнение с официальным приложением остаются физическим барьером первого
+телефона и датчика.
+
 Текущий результат программных проверок:
 
 - `sensor:sibionics-datahandle`: 12 тестов;
-- `sensor:sibionics`: 201 тест, включая 26 golden/replay и fake-GATT
+- `sensor:sibionics-algorithm`: 36 JVM-тестов;
+- `sensor:sibionics`: 280 тестов, включая golden/replay, recovery и fake-GATT
   lifecycle;
+- `core:data`: 42 JVM-теста;
 - lint обоих модулей — успешно;
 - `git diff --check` — успешно.
 
@@ -208,6 +250,76 @@ lint, полный TypeScript-check и production audit. Метаданные и
 - подготовлен least-privilege CI-шаблон с SHA-pinned actions для Go/PostgreSQL,
   web и Android; `actionlint` зелёный. Автоматический запуск пока не включён:
   GitHub token не имеет отдельного разрешения `Workflows`.
+
+## TDD локальной доставки тревог
+
+Сначала добавлены красные проверки долговечного signal-loss state, checksum,
+stale generation/identity, out-of-order reading, clock rollback, exact/inexact
+плана, reboot policy и delivery-pending. После них реализованы:
+
+- отдельный системный watchdog последнего свежего `VALID`-измерения;
+- неточный резерв рядом с exact wakeup и emergency fallback при ошибке
+  планирования;
+- единая атомарная граница alarm episode/watchdog для reading, acknowledge и
+  системных receiver;
+- pending episode и pre-arm повтора до durable save/notification, закрывающие
+  окно смерти процесса;
+- отметка `lastAlertAt` только после подтверждённого вызова уведомления;
+- очистка signal-loss watchdog только после подтверждённого follow-up;
+- fail-closed обработка повреждённого состояния без зависшего ongoing
+  уведомления;
+- разделение runtime-инварианта: отзыв локальной готовности не останавливает
+  будущий продуктовый data/remote path, а демо закрывается отдельно.
+
+После финального alternating-slot исправления `:app:testDebugUnitTest` проходит
+169 из 169 тестов, `:app:lintDebug`, debug APK и Android-test APK собираются.
+Android instrumentation исходники компилируются, но runtime-прогон ещё не
+запускался, потому что устройство не подключено. Direct Boot до первого
+разблокирования не реализован и явно оставлен P1-границей первого Samsung.
+
+## Итоговый программный preflight без телефона и датчика
+
+После закрытия V115 golden/replay-разрыва выполнен единый прогон с
+`--rerun-tasks`: 647 Gradle-задач, 556 JVM-тестов, 0 failures/errors/skipped,
+сборка app/core/algorithm/datahandle instrumentation APK, debug APK, lint и R8
+minify — успешно.
+
+APK дополнительно проверен как артефакт:
+
+- package `com.sladkaya.app.debug`, подпись Android Debug и явная метка
+  «Сладкая · тест»;
+- только ARM ABI `arm64-v8a` и `armeabi-v7a`;
+- 16-КБ zip alignment проходит; закреплённые native hashes проверяются каждой
+  сборкой, а ARM64 `PT_LOAD` проверен с выравниванием `2**14`;
+- `usesCleartextTraffic=false`, backup/device-transfer отключены;
+- service и внутренние alarm receivers не экспортированы, системный boot
+  receiver содержит только ожидаемые системные actions.
+
+Lint: 0 ошибок и 26 предупреждений. Они относятся к KTX-стилю, inlined API с
+явными SDK-gate, доступным обновлениям зависимостей, ARM-only ChromeOS и
+side-load запросу исключения из оптимизации батареи; safety-критичных замечаний
+не найдено. `govulncheck@v1.1.4` не нашёл вызываемых Go-уязвимостей,
+`actionlint@v1.7.12` подтвердил CI-шаблон.
+
+## Аудит продуктового пути после будущего физического допуска
+
+Аудит зафиксировал, что безопасный диагностический тракт готов к первому
+устройству, но автоматический переход в продукт намеренно ещё отсутствует:
+
+- confirmed-config пока является только read-only marker и не загружает полную
+  типизированную конфигурацию;
+- `ConfiguredSensor` не открывает GATT, а coordinator всегда сохраняет
+  `publishable=false`, `alarmEligible=false` и `measurement=null`;
+- история, widget и uploader не подключены к реальному источнику;
+- uploader работает только в процессе и содержит временный пустой BuildConfig
+  seam вместо Android Keystore и долговечной WorkManager/outbox очереди;
+- текущий backend привязывает один device token к одному patient из config;
+  token→device→patient lookup для нескольких семей ещё не реализован.
+
+Следующая TDD-итерация начинается с типизированного физического допуска в
+окончательной Room `v1`, затем добавляет отдельный product runtime, атомарные
+`measurement + outbox`, восстановление UI/alarm/widget, Android Keystore и
+WorkManager. Обычный onboarding не сможет сам выдать физический допуск.
 
 ## Следующий физический барьер
 

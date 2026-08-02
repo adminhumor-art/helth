@@ -19,6 +19,8 @@ data class DecodedGs1RawSample(
     val current: Int,
     val temperature: Int,
     val reindex: Int,
+    val sensorTimeWasClamped: Boolean = false,
+    val addTimeSeconds: Int? = null,
 )
 
 data class DecodedGs3GlucoseSample(

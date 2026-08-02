@@ -408,6 +408,8 @@ class Gs1ProcessingCoordinatorTest {
                 encoding = SensitivityEncoding.NORMAL,
             ),
             store = store,
+            transportProtocol = "GS1_V120",
+            transportCodecId = "transport-codec-test",
             phoneClock = phoneClock,
         )
     }
@@ -441,6 +443,19 @@ private class FakeStore(
     val failures = mutableListOf<SensorIngestionFailureRecord>()
     var commitAttempts = 0
     var failureAttempts = 0
+
+    override suspend fun bindProtocol(
+        record: com.sladkaya.core.data.SensorProtocolBindingRecord,
+    ): com.sladkaya.core.data.SensorProtocolBindingCommitResult =
+        com.sladkaya.core.data.SensorProtocolBindingCommitResult.Bound
+
+    override suspend fun protocolBinding(
+        sensorId: String,
+    ): com.sladkaya.core.data.SensorProtocolBindingRecord? = null
+
+    override suspend fun protocolBindingByBluetoothAddress(
+        bluetoothAddress: String,
+    ): com.sladkaya.core.data.SensorProtocolBindingRecord? = null
 
     override suspend fun commit(record: AtomicSensorCoreRecord): SensorCoreCommitResult {
         commitAttempts += 1

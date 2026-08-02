@@ -14,6 +14,7 @@ import androidx.room.RoomDatabase
         SensorIngestionFailureEntity::class,
         SensorPacketIngressEntity::class,
         SensorPacketIngressOutcomeEntity::class,
+        SensorProtocolBindingEntity::class,
     ],
     version = 1,
     exportSchema = true,

@@ -2,6 +2,7 @@ package com.sladkaya.sensor.sibionics
 
 import com.sladkaya.core.data.SensorAlgorithmCheckpointRecord
 import com.sladkaya.core.data.SensorCoreStore
+import com.sladkaya.core.data.SensorProtocolBindingRecord
 import com.sladkaya.core.model.SensorFamily
 import com.sladkaya.sensor.sibionics.algorithm.AlgorithmCheckpoint
 import com.sladkaya.sensor.sibionics.algorithm.AlgorithmInitializationMode
@@ -16,8 +17,8 @@ import com.sladkaya.sensor.sibionics.algorithm.SensitivityToken
 import com.sladkaya.sensor.sibionics.algorithm.SensitivityTokenPolicy
 import com.sladkaya.sensor.sibionics.algorithm.SensitivityTokenValidation
 import com.sladkaya.sensor.sibionics.algorithm.SibionicsAlgorithmSession
+import com.sladkaya.sensor.sibionics.algorithm.V115GNativeAlgorithmApi
 import com.sladkaya.sensor.sibionics.algorithm.V116ANativeAlgorithmApi
-import com.sladkaya.sensor.sibionics.datahandle.SibionicsDataHandle
 import java.util.concurrent.CancellationException
 
 internal data class Gs1CoreConfiguration(
@@ -26,6 +27,7 @@ internal data class Gs1CoreConfiguration(
     val bluetoothAddress: String,
     val transportVariant: Int,
     val packageCode: String,
+    val wireProfile: Gs1WireProfile,
 ) {
     init {
         require(sensorId.isNotBlank() && sensorId.length <= 128)
@@ -37,6 +39,9 @@ internal data class Gs1CoreConfiguration(
 internal enum class Gs1CoreOpenError {
     UNSUPPORTED_FAMILY,
     UNSUPPORTED_TRANSPORT_VARIANT,
+    UNSUPPORTED_WIRE_PROFILE,
+    PROTOCOL_BINDING_REQUIRED,
+    PROTOCOL_BINDING_MISMATCH,
     INVALID_PACKAGE_CODE,
     SENSITIVITY_DECODE_FAILED,
     UNSUPPORTED_SENSITIVITY_ENCODING,
@@ -67,12 +72,19 @@ internal class Gs1CoreFactory private constructor(
     private val decodeSensitivityForProfile: (AlgorithmProfile, SensitivityToken) -> SensitivityDecodeResult,
     private val nativeProvider: (AlgorithmProfile) -> NativeAlgorithmApi,
 ) {
+    private val protocolBindingResolver = Gs1ProtocolBindingResolver(store)
+
     constructor(store: SensorCoreStore) : this(
         store = store,
         decodeSensitivityForProfile = { profile, token ->
             SensitivityDecoder.create(profile).decode(token)
         },
-        nativeProvider = { V116ANativeAlgorithmApi() },
+        nativeProvider = { profile ->
+            when (profile) {
+                AlgorithmProfile.V115G -> V115GNativeAlgorithmApi()
+                AlgorithmProfile.V116A -> V116ANativeAlgorithmApi()
+            }
+        },
     )
 
     internal constructor(
@@ -85,16 +97,97 @@ internal class Gs1CoreFactory private constructor(
         nativeProvider = nativeProvider,
     )
 
-    suspend fun open(configuration: Gs1CoreConfiguration): Gs1CoreOpenResult {
+    suspend fun inspectProtocol(
+        profile: Gs1DiagnosticActivationProfile,
+    ): Gs1ProtocolResolution = protocolBindingResolver.inspect(profile)
+
+    /** Decodes calibration, then commits evidence before any checkpoint/native access. */
+    suspend fun bindProtocolEvidence(
+        profile: Gs1DiagnosticActivationProfile,
+        wireProfile: Gs1WireProfile,
+        evidenceKind: String,
+        evidence: ByteArray,
+    ): Gs1ProtocolResolution {
+        val spec = try {
+            Gs1WireProfiles.requireResolved(wireProfile)
+        } catch (invalid: IllegalArgumentException) {
+            return Gs1ProtocolResolution.Failure(
+                code = "PROTOCOL_BINDING_PROFILE_INVALID",
+                detail = invalid.message,
+            )
+        }
+        val token = when (
+            val validation = SensitivityTokenPolicy.validatePackageCode(profile.packageCode)
+        ) {
+            is SensitivityTokenValidation.Valid -> validation.token
+            is SensitivityTokenValidation.Invalid -> return Gs1ProtocolResolution.Failure(
+                code = "INVALID_PACKAGE_CODE",
+                detail = validation.error.name,
+            )
+        }
+        val decoded = try {
+            decodeSensitivityForProfile(spec.algorithmProfile, token)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: LinkageError) {
+            return Gs1ProtocolResolution.Failure(
+                code = "SENSITIVITY_DECODE_FAILED",
+                detail = failure.message,
+            )
+        } catch (failure: Exception) {
+            return Gs1ProtocolResolution.Failure(
+                code = "SENSITIVITY_DECODE_FAILED",
+                detail = failure.message,
+            )
+        }
+        val sensitivity = when (decoded) {
+            is SensitivityDecodeResult.Success -> decoded.value
+            is SensitivityDecodeResult.Failure -> return Gs1ProtocolResolution.Failure(
+                code = "SENSITIVITY_DECODE_FAILED",
+                detail = decoded.error.name,
+            )
+        }
+        return protocolBindingResolver.bind(
+            profile = profile,
+            wireProfile = wireProfile,
+            evidenceKind = evidenceKind,
+            evidence = evidence,
+            sensitivityEncoding = sensitivity.encoding.name,
+        )
+    }
+
+    suspend fun openBound(
+        profile: Gs1DiagnosticActivationProfile,
+        resolution: Gs1ProtocolResolution.Resolved,
+    ): Gs1CoreOpenResult {
+        val binding = resolution.binding
+            ?: return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.PROTOCOL_BINDING_REQUIRED)
+        return open(profile.coreConfiguration(resolution.wireProfile), binding)
+    }
+
+    suspend fun open(
+        configuration: Gs1CoreConfiguration,
+        protocolBinding: SensorProtocolBindingRecord,
+    ): Gs1CoreOpenResult {
         if (configuration.family != SensorFamily.SIBIONICS_GS1 &&
             configuration.family != SensorFamily.SIBIONICS_GS1SB
         ) {
             return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.UNSUPPORTED_FAMILY)
         }
-        if (configuration.transportVariant !in VERIFIED_TRANSPORT_VARIANTS) {
+        if (configuration.transportVariant !in VERIFIED_TRANSPORT_VARIANTS ||
+            configuration.transportVariant == GLOBAL_VARIANT &&
+            configuration.wireProfile != Gs1WireProfile.V120
+        ) {
             return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.UNSUPPORTED_TRANSPORT_VARIANT)
         }
-
+        val spec = try {
+            Gs1WireProfiles.requireResolved(configuration.wireProfile)
+        } catch (invalid: IllegalArgumentException) {
+            return Gs1CoreOpenResult.Failure(
+                Gs1CoreOpenError.UNSUPPORTED_WIRE_PROFILE,
+                invalid.message,
+            )
+        }
         val token = when (val validation = SensitivityTokenPolicy.validatePackageCode(configuration.packageCode)) {
             is SensitivityTokenValidation.Valid -> validation.token
             is SensitivityTokenValidation.Invalid -> {
@@ -104,8 +197,11 @@ internal class Gs1CoreFactory private constructor(
                 )
             }
         }
+        if (!protocolBinding.matches(configuration, spec, token)) {
+            return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.PROTOCOL_BINDING_MISMATCH)
+        }
         val decoded = try {
-                decodeSensitivityForProfile(PINNED_PROFILE, token)
+                decodeSensitivityForProfile(spec.algorithmProfile, token)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: LinkageError) {
@@ -128,11 +224,25 @@ internal class Gs1CoreFactory private constructor(
                 )
             }
         }
-        if (sensitivity.encoding != SensitivityEncoding.NORMAL) {
-            return Gs1CoreOpenResult.Failure(
-                Gs1CoreOpenError.UNSUPPORTED_SENSITIVITY_ENCODING,
-                sensitivity.encoding.name,
-            )
+        if (protocolBinding.sensitivityEncoding != sensitivity.encoding.name) {
+            return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.PROTOCOL_BINDING_MISMATCH)
+        }
+        val initializationMode = sensitivity.initializationMode()
+
+        val native: NativeAlgorithmApi
+        val nativeAlgorithmVersion: String
+        try {
+            native = nativeProvider(spec.algorithmProfile)
+            nativeAlgorithmVersion = native.algorithmVersion
+            require(nativeAlgorithmVersion.isNotBlank() &&
+                !nativeAlgorithmVersion.trim().equals("unknown", ignoreCase = true)
+            ) { "Native algorithm version is absent or unknown" }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: LinkageError) {
+            return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.NATIVE_LOAD_FAILED, failure.message)
+        } catch (failure: Exception) {
+            return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.NATIVE_LOAD_FAILED, failure.message)
         }
 
         val (stored, physicalCheckpoint) = try {
@@ -154,10 +264,23 @@ internal class Gs1CoreFactory private constructor(
                 Gs1CoreOpenError.CHECKPOINT_PHYSICAL_IDENTITY_MISMATCH,
             )
         }
-        if (stored != null && !stored.calibrationMatches(configuration, sensitivity)) {
+        if (stored != null && !stored.calibrationMatches(
+                configuration,
+                sensitivity,
+                spec,
+                initializationMode,
+                native.binarySetId,
+                nativeAlgorithmVersion,
+            )
+        ) {
             return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.CHECKPOINT_CALIBRATION_MISMATCH)
         }
-        val checkpoint = stored?.toAlgorithmCheckpoint(configuration, sensitivity)
+        val checkpoint = stored?.toAlgorithmCheckpoint(
+            configuration,
+            sensitivity,
+            spec,
+            initializationMode,
+        )
             ?: if (stored == null) null else {
                 return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.CHECKPOINT_METADATA_MISMATCH)
             }
@@ -169,20 +292,11 @@ internal class Gs1CoreFactory private constructor(
             return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.CHECKPOINT_METADATA_MISMATCH)
         }
 
-        val native = try {
-            nativeProvider(PINNED_PROFILE)
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (failure: LinkageError) {
-            return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.NATIVE_LOAD_FAILED, failure.message)
-        } catch (failure: Exception) {
-            return Gs1CoreOpenResult.Failure(Gs1CoreOpenError.NATIVE_LOAD_FAILED, failure.message)
-        }
         return when (
             val opened = SibionicsAlgorithmSession.open(
-                profile = PINNED_PROFILE,
+                profile = spec.algorithmProfile,
                 sensitivityToken = sensitivity.token,
-                initializationMode = AlgorithmInitializationMode.STANDARD,
+                initializationMode = initializationMode,
                 checkpoint = checkpoint,
                 native = native,
             )
@@ -200,6 +314,8 @@ internal class Gs1CoreFactory private constructor(
                     algorithm = opened.session,
                     sensitivity = sensitivity,
                     store = store,
+                    transportProtocol = spec.transportProtocol,
+                    transportCodecId = spec.transportCodecId,
                 ),
                 sensitivity = sensitivity,
                 nextSensorIndex = nextSensorIndex,
@@ -210,39 +326,47 @@ internal class Gs1CoreFactory private constructor(
     private fun SensorAlgorithmCheckpointRecord.calibrationMatches(
         configuration: Gs1CoreConfiguration,
         sensitivity: DecodedSensitivity,
+        spec: Gs1WireProfileSpec,
+        initializationMode: AlgorithmInitializationMode,
+        nativeBinarySetId: String,
+        nativeAlgorithmVersion: String,
     ): Boolean =
         sensorId == configuration.sensorId &&
             bluetoothAddress == configuration.bluetoothAddress &&
             sensorFamily == configuration.family &&
             transportVariant == configuration.transportVariant &&
-            transportProtocol == TRANSPORT_PROTOCOL &&
-            dataHandleBinarySetId == SibionicsDataHandle.BINARY_SET_ID &&
-            algorithmProfile == PINNED_PROFILE.name &&
+            transportProtocol == spec.transportProtocol &&
+            transportCodecId == spec.transportCodecId &&
+            algorithmProfile == spec.algorithmProfile.name &&
             sensitivityToken == sensitivity.token.value &&
             sensitivityTokenSource == sensitivity.token.source.name &&
             sensitivityCoefficient == sensitivity.coefficient.toDouble() &&
             sensitivityEncoding == sensitivity.encoding.name &&
-            initializationMode == AlgorithmInitializationMode.STANDARD.name
+            this.initializationMode == initializationMode.name &&
+            binarySetId == nativeBinarySetId &&
+            algorithmVersion == nativeAlgorithmVersion
 
     private fun SensorAlgorithmCheckpointRecord.toAlgorithmCheckpoint(
         configuration: Gs1CoreConfiguration,
         sensitivity: DecodedSensitivity,
+        spec: Gs1WireProfileSpec,
+        initializationMode: AlgorithmInitializationMode,
     ): AlgorithmCheckpoint? {
         if (sensorId != configuration.sensorId ||
             bluetoothAddress != configuration.bluetoothAddress ||
             sensorFamily != configuration.family ||
             transportVariant != configuration.transportVariant ||
-            transportProtocol != TRANSPORT_PROTOCOL ||
-            dataHandleBinarySetId != SibionicsDataHandle.BINARY_SET_ID ||
-            algorithmProfile != PINNED_PROFILE.name ||
+            transportProtocol != spec.transportProtocol ||
+            transportCodecId != spec.transportCodecId ||
+            algorithmProfile != spec.algorithmProfile.name ||
             sensorTimeEpochMs <= 0 ||
             sensorTimeEpochMs % MILLIS_PER_SECOND != 0L
         ) return null
         return AlgorithmCheckpoint(
-            profile = PINNED_PROFILE,
+            profile = spec.algorithmProfile,
             binarySetId = binarySetId,
             sensitivityToken = sensitivity.token,
-            initializationMode = AlgorithmInitializationMode.STANDARD,
+            initializationMode = initializationMode,
             lastProcessedIndex = sequence,
             lastSensorTimeEpochSeconds = sensorTimeEpochMs / MILLIS_PER_SECOND,
             nativeState = stateCopy(),
@@ -257,13 +381,31 @@ internal class Gs1CoreFactory private constructor(
         const val MILLIS_PER_SECOND = 1_000L
         const val FIRST_SENSOR_INDEX = 1
         const val MAX_SENSOR_INDEX = 0xffff
-        val PINNED_PROFILE = AlgorithmProfile.V116A
-        // The downloaded Global APK proves this exact V120 + V116A pair.
-        // Other regional authentication variants remain blocked until their
-        // algorithm/binary pairing is proven by an official fixture.
-        val VERIFIED_TRANSPORT_VARIANTS = setOf(0)
-        const val TRANSPORT_PROTOCOL = "GS1_V120"
+        const val GLOBAL_VARIANT = 0
+        const val CHINESE_VARIANT = 2
+        val VERIFIED_TRANSPORT_VARIANTS = setOf(GLOBAL_VARIANT, CHINESE_VARIANT)
     }
 }
+
+private fun SensorProtocolBindingRecord.matches(
+    configuration: Gs1CoreConfiguration,
+    spec: Gs1WireProfileSpec,
+    sensitivityToken: SensitivityToken,
+): Boolean = sensorId == configuration.sensorId &&
+    bluetoothAddress == configuration.bluetoothAddress &&
+    sensorFamily == configuration.family &&
+    transportVariant == configuration.transportVariant &&
+    this.sensitivityToken == sensitivityToken.value &&
+    wireProfile == spec.wireProfile.name &&
+    transportProtocol == spec.transportProtocol &&
+    transportCodecId == spec.transportCodecId &&
+    algorithmProfile == spec.algorithmProfile.name &&
+    schemaVersion == SensorProtocolBindingRecord.SCHEMA_VERSION
+
+private fun DecodedSensitivity.initializationMode(): AlgorithmInitializationMode =
+    when (encoding) {
+        SensitivityEncoding.NORMAL -> AlgorithmInitializationMode.STANDARD
+        SensitivityEncoding.FACTION -> AlgorithmInitializationMode.FACTION
+    }
 
 private val CANONICAL_BLUETOOTH_ADDRESS = Regex("^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$")

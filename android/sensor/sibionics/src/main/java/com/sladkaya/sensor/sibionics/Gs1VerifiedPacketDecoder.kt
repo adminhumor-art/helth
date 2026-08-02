@@ -30,7 +30,7 @@ internal fun interface Gs1NativeSplitter {
 }
 
 internal fun interface Gs1PacketVerifier {
-    fun decode(encryptedPacket: ByteArray): Gs1VerifiedPacketResult
+    fun decode(encryptedPacket: ByteArray, receivedAtEpochMs: Long): Gs1VerifiedPacketResult
 }
 
 /**
@@ -43,7 +43,10 @@ internal class Gs1VerifiedPacketDecoder(
         SibionicsDataHandle().splitGs1Data(packet)
     },
 ) : Gs1PacketVerifier {
-    override fun decode(encryptedPacket: ByteArray): Gs1VerifiedPacketResult {
+    override fun decode(
+        encryptedPacket: ByteArray,
+        receivedAtEpochMs: Long,
+    ): Gs1VerifiedPacketResult {
         val local = when (val decoded = wireCodec.decode(SensorFamily.SIBIONICS_GS1, encryptedPacket)) {
             is DecodedPacket.Gs1RawSamples -> decoded.values
             is DecodedPacket.Invalid -> {

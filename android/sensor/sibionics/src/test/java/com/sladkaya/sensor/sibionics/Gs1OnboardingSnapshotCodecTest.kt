@@ -14,12 +14,14 @@ class Gs1OnboardingSnapshotCodecTest {
             Gs1OnboardingSnapshot(
                 stage = Gs1OnboardingStage.DISCOVERING,
                 family = SensorFamily.SIBIONICS_GS1,
+                marketProfile = Gs1MarketProfile.GLOBAL,
                 codeSource = Gs1PackageCodeSource.MANUAL,
                 packageCode = "Ab1Zcd34",
             ),
             Gs1OnboardingSnapshot(
                 stage = Gs1OnboardingStage.RESOLUTION_BLOCKED,
                 family = SensorFamily.SIBIONICS_GS1SB,
+                marketProfile = Gs1MarketProfile.GLOBAL,
                 codeSource = Gs1PackageCodeSource.DATA_MATRIX,
                 packageCode = "Ab1Zcd34",
                 rejectionReason = Gs1OnboardingRejectionReason.AMBIGUOUS_CANDIDATES,
@@ -27,6 +29,15 @@ class Gs1OnboardingSnapshotCodecTest {
                     Gs1ResolvedAdvertisement("GS-Ab1Z", "AA:BB:CC:DD:EE:02"),
                     Gs1ResolvedAdvertisement("MED-Ab1Z", "AA:BB:CC:DD:EE:01"),
                 ),
+            ),
+            Gs1OnboardingSnapshot(
+                stage = Gs1OnboardingStage.PROFILE_BLOCKED,
+                family = SensorFamily.SIBIONICS_GS1,
+                marketProfile = Gs1MarketProfile.RUSSIAN,
+                codeSource = Gs1PackageCodeSource.MANUAL,
+                packageCode = "Ab1Zcd34",
+                rejectionReason =
+                    Gs1OnboardingRejectionReason.PROFILE_NOT_PHYSICALLY_VERIFIED,
             ),
             pendingSnapshot(),
         )
@@ -123,6 +134,7 @@ class Gs1OnboardingSnapshotCodecTest {
         val profile = (restarted.state as Gs1OnboardingState.PendingDiagnostic).profile
 
         assertEquals(Gs1OnboardingProfileStatus.PENDING_DIAGNOSTIC, profile.status)
+        assertEquals(Gs1MarketProfile.GLOBAL, profile.marketProfile)
         assertEquals("Ab1Zcd34", profile.packageCode)
         assertFalse(profile.physicalEvidenceVerified)
         assertFalse(profile.eligibleForConfirmedConfiguration)
@@ -133,12 +145,22 @@ class Gs1OnboardingSnapshotCodecTest {
     private fun pendingSnapshot() = Gs1OnboardingSnapshot(
         stage = Gs1OnboardingStage.PENDING_DIAGNOSTIC,
         family = SensorFamily.SIBIONICS_GS1,
+        marketProfile = Gs1MarketProfile.GLOBAL,
         codeSource = Gs1PackageCodeSource.MANUAL,
         packageCode = "Ab1Zcd34",
         selectedDeviceName = "GS-Ab1Z",
         selectedBluetoothAddress = "AA:BB:CC:DD:EE:01",
     )
 }
+
+private fun Gs1OnboardingStateMachine.submitPackageCode(
+    family: SensorFamily,
+    input: Gs1PackageCodeInput,
+): Gs1OnboardingActionResult = submitPackageCode(
+    family = family,
+    input = input,
+    marketProfile = Gs1MarketProfile.GLOBAL,
+)
 
 private class EncodedOnboardingStore(
     var encodedValue: String? = null,

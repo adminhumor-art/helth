@@ -1,6 +1,6 @@
 # Golden/replay-контур GS1/GS1Sb
 
-Обновлено: 1 августа 2026 года.
+Обновлено: 2 августа 2026 года.
 
 ## Назначение и граница
 
@@ -67,15 +67,18 @@ payload-sha256=<64 lower-case hex>
 закреплёнными enum/числами/хешами, кодируются lower-case hex от UTF-8 bytes.
 
 Метаданные закрепляют trace id, provenance/privacy classification, семейство,
-профиль, algorithm version, binary set, `GS1_V120`, обязательный `STANDARD`,
-источник `PACKAGE_CODE`, `NORMAL`, точные IEEE-754 Float bits коэффициента,
-HMAC точного sensitivity input и pseudonymous identity evidence.
+algorithm version, binary set и точную transport/profile-пару:
+`GS1_V120/V116A` либо `GS1_V115/V115G`. Также фиксируются согласованная пара
+`NORMAL/STANDARD` либо `FACTION/FACTION`, источник `PACKAGE_CODE`, точные
+IEEE-754 Float bits коэффициента, HMAC точного sensitivity input и
+pseudonymous identity evidence.
 
 Каждая строка `notification` содержит attempt/pseudonym, ordinal, ingress time,
 полный encrypted packet и SHA-256, ожидаемый исход `GS1_DATA`, `NON_DATA` либо
 `REJECTED`, признак дешифрования и число samples. За каждым sample идут:
 
-- `sample`: index, sensor time, raw current, raw temperature, reindex;
+- `sample`: index, sensor time, raw current, raw temperature, reindex,
+  `addTimeSeconds` и признак применения future-clamp;
 - `diagnostic`: точные IEEE-754 bits native и diagnostic output, trend, три
   warning-кода, state SHA-256 и при наличии checkpointed error code.
 
@@ -86,9 +89,13 @@ Parser и planner отвергают файл до decoder/native при неи�
 неизвестной строке, конфликте attempt/ordinal/index/time, non-finite output,
 неверном state hash либо sensitivity metadata.
 
-Первый sample имеет index `1`; следующие index и sensor time идут без разрыва с
-шагом 60 секунд. Один notification содержит не более 29 samples, packet — не
-более 250 bytes, payload — не более 16 MiB.
+Первый sample имеет index `1`, следующие index идут без разрыва. Для V120 время
+обязано идти с точным шагом 60 секунд, `addTimeSeconds` отсутствует,
+future-clamp запрещён, а один notification содержит не более 29 samples. Для
+V115 planner заново выводит время каждого sample из сохранённых
+`receivedAtEpochMs`, `addTimeSeconds` и `reindex`, точно проверяет future-clamp,
+разрешает равные и неминутные интервалы и ограничивает notification 17
+samples. Packet — не более 250 bytes, payload — не более 16 MiB.
 
 Header ограничен 256 bytes. Payload разбирается последовательным курсором без
 списка всех строк; одна строка ограничена 2048 символами до `split`. Поэтому
@@ -101,8 +108,8 @@ Planner повторно проверяет даже программно соз
 batch до первого нативного шага и затем открывает существующий stateful session
 через injected factory.
 
-До первого нативного шага runner требует HMAC-capability и сверяет `STANDARD`,
-token source, sensitivity encoding и точные Float bits коэффициента. Exact
+До первого нативного шага runner требует HMAC-capability и сверяет точную пару
+initialization mode/encoding, token source и точные Float bits коэффициента. Exact
 8-символьный input проверяется HMAC без записи кода или ключа.
 
 После каждого sample runner побитово сверяет output, trend, warnings,
@@ -127,4 +134,5 @@ outputs независимо от expected trace; отдельные mutation-т
 
 Fixture не получен с датчика, не является значениями для лечения или сравнением
 с закреплённым эталоном. До реального golden остаются private capture/export вне
-Git, прогон закреплённого эталона и ARM replay обоих профилей.
+Git, прогон закреплённого эталона и ARM replay обеих точных
+transport/profile-пар.

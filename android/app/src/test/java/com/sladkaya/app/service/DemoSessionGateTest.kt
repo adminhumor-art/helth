@@ -63,4 +63,15 @@ class DemoSessionGateTest {
         assertTrue(gate.runIfCurrent(generation) { calls += 1 })
         assertEquals(1, calls)
     }
+
+    @Test
+    fun repeatedDemoStartIsIgnoredUntilCurrentStartOrSessionReleasesClaim() {
+        val gate = DemoStartRequestGate()
+
+        assertTrue(gate.claim())
+        assertFalse(gate.claim())
+
+        gate.release()
+        assertTrue(gate.claim())
+    }
 }

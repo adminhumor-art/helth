@@ -32,12 +32,14 @@ class Gs1DiagnosticActivationProfile private constructor(
     val transportVariant: Int,
     val packageCode: String,
 ) {
-    internal fun coreConfiguration() = Gs1CoreConfiguration(
+    internal fun coreConfiguration(wireProfile: Gs1WireProfile) =
+        Gs1CoreConfiguration(
         sensorId = sensorId,
         family = family,
         bluetoothAddress = bluetoothAddress,
         transportVariant = transportVariant,
         packageCode = packageCode,
+        wireProfile = wireProfile,
     )
 
     companion object {
@@ -90,7 +92,9 @@ class Gs1DiagnosticActivationProfile private constructor(
 
         private const val MAX_SENSOR_ID_CHARS = 128
         private const val PACKAGE_CODE_CHARS = 8
-        private val VERIFIED_TRANSPORT_VARIANTS = setOf(0)
+        // Regional identity is captured from the one product setup flow. The
+        // concrete wire/profile tuple remains an internal, evidence-bound choice.
+        private val VERIFIED_TRANSPORT_VARIANTS = setOf(0, 2)
         private val BLUETOOTH_ADDRESS = Regex("^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
     }
 }

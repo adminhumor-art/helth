@@ -11,6 +11,47 @@ import java.security.MessageDigest
 
 class SensorCoreDaoTest {
     @Test
+    fun protocolBindingIsInsertOnlyIdempotentAndPhysicalIdentityUnique() = runBlocking {
+        val dao = RecordingSensorCoreDao(implicitProtocolBinding = false)
+        val first = protocolBinding()
+
+        assertEquals(SensorCoreCommitDisposition.COMMITTED, dao.bindProtocol(first))
+        assertEquals(SensorCoreCommitDisposition.ALREADY_COMMITTED, dao.bindProtocol(first))
+        assertThrows(SensorCoreConflictException::class.java) {
+            runBlocking { dao.bindProtocol(first.copy(wireProfile = "V115")) }
+        }
+        assertThrows(SensorCoreConflictException::class.java) {
+            runBlocking { dao.bindProtocol(first.copy(sensorId = "sensor-b")) }
+        }
+        assertEquals(first, dao.protocolBinding("sensor-a"))
+        Unit
+    }
+
+    @Test
+    fun coreCommitCannotPrecedeOrContradictDurableProtocolBinding() = runBlocking {
+        val dao = RecordingSensorCoreDao(implicitProtocolBinding = false)
+        val bundle = record().toEntityBundle()
+
+        assertThrows(SensorCoreConflictException::class.java) {
+            runBlocking { dao.commit(bundle) }
+        }
+        dao.bindProtocol(protocolBinding())
+        assertEquals(SensorCoreCommitDisposition.COMMITTED, dao.commit(bundle))
+        assertThrows(SensorCoreConflictException::class.java) {
+            runBlocking {
+                dao.commit(
+                    record(sequence = 2).copy(
+                        checkpoint = record(sequence = 2).checkpoint.copy(
+                            transportCodecId = "opposite-codec",
+                        ),
+                    ).toEntityBundle(),
+                )
+            }
+        }
+        Unit
+    }
+
+    @Test
     fun commitWritesEveryPartBeforeReplacingCheckpoint() = runBlocking {
         val dao = RecordingSensorCoreDao()
 
@@ -123,6 +164,65 @@ class SensorCoreDaoTest {
     }
 
     @Test
+    fun v115AcceptsExactNonMinuteTimingAndPreservesReceiveTimeProvenanceOnRetry() = runBlocking {
+        val dao = RecordingSensorCoreDao(implicitProtocolBinding = false)
+        dao.bindProtocol(
+            protocolBinding(
+                transportVariant = 2,
+                wireProfile = "V115",
+                transportProtocol = "GS1_V115",
+                transportCodecId = "GS1_V115_WIRE_V1",
+                algorithmProfile = "V115G",
+            ),
+        )
+        val receivedAt = 1_700_000_060_000L
+        val history = record(
+            sequence = 1,
+            sensorTime = receivedAt - 30_000L,
+            phoneTime = receivedAt,
+            historyDistance = 1,
+            transportVariant = 2,
+            transportProtocol = "GS1_V115",
+            transportCodecId = "GS1_V115_WIRE_V1",
+            algorithmProfile = "V115G",
+            algorithmVersion = "1.1.5G",
+            algorithmStateSize = 2_336,
+            addTimeSeconds = 30,
+        )
+        val current = record(
+            sequence = 2,
+            sensorTime = receivedAt,
+            phoneTime = receivedAt,
+            historyDistance = 0,
+            transportVariant = 2,
+            transportProtocol = "GS1_V115",
+            transportCodecId = "GS1_V115_WIRE_V1",
+            algorithmProfile = "V115G",
+            algorithmVersion = "1.1.5G",
+            algorithmStateSize = 2_336,
+            sensorTimeWasClamped = true,
+            addTimeSeconds = 30,
+        )
+
+        assertEquals(SensorCoreCommitDisposition.COMMITTED, dao.commit(history.toEntityBundle()))
+        val currentBundle = current.toEntityBundle()
+        assertEquals(SensorCoreCommitDisposition.COMMITTED, dao.commit(currentBundle))
+        assertEquals(SensorCoreCommitDisposition.ALREADY_COMMITTED, dao.commit(currentBundle))
+
+        val savedHistory = checkNotNull(dao.rawByEvent(history.raw.eventId))
+        val savedCurrent = checkNotNull(dao.rawByEvent(current.raw.eventId))
+        assertEquals(receivedAt - 30_000L, savedHistory.sensorTimeEpochMs)
+        assertEquals(receivedAt, savedHistory.phoneTimeEpochMs)
+        assertEquals(30, savedHistory.addTimeSeconds)
+        assertEquals(false, savedHistory.sensorTimeWasClamped)
+        assertEquals(receivedAt, savedCurrent.sensorTimeEpochMs)
+        assertEquals(receivedAt, savedCurrent.phoneTimeEpochMs)
+        assertEquals(30, savedCurrent.addTimeSeconds)
+        assertEquals(true, savedCurrent.sensorTimeWasClamped)
+        assertEquals(receivedAt, dao.savedCheckpoint?.sensorTimeEpochMs)
+    }
+
+    @Test
     fun immutableCheckpointProvenanceCannotChangeMidSensor() = runBlocking {
         val dao = RecordingSensorCoreDao()
         dao.commit(record(sequence = 1).toEntityBundle())
@@ -159,7 +259,7 @@ class SensorCoreDaoTest {
     }
 
     @Test
-    fun physicalBluetoothIdentityCannotBeClaimedByAnotherLogicalSensor() = runBlocking {
+    fun unboundLogicalIdentityCannotClaimAnExistingPhysicalSensor() = runBlocking {
         val dao = RecordingSensorCoreDao()
         dao.commit(record(sensorId = "sensor-a").toEntityBundle())
         dao.calls.clear()
@@ -168,7 +268,7 @@ class SensorCoreDaoTest {
             runBlocking { dao.commit(record(sensorId = "sensor-b").toEntityBundle()) }
         }
 
-        assertEquals("Bluetooth address is already bound to another sensor", conflict.message)
+        assertEquals("Protocol must be durably bound before the first core commit", conflict.message)
         assertEquals(emptyList<String>(), dao.calls)
     }
 
@@ -250,7 +350,17 @@ class SensorCoreDaoTest {
     private fun record(
         sequence: Int = 1,
         sensorTime: Long = 1_700_000_000_000L + sequence * 60_000L,
+        phoneTime: Long = sensorTime + 1_000L,
         sensorId: String = "sensor-a",
+        historyDistance: Int = 0,
+        transportVariant: Int = 0,
+        transportProtocol: String = "GS1_V120",
+        transportCodecId: String = "transport-codec-test",
+        algorithmProfile: String = "V116A",
+        algorithmVersion: String = "1.1.6A",
+        algorithmStateSize: Int = 2_480,
+        sensorTimeWasClamped: Boolean = false,
+        addTimeSeconds: Int? = null,
     ): AtomicSensorCoreRecord {
         val packet = byteArrayOf(1, 2, sequence.toByte())
         val raw = RawSensorSampleRecord(
@@ -259,13 +369,15 @@ class SensorCoreDaoTest {
             sensorFamily = SensorFamily.SIBIONICS_GS1,
             sequence = sequence,
             sensorTimeEpochMs = sensorTime,
-            phoneTimeEpochMs = sensorTime + 1_000L,
+            phoneTimeEpochMs = phoneTime,
             packet = packet,
             packetSha256 = packet.sha256(),
             currentRaw = 53,
             temperatureRaw = 322,
-            historyDistance = 0,
-            transportVariant = 0,
+            historyDistance = historyDistance,
+            transportVariant = transportVariant,
+            sensorTimeWasClamped = sensorTimeWasClamped,
+            addTimeSeconds = addTimeSeconds,
         )
         val result = SensorAlgorithmResultRecord(
             eventId = raw.eventId,
@@ -278,8 +390,8 @@ class SensorCoreDaoTest {
             glucoseWarning = 0,
             currentWarning = 0,
             temperatureWarning = 0,
-            algorithmProfile = "V116A",
-            algorithmVersion = "1.1.6A",
+            algorithmProfile = algorithmProfile,
+            algorithmVersion = algorithmVersion,
             binarySetId = "set",
             sensitivityToken = "ABCDEFGH",
             sensitivityTokenSource = "PACKAGE_CODE",
@@ -293,20 +405,20 @@ class SensorCoreDaoTest {
             bluetoothAddress = "AA:BB:CC:DD:EE:FF",
             sensorFamily = raw.sensorFamily,
             transportVariant = raw.transportVariant,
-            transportProtocol = "GS1_V120",
-            dataHandleBinarySetId = "datahandle-test",
+            transportProtocol = transportProtocol,
+            transportCodecId = transportCodecId,
             sequence = raw.sequence,
             sensorTimeEpochMs = raw.sensorTimeEpochMs,
-            algorithmProfile = "V116A",
-            algorithmVersion = "1.1.6A",
+            algorithmProfile = algorithmProfile,
+            algorithmVersion = algorithmVersion,
             binarySetId = "set",
             sensitivityToken = "ABCDEFGH",
             sensitivityTokenSource = "PACKAGE_CODE",
             sensitivityCoefficient = 1.42,
             sensitivityEncoding = "NORMAL",
             initializationMode = "STANDARD",
-            state = ByteArray(2_480),
-            stateSha256 = ByteArray(2_480).sha256(),
+            state = ByteArray(algorithmStateSize),
+            stateSha256 = ByteArray(algorithmStateSize).sha256(),
             displayOffsetMmolL = 0.0,
             schemaVersion = 1,
         )
@@ -349,6 +461,28 @@ class SensorCoreDaoTest {
         )
     }
 
+    private fun protocolBinding(
+        transportVariant: Int = 0,
+        wireProfile: String = "V120",
+        transportProtocol: String = "GS1_V120",
+        transportCodecId: String = "transport-codec-test",
+        algorithmProfile: String = "V116A",
+    ) = SensorProtocolBindingEntity(
+        sensorId = "sensor-a",
+        bluetoothAddress = "AA:BB:CC:DD:EE:FF",
+        sensorFamily = SensorFamily.SIBIONICS_GS1.wireName,
+        transportVariant = transportVariant,
+        sensitivityToken = "ABCDEFGH",
+        wireProfile = wireProfile,
+        transportProtocol = transportProtocol,
+        transportCodecId = transportCodecId,
+        algorithmProfile = algorithmProfile,
+        sensitivityEncoding = "NORMAL",
+        evidenceKind = "TEST_EVIDENCE",
+        evidenceSha256 = "ab".repeat(32),
+        schemaVersion = 1,
+    )
+
     private fun ByteArray.sha256(): String = MessageDigest.getInstance("SHA-256")
         .digest(this)
         .joinToString("") { "%02x".format(it) }
@@ -356,14 +490,51 @@ class SensorCoreDaoTest {
 
 private class RecordingSensorCoreDao(
     private val failOnResult: Boolean = false,
+    private val implicitProtocolBinding: Boolean = true,
 ) : SensorCoreDao() {
     val calls = mutableListOf<String>()
     private val rawByEvent = mutableMapOf<String, RawSensorSampleEntity>()
     private val resultByEvent = mutableMapOf<String, SensorAlgorithmResultEntity>()
     private val measurementByEvent = mutableMapOf<String, MeasurementEntity>()
     private val checkpoints = mutableMapOf<String, SensorAlgorithmCheckpointEntity>()
+    private val protocolBindings = mutableMapOf<String, SensorProtocolBindingEntity>()
     val savedCheckpoint: SensorAlgorithmCheckpointEntity?
         get() = checkpoints.values.singleOrNull()
+
+    override suspend fun insertProtocolBinding(value: SensorProtocolBindingEntity): Long {
+        val conflict = protocolBindings.containsKey(value.sensorId) ||
+            protocolBindings.values.any { it.bluetoothAddress == value.bluetoothAddress }
+        if (conflict) return -1
+        protocolBindings[value.sensorId] = value
+        return 1
+    }
+
+    override suspend fun protocolBinding(sensorId: String): SensorProtocolBindingEntity? =
+        protocolBindings[sensorId] ?: implicitBinding().takeIf { implicitProtocolBinding && it.sensorId == sensorId }
+
+    override suspend fun protocolBindingByBluetoothAddress(
+        bluetoothAddress: String,
+    ): SensorProtocolBindingEntity? = protocolBindings.values.singleOrNull {
+        it.bluetoothAddress == bluetoothAddress
+    } ?: implicitBinding().takeIf {
+        implicitProtocolBinding && it.bluetoothAddress == bluetoothAddress
+    }
+
+    private fun implicitBinding() = SensorProtocolBindingEntity(
+        sensorId = "sensor-a",
+        bluetoothAddress = "AA:BB:CC:DD:EE:FF",
+        sensorFamily = SensorFamily.SIBIONICS_GS1.wireName,
+        transportVariant = 0,
+        sensitivityToken = "ABCDEFGH",
+        wireProfile = "V120",
+        transportProtocol = "GS1_V120",
+        transportCodecId = "transport-codec-test",
+        algorithmProfile = "V116A",
+        sensitivityEncoding = "NORMAL",
+        evidenceKind = "TEST_EVIDENCE",
+        evidenceSha256 = "ab".repeat(32),
+        schemaVersion = 1,
+    )
 
     override suspend fun insertRaw(value: RawSensorSampleEntity): Long {
         calls += "raw"

@@ -60,6 +60,63 @@ class Gs1DiagnosticCommitPolicyTest {
         assertNull(assessment.latest)
     }
 
+    @Test
+    fun emptyCommitCannotEndHandshakeOrArmAFalseStreamWatchdog() {
+        val plan = Gs1DiagnosticCommitProgressPolicy.plan(
+            alreadyStreaming = false,
+            assessment = Gs1DiagnosticCommitPolicy.assess(emptyList()),
+        )
+
+        assertFalse(plan.markStreaming)
+        assertFalse(plan.armSilenceWatchdog)
+    }
+
+    @Test
+    fun validatedEmptyTransportEnvelopeEndsHandshakeWithoutLookingMedicallyFresh() {
+        val assessment = Gs1DiagnosticCommitPolicy.assess(
+            diagnostics = emptyList(),
+            validatedTransportEnvelope = true,
+        )
+        val plan = Gs1DiagnosticCommitProgressPolicy.plan(
+            alreadyStreaming = false,
+            assessment = assessment,
+        )
+
+        assertTrue(assessment.hasTransportProgress)
+        assertFalse(assessment.hasFreshDiagnostic)
+        assertTrue(plan.markStreaming)
+        assertTrue(plan.armSilenceWatchdog)
+    }
+
+    @Test
+    fun durableProgressEndsHandshakeAndEveryLaterProgressRefreshesTheWatchdog() {
+        val assessment = Gs1DiagnosticCommitPolicy.assess(
+            diagnostics = emptyList(),
+            committedSampleCount = 1,
+        )
+
+        assertEquals(
+            Gs1DiagnosticCommitProgressPlan(
+                markStreaming = true,
+                armSilenceWatchdog = true,
+            ),
+            Gs1DiagnosticCommitProgressPolicy.plan(
+                alreadyStreaming = false,
+                assessment = assessment,
+            ),
+        )
+        assertEquals(
+            Gs1DiagnosticCommitProgressPlan(
+                markStreaming = false,
+                armSilenceWatchdog = true,
+            ),
+            Gs1DiagnosticCommitProgressPolicy.plan(
+                alreadyStreaming = true,
+                assessment = assessment,
+            ),
+        )
+    }
+
     private fun diagnostic(sequence: Long, quality: ReadingQuality) = Gs1DiagnosticReading(
         eventId = "event-$sequence",
         sensorId = "sensor-a",

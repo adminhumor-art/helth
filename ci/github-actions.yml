@@ -119,7 +119,13 @@ jobs:
         run: ./gradlew testDebugUnitTest --no-daemon
 
       - name: Compile instrumentation tests
-        run: ./gradlew :core:data:assembleDebugAndroidTest :app:assembleDebugAndroidTest --no-daemon
+        run: >-
+          ./gradlew
+          :core:data:assembleDebugAndroidTest
+          :sensor:sibionics-algorithm:assembleDebugAndroidTest
+          :sensor:sibionics-datahandle:assembleDebugAndroidTest
+          :app:assembleDebugAndroidTest
+          --no-daemon
 
       - name: Run lint and build both APK variants
-        run: ./gradlew lintDebug assembleDebug assembleRelease --no-daemon
+        run: ./gradlew lintDebug assembleDebug minifyReleaseWithR8 --no-daemon

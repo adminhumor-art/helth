@@ -21,6 +21,29 @@ internal object RequiredPermissionPolicy {
         if (sdkInt >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
     }
 
+    fun forStart(sdkInt: Int, alarmMonitoring: Boolean): List<String> =
+        if (alarmMonitoring) forSdk(sdkInt) else mandatoryBleForSdk(sdkInt)
+
+    fun hasPermissionsForStart(
+        sdkInt: Int,
+        grantedPermissions: Set<String>,
+        alarmMonitoring: Boolean,
+    ): Boolean = forStart(sdkInt, alarmMonitoring).all(grantedPermissions::contains)
+
+    fun denialMessage(
+        sdkInt: Int,
+        grantedPermissions: Set<String>,
+        alarmMonitoring: Boolean,
+    ): String = when {
+        !hasMandatoryBlePermissions(sdkInt, grantedPermissions) ->
+            BLUETOOTH_DENIED_MESSAGE
+        alarmMonitoring &&
+            sdkInt >= 33 &&
+            Manifest.permission.POST_NOTIFICATIONS !in grantedPermissions ->
+            NOTIFICATION_DENIED_MESSAGE
+        else -> BLUETOOTH_DENIED_MESSAGE
+    }
+
     fun hasMandatoryBlePermissions(
         sdkInt: Int,
         grantedPermissions: Set<String>,
@@ -35,9 +58,32 @@ internal object RequiredPermissionPolicy {
         return hasMandatoryBlePermissions(Build.VERSION.SDK_INT, granted)
     }
 
-    fun missingPermissions(context: Context): List<String> =
-        forSdk(Build.VERSION.SDK_INT).filter { permission ->
+    fun hasPermissionsForStart(context: Context, alarmMonitoring: Boolean): Boolean {
+        val granted = forStart(Build.VERSION.SDK_INT, alarmMonitoring)
+            .filterTo(linkedSetOf()) { permission ->
+                ContextCompat.checkSelfPermission(context, permission) ==
+                    PackageManager.PERMISSION_GRANTED
+            }
+        return hasPermissionsForStart(Build.VERSION.SDK_INT, granted, alarmMonitoring)
+    }
+
+    fun denialMessage(context: Context, alarmMonitoring: Boolean): String {
+        val granted = forStart(Build.VERSION.SDK_INT, alarmMonitoring)
+            .filterTo(linkedSetOf()) { permission ->
+                ContextCompat.checkSelfPermission(context, permission) ==
+                    PackageManager.PERMISSION_GRANTED
+            }
+        return denialMessage(Build.VERSION.SDK_INT, granted, alarmMonitoring)
+    }
+
+    fun missingPermissions(context: Context, alarmMonitoring: Boolean = true): List<String> =
+        forStart(Build.VERSION.SDK_INT, alarmMonitoring).filter { permission ->
             ContextCompat.checkSelfPermission(context, permission) !=
                 PackageManager.PERMISSION_GRANTED
         }
+
+    private const val BLUETOOTH_DENIED_MESSAGE =
+        "Нужен доступ к Bluetooth для получения данных"
+    private const val NOTIFICATION_DENIED_MESSAGE =
+        "Разрешите уведомления для звуковых тревог"
 }

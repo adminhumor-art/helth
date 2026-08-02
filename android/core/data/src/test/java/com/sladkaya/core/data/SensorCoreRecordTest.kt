@@ -85,6 +85,28 @@ class SensorCoreRecordTest {
         }
     }
 
+    @Test
+    fun factionInitializationProvenanceIsAcceptedOnlyWhenResultAndCheckpointAgree() {
+        val factionResult = result().copy(
+            sensitivityEncoding = "FACTION",
+            initializationMode = "FACTION",
+        )
+        val factionCheckpoint = checkpoint().copy(
+            sensitivityEncoding = "FACTION",
+            initializationMode = "FACTION",
+        )
+
+        val record = AtomicSensorCoreRecord(
+            raw = raw(),
+            result = factionResult,
+            checkpoint = factionCheckpoint,
+            measurement = reading(),
+        )
+
+        assertEquals("FACTION", record.result.initializationMode)
+        assertEquals("FACTION", record.checkpoint.sensitivityEncoding)
+    }
+
     private fun raw(packet: ByteArray = byteArrayOf(1, 2, 3, 4)) = RawSensorSampleRecord(
         eventId = "event-10",
         sensorId = "sensor-a",
@@ -128,7 +150,7 @@ class SensorCoreRecordTest {
         sensorFamily = SensorFamily.SIBIONICS_GS1,
         transportVariant = 0,
         transportProtocol = "GS1_V120",
-        dataHandleBinarySetId = "datahandle-test",
+        transportCodecId = "transport-codec-test",
         sequence = 10,
         sensorTimeEpochMs = 1_700_000_600_000L,
         algorithmProfile = "V116A",

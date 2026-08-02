@@ -123,6 +123,35 @@ class WidgetReadingPersistencePolicyTest {
         )
     }
 
+    @Test
+    fun persistedValueRequiresExactExpiryCapabilityOnModernAndroid() {
+        assertTrue(WidgetExactAlarmPolicy.canArm(sdkInt = 30, canScheduleExactAlarms = false))
+        assertTrue(WidgetExactAlarmPolicy.canArm(sdkInt = 31, canScheduleExactAlarms = true))
+        assertFalse(WidgetExactAlarmPolicy.canArm(sdkInt = 31, canScheduleExactAlarms = false))
+        assertFalse(WidgetExactAlarmPolicy.canArm(sdkInt = 37, canScheduleExactAlarms = false))
+    }
+
+    @Test
+    fun everyVisibleValueHasExactExpiryAndARevocationWatchdog() {
+        assertEquals(
+            setOf(
+                WidgetExpiryAlarmKind.EXACT_EXPIRY,
+                WidgetExpiryAlarmKind.INEXACT_REVOCATION_WATCHDOG,
+            ),
+            WidgetExpiryAlarmPlanPolicy.plan(
+                sdkInt = 37,
+                canScheduleExactAlarms = true,
+            ),
+        )
+        assertEquals(
+            emptySet<WidgetExpiryAlarmKind>(),
+            WidgetExpiryAlarmPlanPolicy.plan(
+                sdkInt = 37,
+                canScheduleExactAlarms = false,
+            ),
+        )
+    }
+
     private fun reading(
         family: SensorFamily,
         quality: ReadingQuality = ReadingQuality.VALID,

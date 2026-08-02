@@ -152,6 +152,7 @@ class Gs1PendingIngressRecoveryPlannerTest {
         val decision = Gs1PendingIngressRecoveryPlanner(
             family = SensorFamily.SIBIONICS_GS1SB,
             codec = codec,
+            wireProfile = Gs1WireProfile.V120,
         ).plan(
             currentCoreCursor = 1,
             orderedRecords = listOf(record(0, packet, SensorFamily.SIBIONICS_GS1SB)),
@@ -197,6 +198,7 @@ class Gs1PendingIngressRecoveryPlannerTest {
     private fun planner() = Gs1PendingIngressRecoveryPlanner(
         family = SensorFamily.SIBIONICS_GS1,
         codec = codec,
+        wireProfile = Gs1WireProfile.V120,
     )
 
     private fun record(

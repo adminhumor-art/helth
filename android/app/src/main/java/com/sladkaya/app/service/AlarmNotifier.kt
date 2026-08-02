@@ -59,26 +59,37 @@ class AlarmNotifier(private val context: Context) {
             .build()
     }
 
-    fun show(kind: AlarmKind, reading: GlucoseReading?, demo: Boolean = false) {
-        if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return
-        val value = reading?.let { String.format(Locale.forLanguageTag("ru"), "%.1f ммоль/л", it.glucoseMmolL) }
-        val title = when (kind) {
+    internal fun episodeNotification(episode: AlarmEpisode, alert: Boolean): Notification {
+        val primaryKind = episode.activeKinds.firstBySafetyPriority()
+        val baseTitle = when (primaryKind) {
             AlarmKind.LOW -> "Низкая глюкоза"
             AlarmKind.HIGH -> "Высокая глюкоза"
             AlarmKind.RAPID_FALL -> "Глюкоза быстро снижается"
             AlarmKind.RAPID_RISE -> "Глюкоза быстро повышается"
             AlarmKind.SIGNAL_LOSS -> "Нет свежих данных"
         }
-        val shownTitle = if (demo) "ДЕМО · $title" else title
-        val message = if (demo) {
-            value?.let { "$shownTitle · $it · тестовые данные" }
-                ?: "$shownTitle · тестовые данные"
-        } else {
-            value?.let { "$shownTitle · $it" } ?: "$shownTitle · проверьте датчик и телефон"
+        val sourceTitle = if (episode.demo) "ДЕМО · $baseTitle" else baseTitle
+        val title = if (episode.acknowledged) "Подтверждено · $sourceTitle" else sourceTitle
+        val value = episode.reading
+            ?.takeUnless { AlarmKind.SIGNAL_LOSS in episode.activeKinds }
+            ?.let {
+                String.format(
+                    Locale.forLanguageTag("ru"),
+                    "%.1f ммоль/л",
+                    it.glucoseMgDl / 18.0,
+                )
+            }
+        val message = buildString {
+            append(title)
+            value?.let { append(" · ").append(it) }
+            if (episode.demo) append(" · тестовые данные")
+            if (episode.acknowledged) {
+                append(" · звук остановлен, тревога остаётся активной")
+            }
         }
-        val notification = NotificationCompat.Builder(context, ALARM_CHANNEL)
+        return NotificationCompat.Builder(context, ALARM_CHANNEL)
             .setSmallIcon(android.R.drawable.ic_dialog_alert)
-            .setContentTitle(shownTitle)
+            .setContentTitle(title)
             .setContentText(message)
             .setStyle(NotificationCompat.BigTextStyle().bigText(message))
             .setContentIntent(openAppIntent())
@@ -86,20 +97,38 @@ class AlarmNotifier(private val context: Context) {
             .setCategory(NotificationCompat.CATEGORY_ALARM)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setOngoing(true)
+            .setOnlyAlertOnce(!alert)
+            .setSilent(!alert)
+            .apply {
+                if (!episode.acknowledged) {
+                    addAction(
+                        android.R.drawable.ic_menu_close_clear_cancel,
+                        "Подтвердить",
+                        AlarmAcknowledgeReceiver.pendingIntent(context, episode.id),
+                    )
+                }
+            }
             .build()
-        runCatching {
-            NotificationManagerCompat.from(context)
-                .notify(AlarmNotificationIds.forAlarm(kind), notification)
+    }
+
+    internal fun showEpisode(episode: AlarmEpisode, alert: Boolean): Boolean {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return false
         }
+        return runCatching {
+            NotificationManagerCompat.from(context).notify(
+                AlarmNotificationIds.ACTIVE_EPISODE,
+                episodeNotification(episode, alert),
+            )
+        }.isSuccess
     }
 
-    fun cancel(kind: AlarmKind) {
-        NotificationManagerCompat.from(context).cancel(AlarmNotificationIds.forAlarm(kind))
-    }
-
-    fun cancelAllAlarms() {
-        AlarmKind.values().forEach(::cancel)
-    }
+    fun cancelAllAlarms(): Boolean = runCatching {
+        NotificationManagerCompat.from(context).cancel(AlarmNotificationIds.ACTIVE_EPISODE)
+    }.isSuccess
 
     fun showTest(): Boolean {
         createChannels()
@@ -151,9 +180,24 @@ class AlarmNotifier(private val context: Context) {
     }
 }
 
+private fun Set<AlarmKind>.firstBySafetyPriority(): AlarmKind = when {
+    AlarmKind.LOW in this -> AlarmKind.LOW
+    AlarmKind.HIGH in this -> AlarmKind.HIGH
+    AlarmKind.RAPID_FALL in this -> AlarmKind.RAPID_FALL
+    AlarmKind.RAPID_RISE in this -> AlarmKind.RAPID_RISE
+    else -> AlarmKind.SIGNAL_LOSS
+}
+
 internal object AlarmNotificationIds {
+    const val ACTIVE_EPISODE = 4_100
+    const val ACKNOWLEDGE_REQUEST = 4_101
+    const val REPEAT_REQUEST = 4_102
+    const val REVOCATION_WATCHDOG_REQUEST = 4_103
+    const val SIGNAL_LOSS_PRIMARY_SLOT_0_REQUEST = 4_104
+    const val SIGNAL_LOSS_WATCHDOG_SLOT_0_REQUEST = 4_105
+    const val SIGNAL_LOSS_PRIMARY_SLOT_1_REQUEST = 4_106
+    const val SIGNAL_LOSS_WATCHDOG_SLOT_1_REQUEST = 4_107
     const val TEST = 4_900
     const val TEST_TIMEOUT_MS = 10_000L
 
-    fun forAlarm(kind: AlarmKind): Int = 4_000 + kind.ordinal
 }

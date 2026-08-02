@@ -1,5 +1,6 @@
 package com.sladkaya.app
 
+import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -34,12 +35,14 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -55,17 +58,29 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.sladkaya.app.service.AlarmNotifier
 import com.sladkaya.app.service.SensorForegroundService
+import com.sladkaya.app.service.PendingDiagnosticGs1OnboardingStateStore
+import com.sladkaya.app.onboarding.DataMatrixScannerActivity
+import com.sladkaya.app.onboarding.DataMatrixManualReason
+import com.sladkaya.app.onboarding.DataMatrixPackageCodeResolution
+import com.sladkaya.app.onboarding.DataMatrixPayloadResolutionPolicy
+import com.sladkaya.app.onboarding.Gs1SensorSetupCoordinator
+import com.sladkaya.app.onboarding.SensorSetupScreen
 import com.sladkaya.app.settings.AlarmSettingsScreen
 import com.sladkaya.app.settings.AlarmSettingsStore
 import com.sladkaya.app.settings.LoadedAlarmSettings
+import com.sladkaya.app.widget.WidgetExactAlarmAccess
+import com.sladkaya.app.widget.readWidgetExactAlarmAccess
 import com.sladkaya.core.model.AlarmKind
 import com.sladkaya.core.model.AlarmThresholds
 import com.sladkaya.core.model.GlucoseReading
 import com.sladkaya.core.sensor.SensorDriverState
+import com.sladkaya.sensor.sibionics.AndroidGs1AdvertisementScanner
+import com.sladkaya.sensor.sibionics.Gs1PackageCodeInput
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 private val Forest = Color(0xFF176B57)
 private val Ink = Color(0xFF162A27)
@@ -79,25 +94,68 @@ private val WarningSoft = Color(0xFFFFF3CF)
 
 private enum class RequestedServiceStart {
     Sensor,
+    Diagnostic,
     Demo,
+    Search,
 }
 
+private val RequestedServiceStart.alarmMonitoring: Boolean
+    get() = this == RequestedServiceStart.Sensor || this == RequestedServiceStart.Demo
+
 class MainActivity : ComponentActivity() {
+    private var lifecycleRevision by mutableIntStateOf(0)
+
+    override fun onResume() {
+        super.onResume()
+        lifecycleRevision += 1
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         AlarmNotifier(this).createChannels()
         setContent {
             MaterialTheme {
+                val scope = rememberCoroutineScope()
+                val onboardingStore = remember {
+                    PendingDiagnosticGs1OnboardingStateStore(this@MainActivity)
+                }
+                val setupCoordinator = remember {
+                    Gs1SensorSetupCoordinator(
+                        stateStore = onboardingStore,
+                        scanner = AndroidGs1AdvertisementScanner(this@MainActivity),
+                        clearDraft = onboardingStore::clearDraft,
+                    )
+                }
+                val setupState by setupCoordinator.state.collectAsStateWithLifecycle()
+                val appState by AppState.state.collectAsStateWithLifecycle()
+                DisposableEffect(setupCoordinator) {
+                    onDispose { setupCoordinator.cancelSearch() }
+                }
                 var permissionRevision by remember { mutableIntStateOf(0) }
-                var pendingStart by remember { mutableStateOf<RequestedServiceStart?>(null) }
+                var pendingStart by rememberSaveable {
+                    mutableStateOf<RequestedServiceStart?>(null)
+                }
+                var setupOpen by rememberSaveable { mutableStateOf(false) }
+                var scannerMessage by rememberSaveable { mutableStateOf<String?>(null) }
+                var scannerSuggestedCode by rememberSaveable { mutableStateOf<String?>(null) }
                 fun startPermitted(mode: RequestedServiceStart) {
                     when (mode) {
                         RequestedServiceStart.Sensor -> SensorForegroundService.start(this@MainActivity)
+                        RequestedServiceStart.Diagnostic ->
+                            SensorForegroundService.startDiagnostic(this@MainActivity)
                         RequestedServiceStart.Demo -> SensorForegroundService.startDemo(this@MainActivity)
+                        RequestedServiceStart.Search -> scope.launch {
+                            setupCoordinator.search()
+                        }
                     }
                 }
-                fun showPermissionRequired() {
-                    AppState.onSetupRequired("Нужен доступ к Bluetooth для получения данных")
+                fun showPermissionRequired(mode: RequestedServiceStart) {
+                    AppState.onSetupRequired(
+                        RequiredPermissionPolicy.denialMessage(
+                            this@MainActivity,
+                            mode.alarmMonitoring,
+                        ),
+                    )
                     com.sladkaya.app.widget.GlucoseWidgetProvider.showSetupRequired(this@MainActivity)
                 }
                 val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -105,41 +163,150 @@ class MainActivity : ComponentActivity() {
                     val requested = pendingStart
                     pendingStart = null
                     if (requested != null) {
-                        if (RequiredPermissionPolicy.hasMandatoryBlePermissions(this@MainActivity)) {
+                        if (
+                            RequiredPermissionPolicy.hasPermissionsForStart(
+                                this@MainActivity,
+                                requested.alarmMonitoring,
+                            )
+                        ) {
                             startPermitted(requested)
                         } else {
-                            showPermissionRequired()
+                            showPermissionRequired(requested)
                         }
                     }
                 }
                 fun requestStart(mode: RequestedServiceStart) {
-                    val missing = RequiredPermissionPolicy.missingPermissions(this@MainActivity)
-                    if (RequiredPermissionPolicy.hasMandatoryBlePermissions(this@MainActivity)) {
+                    val missing = RequiredPermissionPolicy.missingPermissions(
+                        this@MainActivity,
+                        mode.alarmMonitoring,
+                    )
+                    if (missing.isEmpty()) {
                         startPermitted(mode)
-                        if (missing.isNotEmpty()) launcher.launch(missing.toTypedArray())
                     } else {
                         pendingStart = mode
                         launcher.launch(missing.toTypedArray())
                     }
                 }
-                LaunchedEffect(Unit) {
-                    requestStart(RequestedServiceStart.Sensor)
+                val dataMatrixLauncher = rememberLauncherForActivityResult(
+                    ActivityResultContracts.StartActivityForResult(),
+                ) { result ->
+                    val rawValue = result.data?.getStringExtra(
+                        DataMatrixScannerActivity.EXTRA_RAW_VALUE,
+                    )
+                    if (result.resultCode == Activity.RESULT_OK && rawValue != null) {
+                        when (val resolved = DataMatrixPayloadResolutionPolicy.resolve(rawValue)) {
+                            is DataMatrixPackageCodeResolution.Ready -> {
+                                scannerSuggestedCode = resolved.packageCode
+                                scannerMessage =
+                                    "Код распознан. Сверьте 8 символов с упаковкой и подтвердите поиск."
+                            }
+                            is DataMatrixPackageCodeResolution.ManualRequired -> {
+                                scannerSuggestedCode = null
+                                scannerMessage = resolved.reason.userMessage()
+                            }
+                        }
+                    } else {
+                        scannerSuggestedCode = null
+                        scannerMessage = when (
+                            result.data?.getStringExtra(DataMatrixScannerActivity.EXTRA_ERROR)
+                        ) {
+                            DataMatrixScannerActivity.ERROR_CAMERA_PERMISSION_REQUIRED ->
+                                "Разрешите камеру или введите код вручную"
+                            DataMatrixScannerActivity.ERROR_CAMERA_UNAVAILABLE ->
+                                "На телефоне нет доступной камеры; введите код вручную"
+                            DataMatrixScannerActivity.ERROR_CAMERA_START_FAILED ->
+                                "Не удалось запустить камеру; введите код вручную"
+                            DataMatrixScannerActivity.ERROR_SCANNER_UNAVAILABLE ->
+                                "Сканер недоступен; введите код вручную"
+                            else -> null
+                        }
+                    }
                 }
-                SladkayaScreen(
-                    onStart = { requestStart(RequestedServiceStart.Sensor) },
-                    onStartDemo = { requestStart(RequestedServiceStart.Demo) },
-                    permissionRevision = permissionRevision,
-                )
+                if (setupOpen) {
+                    SensorSetupScreen(
+                        setup = setupState,
+                        diagnostic = appState.diagnostic,
+                        scannerMessage = scannerMessage,
+                        scannerSuggestedCode = scannerSuggestedCode,
+                        onBack = {
+                            setupCoordinator.cancelSearch()
+                            setupOpen = false
+                        },
+                        onSubmitManual = { family, marketProfile, code ->
+                            val input = if (scannerSuggestedCode == code) {
+                                Gs1PackageCodeInput.DataMatrix(code)
+                            } else {
+                                Gs1PackageCodeInput.Manual(code)
+                            }
+                            scannerSuggestedCode = null
+                            scannerMessage = null
+                            if (
+                                setupCoordinator.submitPackageCode(
+                                    family,
+                                    input,
+                                    marketProfile,
+                                )
+                            ) {
+                                requestStart(RequestedServiceStart.Search)
+                            }
+                        },
+                        onScanDataMatrix = { _, _ ->
+                            scannerSuggestedCode = null
+                            scannerMessage = null
+                            dataMatrixLauncher.launch(
+                                Intent(this@MainActivity, DataMatrixScannerActivity::class.java),
+                            )
+                        },
+                        onRetrySearch = { requestStart(RequestedServiceStart.Search) },
+                        onStartDiagnostic = {
+                            requestStart(RequestedServiceStart.Diagnostic)
+                        },
+                        onStopDiagnostic = {
+                            if (SensorForegroundService.stop(this@MainActivity)) {
+                                AppState.onSetupRequired("Диагностика остановлена")
+                            }
+                        },
+                        onReset = {
+                            if (SensorForegroundService.stop(this@MainActivity)) {
+                                scannerMessage = null
+                                scannerSuggestedCode = null
+                                setupCoordinator.reset()
+                                AppState.onSetupRequired("Требуется настройка датчика")
+                            }
+                        },
+                    )
+                } else {
+                    SladkayaScreen(
+                        onStart = { setupOpen = true },
+                        onStartDemo = { requestStart(RequestedServiceStart.Demo) },
+                        capabilityRevision = permissionRevision + lifecycleRevision,
+                    )
+                }
             }
         }
     }
+}
+
+private fun DataMatrixManualReason.userMessage(): String = when (this) {
+    DataMatrixManualReason.INVALID_GS1_PAYLOAD ->
+        "DataMatrix распознан, но его формат не подтверждён. Введите 8 символов с упаковки."
+    DataMatrixManualReason.UNSUPPORTED_MANUFACTURER ->
+        "Это DataMatrix другого производителя. Проверьте упаковку или введите код вручную."
+    DataMatrixManualReason.GS3_REQUIRES_SEPARATE_SETUP ->
+        "Распознан GS3. Для него нужен отдельный экран подключения; этот код нельзя запускать как GS1."
+    DataMatrixManualReason.TRANSMITTER_CODE_IS_NOT_SENSOR_CODE ->
+        "Отсканирован код передатчика. Для Sibionics 2 / Split нужен отдельный сценарий двух DataMatrix; этот экран его не запускает."
+    DataMatrixManualReason.CODE_NOT_DERIVABLE ->
+        "DataMatrix прочитан, но 8-символьный код нельзя выделить безопасно. Введите его с упаковки."
+    DataMatrixManualReason.CONFLICTING_CANDIDATES ->
+        "В DataMatrix найдены разные варианты кода. Приложение не будет угадывать — введите код с упаковки."
 }
 
 @Composable
 private fun SladkayaScreen(
     onStart: () -> Unit,
     onStartDemo: () -> Unit,
-    permissionRevision: Int,
+    capabilityRevision: Int,
 ) {
     val context = LocalContext.current
     val state by AppState.state.collectAsStateWithLifecycle()
@@ -158,11 +325,17 @@ private fun SladkayaScreen(
         nowEpochMs = nowEpochMs,
         staleAfterMs = loadedSettings.thresholds.staleAfterMs,
     )
-    val notificationCapability = remember(context, permissionRevision, nowEpochMs) {
+    val notificationCapability = remember(context, capabilityRevision, nowEpochMs) {
         readAlarmNotificationCapability(context)
     }
-    val blePermissionsGranted = remember(context, permissionRevision, nowEpochMs) {
+    val blePermissionsGranted = remember(context, capabilityRevision, nowEpochMs) {
         RequiredPermissionPolicy.hasMandatoryBlePermissions(context)
+    }
+    val widgetExactAlarmAccess = remember(context, capabilityRevision, nowEpochMs) {
+        readWidgetExactAlarmAccess(context)
+    }
+    val batteryOptimizationNeedsAction = remember(context, capabilityRevision, nowEpochMs) {
+        BatteryOptimizationAccess.needsUserAction(context)
     }
     if (settingsOpen) {
         AlarmSettingsScreen(
@@ -195,13 +368,21 @@ private fun SladkayaScreen(
             Header(state, freshness, onSettings = { settingsOpen = true })
             BlePermissionWarning(blePermissionsGranted)
             AlarmNotificationWarning(notificationCapability)
+            BatteryOptimizationWarning(batteryOptimizationNeedsAction)
+            WidgetExactAlarmWarning(widgetExactAlarmAccess)
             CurrentGlucoseCard(
                 state = state,
                 freshness = freshness,
                 onAcknowledgeAlarm = SensorForegroundService::acknowledgeActiveAlarms,
             )
             HistoryCard(state.history, loadedSettings.thresholds)
-            ConnectionCard(state.driverState, state.simulatorMode, onStart, onStartDemo)
+            ConnectionCard(
+                state.driverState,
+                state.simulatorMode,
+                state.diagnostic,
+                onStart,
+                onStartDemo,
+            )
             Text(
                 if (state.simulatorMode) {
                     "ДЕМО: используются только тестовые данные. Их нельзя использовать для решений о лечении."
@@ -211,6 +392,93 @@ private fun SladkayaScreen(
                 color = Muted, fontSize = 11.sp, lineHeight = 16.sp, textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 6.dp),
             )
+        }
+    }
+}
+
+@Composable
+private fun BatteryOptimizationWarning(needsUserAction: Boolean) {
+    if (!needsUserAction) return
+    val context = LocalContext.current
+    Card(
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = WarningSoft),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(15.dp),
+            verticalArrangement = Arrangement.spacedBy(9.dp),
+        ) {
+            Text(
+                "Разрешите непрерывную работу",
+                color = Warning,
+                fontWeight = FontWeight.Bold,
+                fontSize = 13.sp,
+            )
+            Text(
+                "Иначе Android или энергосбережение Samsung могут остановить связь с датчиком в фоне.",
+                color = Muted,
+                fontSize = 11.sp,
+            )
+            OutlinedButton(
+                onClick = {
+                    runCatching {
+                        context.startActivity(
+                            BatteryOptimizationAccess.requestExemptionIntent(context),
+                        )
+                    }.onFailure {
+                        runCatching {
+                            context.startActivity(
+                                BatteryOptimizationAccess.fallbackSettingsIntent(),
+                            )
+                        }
+                    }
+                },
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Text("Разрешить работу в фоне", fontSize = 11.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun WidgetExactAlarmWarning(access: WidgetExactAlarmAccess) {
+    if (access == WidgetExactAlarmAccess.AVAILABLE) return
+    val context = LocalContext.current
+    Card(
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = WarningSoft),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(15.dp),
+            verticalArrangement = Arrangement.spacedBy(9.dp),
+        ) {
+            Text(
+                "Для контроля нужны точные таймеры",
+                color = Warning,
+                fontWeight = FontWeight.Bold,
+                fontSize = 13.sp,
+            )
+            Text(
+                AlarmSafetyUxCopy.EXACT_ALARM_BLOCKED_DETAIL,
+                color = Muted,
+                fontSize = 11.sp,
+            )
+            OutlinedButton(
+                onClick = {
+                    context.startActivity(
+                        Intent(
+                            Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,
+                            Uri.parse("package:${context.packageName}"),
+                        ),
+                    )
+                },
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Text("Разрешить точные таймеры", fontSize = 11.sp)
+            }
         }
     }
 }
@@ -280,7 +548,7 @@ private fun AlarmNotificationWarning(capability: AlarmNotificationCapability) {
                 fontSize = 13.sp,
             )
             Text(
-                "Тревога будет видна в открытом приложении, но телефон может не подать звук.",
+                AlarmSafetyUxCopy.NOTIFICATIONS_BLOCKED_DETAIL,
                 color = Muted,
                 fontSize = 11.sp,
             )
@@ -536,6 +804,7 @@ private fun freshnessMessage(freshness: ReadingFreshness): String? = when (fresh
 private fun ConnectionCard(
     driverState: SensorDriverState,
     simulatorMode: Boolean,
+    diagnostic: DiagnosticUiState,
     onStart: () -> Unit,
     onStartDemo: () -> Unit,
 ) {
@@ -547,11 +816,15 @@ private fun ConnectionCard(
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text("Источник данных", color = Ink, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                Text(driverState.label(simulatorMode), color = Muted, fontSize = 11.sp)
+                Text(
+                    if (diagnostic.active) diagnostic.phaseLabel else driverState.label(simulatorMode),
+                    color = Muted,
+                    fontSize = 11.sp,
+                )
             }
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Button(onClick = onStart, colors = ButtonDefaults.buttonColors(containerColor = Forest), shape = RoundedCornerShape(12.dp)) {
-                    Text("Проверить", fontSize = 10.sp)
+                    Text("Датчик", fontSize = 10.sp)
                 }
                 OutlinedButton(onClick = onStartDemo, shape = RoundedCornerShape(12.dp)) {
                     Text("Демо", fontSize = 10.sp)

@@ -9,6 +9,14 @@ class SibionicsPacketCodecTest {
     private val codec = SibionicsPacketCodec()
 
     @Test
+    fun referenceV120SingleRecordNotificationFitsTheDefaultAttPayload() {
+        val exactEnvelope = gs1Packet(count = 1)
+
+        assertEquals(20, exactEnvelope.size)
+        assertTrue(codec.decode(SensorFamily.SIBIONICS_GS1, exactEnvelope) is DecodedPacket.Gs1RawSamples)
+    }
+
+    @Test
     fun decryptsAndParsesSyntheticGs3Sample() {
         val count = 1
         val length = 9 + count * 8 + 2

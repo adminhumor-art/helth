@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.os.SystemClock
+import android.os.Build
 import android.widget.RemoteViews
 import androidx.core.content.edit
 import com.sladkaya.app.MainActivity
@@ -27,8 +28,14 @@ class GlucoseWidgetProvider : AppWidgetProvider() {
     }
 
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action == ACTION_EXPIRE_READING) {
+        if (intent.action == ACTION_EXPIRE_READING ||
+            intent.action == ACTION_EXPIRY_REVOCATION_WATCHDOG
+        ) {
             expireIfNeeded(context)
+            return
+        }
+        if (intent.action == AlarmManager.ACTION_SCHEDULE_EXACT_ALARM_PERMISSION_STATE_CHANGED) {
+            refreshAll(context)
             return
         }
         super.onReceive(context, intent)
@@ -51,6 +58,8 @@ class GlucoseWidgetProvider : AppWidgetProvider() {
         private const val KEY_STALE_AFTER = "expiry_stale_after_ms"
         private const val ACTION_EXPIRE_READING =
             "com.sladkaya.app.widget.EXPIRE_READING"
+        private const val ACTION_EXPIRY_REVOCATION_WATCHDOG =
+            "com.sladkaya.app.widget.EXPIRY_REVOCATION_WATCHDOG"
 
         fun updateAll(context: Context, reading: GlucoseReading) {
             val nowEpochMs = System.currentTimeMillis()
@@ -276,7 +285,27 @@ class GlucoseWidgetProvider : AppWidgetProvider() {
 
         private fun armExpiry(context: Context, expiryElapsed: Long): Boolean {
             return runCatching {
-                context.getSystemService(AlarmManager::class.java).setAndAllowWhileIdle(
+                val manager = context.getSystemService(AlarmManager::class.java)
+                val canScheduleExact = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    manager.canScheduleExactAlarms()
+                } else {
+                    true
+                }
+                val plan = WidgetExpiryAlarmPlanPolicy.plan(
+                    sdkInt = Build.VERSION.SDK_INT,
+                    canScheduleExactAlarms = canScheduleExact,
+                )
+                check(WidgetExpiryAlarmKind.EXACT_EXPIRY in plan) {
+                    "Exact widget expiry is unavailable"
+                }
+                if (WidgetExpiryAlarmKind.INEXACT_REVOCATION_WATCHDOG in plan) {
+                    manager.setAndAllowWhileIdle(
+                        AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                        expiryElapsed,
+                        expiryRevocationWatchdogIntent(context),
+                    )
+                }
+                manager.setExactAndAllowWhileIdle(
                     AlarmManager.ELAPSED_REALTIME_WAKEUP,
                     expiryElapsed,
                     expiryIntent(context),
@@ -286,7 +315,10 @@ class GlucoseWidgetProvider : AppWidgetProvider() {
 
         private fun cancelExpiry(context: Context) {
             runCatching {
-                context.getSystemService(AlarmManager::class.java).cancel(expiryIntent(context))
+                context.getSystemService(AlarmManager::class.java).also { manager ->
+                    manager.cancel(expiryIntent(context))
+                    manager.cancel(expiryRevocationWatchdogIntent(context))
+                }
             }
         }
 
@@ -296,6 +328,15 @@ class GlucoseWidgetProvider : AppWidgetProvider() {
             Intent(context, GlucoseWidgetProvider::class.java).setAction(ACTION_EXPIRE_READING),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
+
+        private fun expiryRevocationWatchdogIntent(context: Context): PendingIntent =
+            PendingIntent.getBroadcast(
+                context,
+                13,
+                Intent(context, GlucoseWidgetProvider::class.java)
+                    .setAction(ACTION_EXPIRY_REVOCATION_WATCHDOG),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
 
         private fun SharedPreferences.Editor.removeReading() {
             remove(KEY_MG_DL)
@@ -393,6 +434,28 @@ class GlucoseWidgetProvider : AppWidgetProvider() {
             else -> "→"
         }
     }
+}
+
+internal object WidgetExactAlarmPolicy {
+    fun canArm(sdkInt: Int, canScheduleExactAlarms: Boolean): Boolean =
+        sdkInt < 31 || canScheduleExactAlarms
+}
+
+internal enum class WidgetExpiryAlarmKind {
+    EXACT_EXPIRY,
+    INEXACT_REVOCATION_WATCHDOG,
+}
+
+internal object WidgetExpiryAlarmPlanPolicy {
+    fun plan(sdkInt: Int, canScheduleExactAlarms: Boolean): Set<WidgetExpiryAlarmKind> =
+        if (WidgetExactAlarmPolicy.canArm(sdkInt, canScheduleExactAlarms)) {
+            setOf(
+                WidgetExpiryAlarmKind.EXACT_EXPIRY,
+                WidgetExpiryAlarmKind.INEXACT_REVOCATION_WATCHDOG,
+            )
+        } else {
+            emptySet()
+        }
 }
 
 internal object WidgetReadingPersistencePolicy {
